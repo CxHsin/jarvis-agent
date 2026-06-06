@@ -4,6 +4,7 @@ from collections import deque
 from app.agent import AgentService
 from app.conversation_store import ConversationStore
 from app.llm_client import ChatMessage, LLMClientError
+from app.memory_store import MemorySnapshot, MemoryStoreError
 
 
 class StubLLMClient:
@@ -43,12 +44,30 @@ class BlockingLLMClient:
         return f"reply-{call_number}"
 
 
-def build_service(llm_client: object, *, max_rounds: int = 3) -> tuple[AgentService, ConversationStore]:
+class StubMemoryStore:
+    def __init__(self, snapshot: MemorySnapshot | None = None, *, error: Exception | None = None) -> None:
+        self._snapshot = snapshot or MemorySnapshot("", "", "", "")
+        self._error = error
+
+    def load_snapshot(self) -> MemorySnapshot:
+        if self._error is not None:
+            raise self._error
+        return self._snapshot
+
+
+def build_service(
+    llm_client: object,
+    *,
+    max_rounds: int = 3,
+    memory_snapshot: MemorySnapshot | None = None,
+    memory_error: Exception | None = None,
+) -> tuple[AgentService, ConversationStore]:
     store = ConversationStore(max_rounds=max_rounds)
     service = AgentService(
         llm_client=llm_client,  # type: ignore[arg-type]
         system_prompt="system rule",
         conversation_store=store,
+        memory_store=StubMemoryStore(memory_snapshot, error=memory_error),  # type: ignore[arg-type]
     )
     return service, store
 
@@ -171,4 +190,51 @@ def test_agent_service_serializes_requests_for_same_chat() -> None:
     assert [(turn.user_text, turn.assistant_text) for turn in store.get_history(1)] == [
         ("first", "reply-1"),
         ("second", "reply-2"),
+    ]
+
+def test_agent_service_includes_long_term_memory_in_fixed_order() -> None:
+    llm_client = StubLLMClient(replies=["hello back"])
+    snapshot = MemorySnapshot(
+        memory_text="stable fact",
+        recent_context_text="recent summary",
+        pending_text="pending item",
+        history_text="important event",
+    )
+    service, _store = build_service(llm_client, memory_snapshot=snapshot)
+
+    service.generate_reply(chat_id=1, user_text="hello")
+
+    assert llm_client.messages == [
+        [
+            ChatMessage(role="system", content="system rule"),
+            ChatMessage(
+                role="system",
+                content=(
+                    "Long-term memory:\n\n"
+                    "[MEMORY.md]\nstable fact\n\n"
+                    "[RECENT_CONTEXT.md]\nrecent summary\n\n"
+                    "[PENDING.md]\npending item\n\n"
+                    "[HISTORY.md]\nimportant event"
+                ),
+            ),
+            ChatMessage(role="user", content="hello"),
+        ]
+    ]
+
+
+def test_agent_service_degrades_when_memory_load_fails() -> None:
+    llm_client = StubLLMClient(replies=["hello back"])
+    service, _store = build_service(
+        llm_client,
+        memory_error=MemoryStoreError("boom"),
+    )
+
+    reply = service.generate_reply(chat_id=1, user_text="hello")
+
+    assert reply == "hello back"
+    assert llm_client.messages == [
+        [
+            ChatMessage(role="system", content="system rule"),
+            ChatMessage(role="user", content="hello"),
+        ]
     ]

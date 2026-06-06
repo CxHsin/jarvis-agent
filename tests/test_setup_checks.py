@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from app.config import Settings
 from app.setup_checks import verify_openai_compatible, verify_telegram_token
 import pytest
@@ -34,6 +36,7 @@ def build_settings() -> Settings:
         conversation_max_rounds=6,
         poll_timeout_seconds=30,
         request_timeout_seconds=30,
+        memory_root_dir=Path("memory"),
     )
 
 

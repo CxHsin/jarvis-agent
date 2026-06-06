@@ -20,6 +20,7 @@ class Settings:
     conversation_max_rounds: int
     poll_timeout_seconds: int
     request_timeout_seconds: int
+    memory_root_dir: Path
 
 
 DEFAULT_CONFIG_PATH = Path("config.toml")
@@ -36,6 +37,7 @@ class ConfigDraft:
     conversation_max_rounds: int
     poll_timeout_seconds: int
     request_timeout_seconds: int
+    memory_root_dir: str
 
 
 def _load_config_file(path: Path) -> dict[str, object]:
@@ -70,6 +72,7 @@ def _draft_from_config(config: dict[str, object]) -> ConfigDraft:
         conversation_max_rounds=_read_int(config, "conversation.max_rounds", 6),
         poll_timeout_seconds=_read_int(config, "telegram.poll_timeout_seconds", 30),
         request_timeout_seconds=_read_int(config, "openai.request_timeout_seconds", 30),
+        memory_root_dir=_read_string(config, "memory.root_dir", "memory"),
     )
 
 
@@ -184,6 +187,14 @@ def settings_from_config(config: dict[str, object]) -> Settings:
             "openai.request_timeout_seconds",
             30,
         ),
+        memory_root_dir=Path(
+            _get_optional_string(
+                config,
+                "MEMORY_ROOT_DIR",
+                "memory.root_dir",
+                "memory",
+            )
+        ),
     )
 
 
@@ -224,6 +235,7 @@ def run_setup_wizard(*, overwrite: bool, path: Path = DEFAULT_CONFIG_PATH) -> Pa
         conversation_max_rounds=draft.conversation_max_rounds,
         poll_timeout_seconds=draft.poll_timeout_seconds,
         request_timeout_seconds=draft.request_timeout_seconds,
+        memory_root_dir=draft.memory_root_dir,
     )
 
     write_config_file(updated, path=path)
@@ -248,6 +260,9 @@ def write_config_file(draft: ConfigDraft, *, path: Path = DEFAULT_CONFIG_PATH) -
             "",
             "[conversation]",
             f"max_rounds = {draft.conversation_max_rounds}",
+            "",
+            "[memory]",
+            f"root_dir = {_toml_string(draft.memory_root_dir)}",
             "",
         ]
     )

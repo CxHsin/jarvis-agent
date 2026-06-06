@@ -12,6 +12,7 @@ from app.config import (
 )
 from app.conversation_store import ConversationStore
 from app.llm_client import OpenAICompatibleClient
+from app.memory_store import MemoryStore, MemoryStoreError
 from app.setup_checks import verify_openai_compatible, verify_telegram_token
 from app.telegram_bot import TelegramBot
 
@@ -49,10 +50,17 @@ def main(argv: list[str] | None = None) -> int:
         timeout_seconds=settings.request_timeout_seconds,
     )
     conversation_store = ConversationStore(max_rounds=settings.conversation_max_rounds)
+    memory_store = MemoryStore(root_dir=settings.memory_root_dir)
+    try:
+        memory_store.ensure_initialized()
+    except MemoryStoreError as exc:
+        logging.error("%s", exc)
+        return 1
     agent_service = AgentService(
         llm_client=llm_client,
         system_prompt=settings.system_prompt,
         conversation_store=conversation_store,
+        memory_store=memory_store,
     )
     bot = TelegramBot(
         bot_token=settings.bot_token,

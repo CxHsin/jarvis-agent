@@ -45,6 +45,7 @@ def test_load_settings_reads_required_values_from_toml(
     assert settings.conversation_max_rounds == 8
     assert settings.poll_timeout_seconds == 10
     assert settings.request_timeout_seconds == 40
+    assert settings.memory_root_dir == Path("memory")
 
 
 def test_load_settings_allows_environment_variables_to_override_file_values(
@@ -76,6 +77,7 @@ def test_load_settings_allows_environment_variables_to_override_file_values(
     assert settings.openai_api_key == "file-key"
     assert settings.openai_model == "env-model"
     assert settings.conversation_max_rounds == 6
+    assert settings.memory_root_dir == Path("memory")
 
 
 def test_load_settings_fails_when_required_values_are_missing(
@@ -137,6 +139,7 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
         conversation_max_rounds=7,
         poll_timeout_seconds=12,
         request_timeout_seconds=34,
+        memory_root_dir="agent-memory",
     )
 
     write_config_file(draft, path=target)
@@ -147,6 +150,7 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
     assert "poll_timeout_seconds = 12" in content
     assert 'system_prompt = "system prompt"' in content
     assert "max_rounds = 7" in content
+    assert 'root_dir = "agent-memory"' in content
 
 
 def test_setup_wizard_creates_config_file_from_user_input(
@@ -180,6 +184,7 @@ def test_setup_wizard_creates_config_file_from_user_input(
     assert "max_rounds = 6" in content
     assert "poll_timeout_seconds = 30" in content
     assert "request_timeout_seconds = 30" in content
+    assert 'root_dir = "memory"' in content
 
 
 def test_setup_wizard_keeps_existing_secret_when_user_presses_enter(
