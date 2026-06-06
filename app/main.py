@@ -10,6 +10,7 @@ from app.config import (
     run_setup_wizard,
     settings_from_config,
 )
+from app.conversation_store import ConversationStore
 from app.llm_client import OpenAICompatibleClient
 from app.setup_checks import verify_openai_compatible, verify_telegram_token
 from app.telegram_bot import TelegramBot
@@ -47,9 +48,11 @@ def main(argv: list[str] | None = None) -> int:
         model=settings.openai_model,
         timeout_seconds=settings.request_timeout_seconds,
     )
+    conversation_store = ConversationStore(max_rounds=settings.conversation_max_rounds)
     agent_service = AgentService(
         llm_client=llm_client,
         system_prompt=settings.system_prompt,
+        conversation_store=conversation_store,
     )
     bot = TelegramBot(
         bot_token=settings.bot_token,

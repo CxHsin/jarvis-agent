@@ -31,6 +31,7 @@ def build_settings() -> Settings:
         openai_base_url="https://example.com/v1",
         openai_model="gpt-test",
         system_prompt="prompt",
+        conversation_max_rounds=6,
         poll_timeout_seconds=30,
         request_timeout_seconds=30,
     )

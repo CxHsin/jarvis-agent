@@ -61,7 +61,10 @@ class TelegramBot:
         logger.info("Received Telegram message", extra={"chat_id": message.chat_id})
         try:
             logger.info("Calling LLM", extra={"chat_id": message.chat_id})
-            reply_text = self._agent_service.generate_reply(message.text)
+            reply_text = self._agent_service.generate_reply(
+                chat_id=message.chat_id,
+                user_text=message.text,
+            )
             logger.info("LLM call succeeded", extra={"chat_id": message.chat_id})
         except LLMClientError:
             logger.exception("LLM call failed")

@@ -17,6 +17,7 @@ class Settings:
     openai_base_url: str
     openai_model: str
     system_prompt: str
+    conversation_max_rounds: int
     poll_timeout_seconds: int
     request_timeout_seconds: int
 
@@ -32,6 +33,7 @@ class ConfigDraft:
     openai_base_url: str
     openai_model: str
     system_prompt: str
+    conversation_max_rounds: int
     poll_timeout_seconds: int
     request_timeout_seconds: int
 
@@ -65,6 +67,7 @@ def _draft_from_config(config: dict[str, object]) -> ConfigDraft:
         openai_base_url=_read_string(config, "openai.base_url", "https://api.openai.com/v1"),
         openai_model=_read_string(config, "openai.model", "gpt-4o-mini"),
         system_prompt=_read_string(config, "agent.system_prompt", DEFAULT_SYSTEM_PROMPT),
+        conversation_max_rounds=_read_int(config, "conversation.max_rounds", 6),
         poll_timeout_seconds=_read_int(config, "telegram.poll_timeout_seconds", 30),
         request_timeout_seconds=_read_int(config, "openai.request_timeout_seconds", 30),
     )
@@ -163,6 +166,12 @@ def settings_from_config(config: dict[str, object]) -> Settings:
             "agent.system_prompt",
             DEFAULT_SYSTEM_PROMPT,
         ),
+        conversation_max_rounds=_get_int(
+            config,
+            "CONVERSATION_MAX_ROUNDS",
+            "conversation.max_rounds",
+            6,
+        ),
         poll_timeout_seconds=_get_int(
             config,
             "POLL_TIMEOUT_SECONDS",
@@ -212,6 +221,7 @@ def run_setup_wizard(*, overwrite: bool, path: Path = DEFAULT_CONFIG_PATH) -> Pa
             "例如: gpt-4o-mini",
         ),
         system_prompt=draft.system_prompt,
+        conversation_max_rounds=draft.conversation_max_rounds,
         poll_timeout_seconds=draft.poll_timeout_seconds,
         request_timeout_seconds=draft.request_timeout_seconds,
     )
@@ -235,6 +245,9 @@ def write_config_file(draft: ConfigDraft, *, path: Path = DEFAULT_CONFIG_PATH) -
             "",
             "[agent]",
             f"system_prompt = {_toml_string(draft.system_prompt)}",
+            "",
+            "[conversation]",
+            f"max_rounds = {draft.conversation_max_rounds}",
             "",
         ]
     )

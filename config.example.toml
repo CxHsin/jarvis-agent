@@ -10,3 +10,6 @@ request_timeout_seconds = 30
 
 [agent]
 system_prompt = "我是 Jarvis，一个乐于助人的 AI 助手。平时使用中文进行交流。"
+
+[conversation]
+max_rounds = 6
