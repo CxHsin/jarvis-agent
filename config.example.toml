@@ -1,0 +1,12 @@
+[telegram]
+bot_token = "your-telegram-bot-token"
+poll_timeout_seconds = 30
+
+[openai]
+api_key = "your-api-key"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+request_timeout_seconds = 30
+
+[agent]
+system_prompt = "我是 Jarvis，一个乐于助人的 AI 助手。平时使用中文进行交流。"
