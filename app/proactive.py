@@ -42,9 +42,16 @@ class ProactiveRuntimeState:
     last_user_message_at: datetime | None = None
     last_proactive_send_at: datetime | None = None
     consecutive_empty_ticks: int = 0
+    passive_turn_in_progress: bool = False
 
     def record_user_message(self, when: datetime | None = None) -> None:
         self.last_user_message_at = when or datetime.now(UTC)
+
+    def mark_passive_turn_started(self) -> None:
+        self.passive_turn_in_progress = True
+
+    def mark_passive_turn_finished(self) -> None:
+        self.passive_turn_in_progress = False
 
 
 class ProactiveDeliveryLog:

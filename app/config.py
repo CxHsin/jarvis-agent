@@ -32,6 +32,13 @@ class Settings:
     proactive_user_active_grace_seconds: int = 900
     proactive_candidate_limit: int = 3
     proactive_max_sends_per_tick: int = 1
+    drift_enabled: bool = False
+    drift_tick_interval_seconds: int = 300
+    drift_idle_grace_seconds_after_user_message: int = 900
+    drift_idle_grace_seconds_after_proactive_send: int = 900
+    drift_dedupe_window_seconds: int = 3600
+    drift_max_task_runtime_seconds: int = 30
+    drift_max_task_cost: int = 3
 
 
 DEFAULT_CONFIG_PATH = Path("config.toml")
@@ -59,6 +66,13 @@ class ConfigDraft:
     proactive_user_active_grace_seconds: int = 900
     proactive_candidate_limit: int = 3
     proactive_max_sends_per_tick: int = 1
+    drift_enabled: bool = False
+    drift_tick_interval_seconds: int = 300
+    drift_idle_grace_seconds_after_user_message: int = 900
+    drift_idle_grace_seconds_after_proactive_send: int = 900
+    drift_dedupe_window_seconds: int = 3600
+    drift_max_task_runtime_seconds: int = 30
+    drift_max_task_cost: int = 3
 
 
 def _load_config_file(path: Path) -> dict[str, object]:
@@ -108,6 +122,21 @@ def _draft_from_config(config: dict[str, object]) -> ConfigDraft:
         ),
         proactive_candidate_limit=_read_int(config, "proactive.candidate_limit", 3),
         proactive_max_sends_per_tick=_read_int(config, "proactive.max_sends_per_tick", 1),
+        drift_enabled=_read_bool(config, "drift.enabled", False),
+        drift_tick_interval_seconds=_read_int(config, "drift.tick_interval_seconds", 300),
+        drift_idle_grace_seconds_after_user_message=_read_int(
+            config,
+            "drift.idle_grace_seconds_after_user_message",
+            900,
+        ),
+        drift_idle_grace_seconds_after_proactive_send=_read_int(
+            config,
+            "drift.idle_grace_seconds_after_proactive_send",
+            900,
+        ),
+        drift_dedupe_window_seconds=_read_int(config, "drift.dedupe_window_seconds", 3600),
+        drift_max_task_runtime_seconds=_read_int(config, "drift.max_task_runtime_seconds", 30),
+        drift_max_task_cost=_read_int(config, "drift.max_task_cost", 3),
     )
 
 
@@ -395,6 +424,48 @@ def settings_from_config(config: dict[str, object]) -> Settings:
             "proactive.max_sends_per_tick",
             1,
         ),
+        drift_enabled=_get_bool(
+            config,
+            "DRIFT_ENABLED",
+            "drift.enabled",
+            False,
+        ),
+        drift_tick_interval_seconds=_get_int(
+            config,
+            "DRIFT_TICK_INTERVAL_SECONDS",
+            "drift.tick_interval_seconds",
+            300,
+        ),
+        drift_idle_grace_seconds_after_user_message=_get_int(
+            config,
+            "DRIFT_IDLE_GRACE_SECONDS_AFTER_USER_MESSAGE",
+            "drift.idle_grace_seconds_after_user_message",
+            900,
+        ),
+        drift_idle_grace_seconds_after_proactive_send=_get_int(
+            config,
+            "DRIFT_IDLE_GRACE_SECONDS_AFTER_PROACTIVE_SEND",
+            "drift.idle_grace_seconds_after_proactive_send",
+            900,
+        ),
+        drift_dedupe_window_seconds=_get_int(
+            config,
+            "DRIFT_DEDUPE_WINDOW_SECONDS",
+            "drift.dedupe_window_seconds",
+            3600,
+        ),
+        drift_max_task_runtime_seconds=_get_int(
+            config,
+            "DRIFT_MAX_TASK_RUNTIME_SECONDS",
+            "drift.max_task_runtime_seconds",
+            30,
+        ),
+        drift_max_task_cost=_get_int(
+            config,
+            "DRIFT_MAX_TASK_COST",
+            "drift.max_task_cost",
+            3,
+        ),
     )
 
 
@@ -446,6 +517,17 @@ def run_setup_wizard(*, overwrite: bool, path: Path = DEFAULT_CONFIG_PATH) -> Pa
         proactive_user_active_grace_seconds=draft.proactive_user_active_grace_seconds,
         proactive_candidate_limit=draft.proactive_candidate_limit,
         proactive_max_sends_per_tick=draft.proactive_max_sends_per_tick,
+        drift_enabled=draft.drift_enabled,
+        drift_tick_interval_seconds=draft.drift_tick_interval_seconds,
+        drift_idle_grace_seconds_after_user_message=(
+            draft.drift_idle_grace_seconds_after_user_message
+        ),
+        drift_idle_grace_seconds_after_proactive_send=(
+            draft.drift_idle_grace_seconds_after_proactive_send
+        ),
+        drift_dedupe_window_seconds=draft.drift_dedupe_window_seconds,
+        drift_max_task_runtime_seconds=draft.drift_max_task_runtime_seconds,
+        drift_max_task_cost=draft.drift_max_task_cost,
     )
 
     write_config_file(updated, path=path)
@@ -489,6 +571,17 @@ def write_config_file(draft: ConfigDraft, *, path: Path = DEFAULT_CONFIG_PATH) -
             f"user_active_grace_seconds = {draft.proactive_user_active_grace_seconds}",
             f"candidate_limit = {draft.proactive_candidate_limit}",
             f"max_sends_per_tick = {draft.proactive_max_sends_per_tick}",
+            "",
+            "[drift]",
+            f"enabled = {_toml_bool(draft.drift_enabled)}",
+            f"tick_interval_seconds = {draft.drift_tick_interval_seconds}",
+            "idle_grace_seconds_after_user_message = "
+            f"{draft.drift_idle_grace_seconds_after_user_message}",
+            "idle_grace_seconds_after_proactive_send = "
+            f"{draft.drift_idle_grace_seconds_after_proactive_send}",
+            f"dedupe_window_seconds = {draft.drift_dedupe_window_seconds}",
+            f"max_task_runtime_seconds = {draft.drift_max_task_runtime_seconds}",
+            f"max_task_cost = {draft.drift_max_task_cost}",
             "",
         ]
     )

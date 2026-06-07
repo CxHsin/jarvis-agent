@@ -1,5 +1,8 @@
 from app.plugins.host import PluginError, PluginHost
 from app.plugins.types import (
+    DriftContext,
+    DriftOutcome,
+    DriftTask,
     MemoryWriteContext,
     ModelCallContext,
     ModelCallResult,
@@ -13,6 +16,9 @@ from app.plugins.types import (
 )
 
 __all__ = [
+    "DriftContext",
+    "DriftOutcome",
+    "DriftTask",
     "MemoryWriteContext",
     "ModelCallContext",
     "ModelCallResult",

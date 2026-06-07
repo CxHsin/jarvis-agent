@@ -65,6 +65,8 @@ def test_load_settings_reads_required_values_from_toml(
     assert settings.proactive_user_active_grace_seconds == 180
     assert settings.proactive_candidate_limit == 5
     assert settings.proactive_max_sends_per_tick == 1
+    assert settings.drift_enabled is False
+    assert settings.drift_tick_interval_seconds == 300
 
 
 def test_load_settings_allows_environment_variables_to_override_file_values(
@@ -102,6 +104,7 @@ def test_load_settings_allows_environment_variables_to_override_file_values(
     assert settings.disabled_plugins == ()
     assert settings.proactive_enabled is False
     assert settings.proactive_chat_id is None
+    assert settings.drift_enabled is False
 
 
 def test_load_settings_fails_when_required_values_are_missing(
@@ -174,6 +177,13 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
         proactive_user_active_grace_seconds=180,
         proactive_candidate_limit=5,
         proactive_max_sends_per_tick=1,
+        drift_enabled=True,
+        drift_tick_interval_seconds=60,
+        drift_idle_grace_seconds_after_user_message=240,
+        drift_idle_grace_seconds_after_proactive_send=300,
+        drift_dedupe_window_seconds=7200,
+        drift_max_task_runtime_seconds=15,
+        drift_max_task_cost=2,
     )
 
     write_config_file(draft, path=target)
@@ -192,6 +202,8 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
     assert "enabled = true" in content
     assert 'chat_id = "77"' in content
     assert "tick_interval_seconds = 120" in content
+    assert "[drift]" in content
+    assert "dedupe_window_seconds = 7200" in content
 
 
 def test_setup_wizard_creates_config_file_from_user_input(

@@ -7,6 +7,9 @@ from app.conversation_store import ConversationStore
 from app.memory_normalizer import MemoryEntry
 from app.memory_store import ConsolidationState, MemorySnapshot
 from app.plugins import (
+    DriftContext,
+    DriftOutcome,
+    DriftTask,
     MemoryWriteContext,
     ModelCallContext,
     ModelCallResult,
@@ -206,6 +209,44 @@ def test_plugin_host_skips_invalid_proactive_candidates(caplog: pytest.LogCaptur
 
     assert candidates == []
     assert "Plugin contribution rejected" in caplog.text
+
+
+def test_plugin_host_collects_drift_tasks() -> None:
+    registry = ToolRegistry()
+
+    def execute(context: DriftContext) -> DriftOutcome:
+        return DriftOutcome(summary="done")
+
+    plugin = PluginSpec(
+        plugin_id="drift_test",
+        plugin_name="Drift Test",
+        collect_drift_tasks=lambda context: [
+            DriftTask(
+                task_id="task-1",
+                plugin_id="drift_test",
+                kind="memory_maintenance",
+                summary="compact memory",
+                execute=execute,
+                dedupe_key="compact-memory",
+            )
+        ],
+    )
+    host = PluginHost(registry=registry, plugins_package="app.plugins")
+    host._plugins = [plugin]  # type: ignore[attr-defined]
+
+    tasks = host.collect_drift_tasks(
+        DriftContext(
+            now=datetime.now(UTC),
+            last_user_message_at=None,
+            last_proactive_send_at=None,
+            memory_snapshot=None,
+            available_tools=(),
+            enabled_plugin_ids=("drift_test",),
+        )
+    )
+
+    assert len(tasks) == 1
+    assert tasks[0].task_id == "task-1"
 
 
 def test_agent_service_applies_plugin_context_and_memory_candidates() -> None:

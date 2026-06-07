@@ -12,6 +12,8 @@ from app.tools.base import ToolSpec
 from app.tools.registry import DuplicateToolError, ToolRegistry
 
 from app.plugins.types import (
+    DriftContext,
+    DriftTask,
     MemoryWriteContext,
     ModelCallContext,
     ModelCallResult,
@@ -162,6 +164,19 @@ class PluginHost:
             validator=_validate_proactive_candidates,
             default=[],
             chat_id=context.chat_id,
+        )
+
+    def collect_drift_tasks(self, context: DriftContext) -> list[DriftTask]:
+        return self._run_hook_list(
+            hook_name="collect_drift_tasks",
+            invoke=(
+                lambda plugin: plugin.collect_drift_tasks(context)
+                if plugin.collect_drift_tasks
+                else None
+            ),
+            validator=_validate_drift_tasks,
+            default=[],
+            chat_id=0,
         )
 
     def _discover_plugins(self) -> list[PluginSpec]:
@@ -430,3 +445,22 @@ def _validate_proactive_candidates(payload: object) -> list[ProactiveCandidate]:
             raise PluginError("ProactiveCandidate.summary must be non-empty.")
         candidates.append(item)
     return candidates
+
+
+def _validate_drift_tasks(payload: object) -> list[DriftTask]:
+    if not isinstance(payload, list) or not all(isinstance(item, DriftTask) for item in payload):
+        raise PluginError("Expected a list of DriftTask.")
+    tasks: list[DriftTask] = []
+    for item in payload:
+        if not item.task_id.strip():
+            raise PluginError("DriftTask.task_id must be non-empty.")
+        if not item.plugin_id.strip():
+            raise PluginError("DriftTask.plugin_id must be non-empty.")
+        if not item.kind.strip():
+            raise PluginError("DriftTask.kind must be non-empty.")
+        if not item.summary.strip():
+            raise PluginError("DriftTask.summary must be non-empty.")
+        if item.estimated_cost <= 0:
+            raise PluginError("DriftTask.estimated_cost must be greater than zero.")
+        tasks.append(item)
+    return tasks

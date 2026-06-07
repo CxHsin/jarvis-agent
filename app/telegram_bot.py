@@ -75,6 +75,7 @@ class TelegramBot:
         logger.info("Received Telegram message", extra={"chat_id": message.chat_id})
         if self._runtime_state is not None:
             self._runtime_state.record_user_message(datetime.now(UTC))
+            self._runtime_state.mark_passive_turn_started()
         try:
             logger.info("Calling LLM", extra={"chat_id": message.chat_id})
             reply_text = self._agent_service.generate_reply(
@@ -88,6 +89,9 @@ class TelegramBot:
         except Exception:
             logger.exception("Unexpected agent error")
             reply_text = "The agent hit an unexpected error. Please try again later."
+        finally:
+            if self._runtime_state is not None:
+                self._runtime_state.mark_passive_turn_finished()
 
         try:
             self._send_message(chat_id=message.chat_id, text=reply_text)

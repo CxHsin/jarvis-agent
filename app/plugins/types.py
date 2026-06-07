@@ -91,6 +91,39 @@ class ProactiveCandidate:
     evidence: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class DriftContext:
+    now: datetime
+    last_user_message_at: datetime | None
+    last_proactive_send_at: datetime | None
+    memory_snapshot: MemorySnapshot | None
+    available_tools: tuple[str, ...]
+    enabled_plugin_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DriftOutcome:
+    summary: str
+    reason: str = "task_executed"
+
+
+ExecuteDriftTask = Callable[[DriftContext], DriftOutcome]
+
+
+@dataclass(frozen=True)
+class DriftTask:
+    task_id: str
+    plugin_id: str
+    kind: str
+    summary: str
+    execute: ExecuteDriftTask
+    priority: int = 0
+    not_before: datetime | None = None
+    dedupe_key: str | None = None
+    estimated_cost: int = 1
+    requires_tools: bool = False
+
+
 RegisterToolsHook = Callable[[], list[ToolSpec]]
 BuildContextHook = Callable[[TurnContext], list[str]]
 BeforeModelCallHook = Callable[[ModelCallContext], list[str]]
@@ -98,6 +131,7 @@ AfterModelCallHook = Callable[[ModelCallResult], list[TurnNote]]
 BeforeMemoryWriteHook = Callable[[MemoryWriteContext], list[MemoryEntry]]
 AfterTurnHook = Callable[[TurnResult], PluginOutcome | None]
 CollectProactiveCandidatesHook = Callable[[ProactiveContext], list[ProactiveCandidate]]
+CollectDriftTasksHook = Callable[[DriftContext], list[DriftTask]]
 
 
 @dataclass(frozen=True)
@@ -114,4 +148,5 @@ class PluginSpec:
     before_memory_write: BeforeMemoryWriteHook | None = None
     after_turn: AfterTurnHook | None = None
     collect_proactive_candidates: CollectProactiveCandidatesHook | None = None
+    collect_drift_tasks: CollectDriftTasksHook | None = None
     config: dict[str, object] = field(default_factory=dict)

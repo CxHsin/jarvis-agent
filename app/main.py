@@ -12,6 +12,7 @@ from app.config import (
     settings_from_config,
 )
 from app.conversation_store import ConversationStore
+from app.drift import DriftConfig, DriftRunner
 from app.llm_client import OpenAICompatibleClient
 from app.memory_store import MemoryStore, MemoryStoreError
 from app.plugins import PluginError, PluginHost
@@ -108,6 +109,12 @@ def main(argv: list[str] | None = None) -> int:
         telegram_bot=bot,
         runtime_state=proactive_state,
     )
+    drift_runner = _build_drift_runner(
+        settings=settings,
+        plugin_host=plugin_host,
+        memory_store=memory_store,
+        activity_state=proactive_state,
+    )
     if proactive_scheduler is not None:
         logging.info(
             "Proactive runtime enabled: chat_id=%s interval=%ss cooldown=%ss",
@@ -118,6 +125,15 @@ def main(argv: list[str] | None = None) -> int:
         proactive_scheduler.start()
     else:
         logging.info("Proactive runtime disabled")
+    if drift_runner is not None:
+        logging.info(
+            "Drift runtime enabled: interval=%ss dedupe=%ss",
+            settings.drift_tick_interval_seconds,
+            settings.drift_dedupe_window_seconds,
+        )
+        drift_runner.start()
+    else:
+        logging.info("Drift runtime disabled")
     try:
         bot.run_forever()
     except TelegramOffsetStoreError as exc:
@@ -126,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if proactive_scheduler is not None:
             proactive_scheduler.stop()
+        if drift_runner is not None:
+            drift_runner.stop()
     return 0
 
 
@@ -158,6 +176,33 @@ def _build_proactive_scheduler(
         memory_store=memory_store,
         telegram_bot=telegram_bot,
         runtime_state=runtime_state,
+    )
+
+
+def _build_drift_runner(
+    *,
+    settings,
+    plugin_host: PluginHost,
+    memory_store: MemoryStore,
+    activity_state: ProactiveRuntimeState,
+) -> DriftRunner | None:
+    if not settings.drift_enabled:
+        return None
+    config = DriftConfig(
+        enabled=True,
+        execution_log_path=settings.memory_root_dir / "drift_execution_log.json",
+        tick_interval_seconds=settings.drift_tick_interval_seconds,
+        idle_grace_seconds_after_user_message=settings.drift_idle_grace_seconds_after_user_message,
+        idle_grace_seconds_after_proactive_send=settings.drift_idle_grace_seconds_after_proactive_send,
+        dedupe_window_seconds=settings.drift_dedupe_window_seconds,
+        max_task_runtime_seconds=settings.drift_max_task_runtime_seconds,
+        max_task_cost=settings.drift_max_task_cost,
+    )
+    return DriftRunner(
+        config=config,
+        plugin_host=plugin_host,
+        memory_store=memory_store,
+        activity_state=activity_state,
     )
 
 

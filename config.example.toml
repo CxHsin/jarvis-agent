@@ -33,8 +33,24 @@ user_active_grace_seconds = 900
 candidate_limit = 3
 max_sends_per_tick = 1
 
+[drift]
+enabled = false
+tick_interval_seconds = 300
+idle_grace_seconds_after_user_message = 900
+idle_grace_seconds_after_proactive_send = 900
+dedupe_window_seconds = 3600
+max_task_runtime_seconds = 30
+max_task_cost = 3
+
 [plugin_config.interval_reminder]
 enabled = false
 interval_minutes = 240
 priority = 5
 message = "该休息一下，喝点水了。"
+
+[plugin_config.pending_review_drift]
+enabled = false
+priority = 3
+estimated_cost = 1
+log_path = "memory/pending-review.log"
+preview_lines = 3
