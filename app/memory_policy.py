@@ -57,10 +57,16 @@ class MemoryPolicy:
         memory_snapshot: MemorySnapshot | None,
         history: list[ConversationTurn],
         user_text: str,
+        extra_system_sections: list[str] | None = None,
     ) -> list[ChatMessage]:
         messages = [ChatMessage(role="system", content=system_prompt)]
         memory_sections = self._build_memory_sections(memory_snapshot)
         messages.extend(ChatMessage(role="system", content=section) for section in memory_sections)
+        messages.extend(
+            ChatMessage(role="system", content=section)
+            for section in (extra_system_sections or [])
+            if section.strip()
+        )
 
         for turn in history:
             messages.append(ChatMessage(role="user", content=turn.user_text))
@@ -75,9 +81,10 @@ class MemoryPolicy:
         *,
         memory_snapshot: MemorySnapshot | None,
         user_text: str,
+        memory_candidates: list[MemoryEntry] | None = None,
     ) -> MemoryWritePlan:
         normalized_user_text = normalize_text(user_text)
-        if not normalized_user_text:
+        if not normalized_user_text and not memory_candidates:
             return MemoryWritePlan(
                 self_text=None,
                 memory_text=None,
@@ -128,6 +135,25 @@ class MemoryPolicy:
                         limit=self._MAX_PENDING_LINES,
                     )
                     pending_text = format_memory_entries(updated_pending_entries)
+
+        plugin_candidates = memory_candidates or []
+        if plugin_candidates:
+            updated_memory_entries = existing_memory_entries
+            last_style_update: str | None = None
+            for plugin_candidate in plugin_candidates:
+                updated_memory_entries = self._upsert_entry(
+                    updated_memory_entries,
+                    plugin_candidate,
+                    limit=self._MAX_MEMORY_LINES,
+                )
+                style_update = _preference_to_self_style(plugin_candidate)
+                if style_update is not None:
+                    last_style_update = style_update
+            memory_text = format_memory_entries(updated_memory_entries)
+            if last_style_update is not None:
+                model = parse_self_model("" if memory_snapshot is None else memory_snapshot.self_text)
+                updated = apply_interaction_style_updates(model, [last_style_update])
+                self_text = format_self_model(updated)
 
         history_entry_text = f"User: {normalized_user_text}"
         return MemoryWritePlan(

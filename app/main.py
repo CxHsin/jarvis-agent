@@ -14,6 +14,7 @@ from app.config import (
 from app.conversation_store import ConversationStore
 from app.llm_client import OpenAICompatibleClient
 from app.memory_store import MemoryStore, MemoryStoreError
+from app.plugins import PluginError, PluginHost
 from app.setup_checks import verify_openai_compatible, verify_telegram_token
 from app.telegram_bot import TelegramBot, TelegramOffsetStoreError
 from app.tools import ToolExecutor, ToolLoop, build_builtin_tool_registry
@@ -62,6 +63,16 @@ def main(argv: list[str] | None = None) -> int:
         workspace_root=Path.cwd(),
         memory_root=settings.memory_root_dir,
     )
+    plugin_host = PluginHost(
+        registry=tool_registry,
+        enabled_plugins=settings.enabled_plugins,
+        disabled_plugins=settings.disabled_plugins,
+    )
+    try:
+        plugin_host.initialize()
+    except PluginError as exc:
+        logging.error("%s", exc)
+        return 1
     agent_service = AgentService(
         llm_client=llm_client,
         system_prompt=settings.system_prompt,
@@ -72,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             executor=ToolExecutor(tool_registry),
             max_tool_steps=settings.tool_max_steps,
         ),
+        plugin_host=plugin_host,
     )
     bot = TelegramBot(
         bot_token=settings.bot_token,

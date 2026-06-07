@@ -19,3 +19,7 @@ root_dir = "memory"
 
 [tools]
 max_steps = 3
+
+[plugins]
+enabled = []
+disabled = []

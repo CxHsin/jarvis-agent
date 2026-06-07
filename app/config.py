@@ -22,6 +22,8 @@ class Settings:
     request_timeout_seconds: int
     memory_root_dir: Path
     tool_max_steps: int
+    enabled_plugins: tuple[str, ...] = ()
+    disabled_plugins: tuple[str, ...] = ()
 
 
 DEFAULT_CONFIG_PATH = Path("config.toml")
@@ -40,6 +42,8 @@ class ConfigDraft:
     request_timeout_seconds: int
     memory_root_dir: str
     tool_max_steps: int
+    enabled_plugins: tuple[str, ...] = ()
+    disabled_plugins: tuple[str, ...] = ()
 
 
 def _load_config_file(path: Path) -> dict[str, object]:
@@ -76,6 +80,8 @@ def _draft_from_config(config: dict[str, object]) -> ConfigDraft:
         request_timeout_seconds=_read_int(config, "openai.request_timeout_seconds", 30),
         memory_root_dir=_read_string(config, "memory.root_dir", "memory"),
         tool_max_steps=_read_int(config, "tools.max_steps", 3),
+        enabled_plugins=_read_string_list(config, "plugins.enabled", ()),
+        disabled_plugins=_read_string_list(config, "plugins.disabled", ()),
     )
 
 
@@ -95,6 +101,21 @@ def _read_int(config: dict[str, object], dotted_key: str, default: int) -> int:
     except ValueError:
         return default
     return parsed if parsed > 0 else default
+
+
+def _read_string_list(
+    config: dict[str, object],
+    dotted_key: str,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    value = _lookup_config_value(config, dotted_key)
+    if not isinstance(value, list):
+        return default
+    items: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            items.append(item.strip())
+    return tuple(items)
 
 
 def _get_string(config: dict[str, object], env_name: str, dotted_key: str) -> str:
@@ -155,6 +176,32 @@ def _get_int(
     return value
 
 
+def _get_string_list(
+    config: dict[str, object],
+    env_name: str,
+    dotted_key: str,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    env_value = os.getenv(env_name, "").strip()
+    if env_value:
+        return tuple(part.strip() for part in env_value.split(",") if part.strip())
+
+    value = _lookup_config_value(config, dotted_key)
+    if not isinstance(value, list):
+        return default
+
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigError(
+                f"Setting {env_name} or '{dotted_key}' in {DEFAULT_CONFIG_PATH} must be a string list"
+            )
+        stripped = item.strip()
+        if stripped:
+            items.append(stripped)
+    return tuple(items)
+
+
 def load_settings() -> Settings:
     config = _load_config_file(DEFAULT_CONFIG_PATH)
     return settings_from_config(config)
@@ -204,6 +251,18 @@ def settings_from_config(config: dict[str, object]) -> Settings:
             "tools.max_steps",
             3,
         ),
+        enabled_plugins=_get_string_list(
+            config,
+            "ENABLED_PLUGINS",
+            "plugins.enabled",
+            (),
+        ),
+        disabled_plugins=_get_string_list(
+            config,
+            "DISABLED_PLUGINS",
+            "plugins.disabled",
+            (),
+        ),
     )
 
 
@@ -246,6 +305,8 @@ def run_setup_wizard(*, overwrite: bool, path: Path = DEFAULT_CONFIG_PATH) -> Pa
         request_timeout_seconds=draft.request_timeout_seconds,
         memory_root_dir=draft.memory_root_dir,
         tool_max_steps=draft.tool_max_steps,
+        enabled_plugins=draft.enabled_plugins,
+        disabled_plugins=draft.disabled_plugins,
     )
 
     write_config_file(updated, path=path)
@@ -276,6 +337,10 @@ def write_config_file(draft: ConfigDraft, *, path: Path = DEFAULT_CONFIG_PATH) -
             "",
             "[tools]",
             f"max_steps = {draft.tool_max_steps}",
+            "",
+            "[plugins]",
+            f"enabled = {_toml_list(draft.enabled_plugins)}",
+            f"disabled = {_toml_list(draft.disabled_plugins)}",
             "",
         ]
     )
@@ -312,3 +377,7 @@ def _prompt_secret(label: str, current_value: str, help_text: str) -> str:
 
 def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _toml_list(values: tuple[str, ...]) -> str:
+    return "[" + ", ".join(_toml_string(value) for value in values) + "]"

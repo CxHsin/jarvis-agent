@@ -47,6 +47,8 @@ def test_load_settings_reads_required_values_from_toml(
     assert settings.request_timeout_seconds == 40
     assert settings.memory_root_dir == Path("memory")
     assert settings.tool_max_steps == 3
+    assert settings.enabled_plugins == ()
+    assert settings.disabled_plugins == ()
 
 
 def test_load_settings_allows_environment_variables_to_override_file_values(
@@ -80,6 +82,8 @@ def test_load_settings_allows_environment_variables_to_override_file_values(
     assert settings.conversation_max_rounds == 6
     assert settings.memory_root_dir == Path("memory")
     assert settings.tool_max_steps == 3
+    assert settings.enabled_plugins == ()
+    assert settings.disabled_plugins == ()
 
 
 def test_load_settings_fails_when_required_values_are_missing(
@@ -143,6 +147,8 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
         request_timeout_seconds=34,
         memory_root_dir="agent-memory",
         tool_max_steps=5,
+        enabled_plugins=("ping_tool",),
+        disabled_plugins=("note_memory",),
     )
 
     write_config_file(draft, path=target)
@@ -155,6 +161,8 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
     assert "max_rounds = 7" in content
     assert 'root_dir = "agent-memory"' in content
     assert "max_steps = 5" in content
+    assert 'enabled = ["ping_tool"]' in content
+    assert 'disabled = ["note_memory"]' in content
 
 
 def test_setup_wizard_creates_config_file_from_user_input(

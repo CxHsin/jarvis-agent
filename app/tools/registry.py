@@ -1,6 +1,10 @@
 from app.tools.base import ToolSpec
 
 
+class DuplicateToolError(ValueError):
+    """Raised when a tool name is registered more than once."""
+
+
 class ToolRegistry:
     def __init__(self, specs: list[ToolSpec] | None = None) -> None:
         self._specs: dict[str, ToolSpec] = {}
@@ -8,6 +12,8 @@ class ToolRegistry:
             self.register(spec)
 
     def register(self, spec: ToolSpec) -> None:
+        if spec.name in self._specs:
+            raise DuplicateToolError(f"Tool '{spec.name}' is already registered.")
         self._specs[spec.name] = spec
 
     def get(self, name: str) -> ToolSpec | None:
