@@ -1,5 +1,6 @@
 import logging
 import sys
+from pathlib import Path
 
 from app.agent import AgentService
 from app.config import (
@@ -15,6 +16,7 @@ from app.llm_client import OpenAICompatibleClient
 from app.memory_store import MemoryStore, MemoryStoreError
 from app.setup_checks import verify_openai_compatible, verify_telegram_token
 from app.telegram_bot import TelegramBot, TelegramOffsetStoreError
+from app.tools import ToolExecutor, ToolLoop, build_builtin_tool_registry
 
 
 def configure_logging() -> None:
@@ -56,11 +58,20 @@ def main(argv: list[str] | None = None) -> int:
     except MemoryStoreError as exc:
         logging.error("%s", exc)
         return 1
+    tool_registry = build_builtin_tool_registry(
+        workspace_root=Path.cwd(),
+        memory_root=settings.memory_root_dir,
+    )
     agent_service = AgentService(
         llm_client=llm_client,
         system_prompt=settings.system_prompt,
         conversation_store=conversation_store,
         memory_store=memory_store,
+        tool_loop=ToolLoop(
+            registry=tool_registry,
+            executor=ToolExecutor(tool_registry),
+            max_tool_steps=settings.tool_max_steps,
+        ),
     )
     bot = TelegramBot(
         bot_token=settings.bot_token,

@@ -6,6 +6,7 @@ from app.conversation_store import ConversationStore
 from app.llm_client import ChatMessage, LLMClientError
 from app.memory_store import ConsolidationState, MemorySnapshot, MemoryStoreError
 from app.self_model import format_self_model, parse_self_model
+from app.tools import ToolExecutor, ToolLoop, ToolRegistry, ToolSpec
 
 
 DEFAULT_SELF_SECTION = ChatMessage(
@@ -150,6 +151,7 @@ def build_service(
     max_rounds: int = 3,
     memory_snapshot: MemorySnapshot | None = None,
     memory_error: Exception | None = None,
+    tool_loop: ToolLoop | None = None,
 ) -> tuple[AgentService, ConversationStore, StubMemoryStore]:
     store = ConversationStore(max_rounds=max_rounds)
     memory_store = StubMemoryStore(memory_snapshot, error=memory_error)
@@ -158,6 +160,7 @@ def build_service(
         system_prompt="system rule",
         conversation_store=store,
         memory_store=memory_store,  # type: ignore[arg-type]
+        tool_loop=tool_loop,
     )
     return service, store, memory_store
 
@@ -522,3 +525,35 @@ def test_agent_service_rebuilds_recent_context_after_three_user_messages() -> No
     assert "## Compression" in recent
     assert "## Recent Turns" in recent
     assert "User: u3" in recent
+
+
+def test_agent_service_can_complete_turn_with_tool_loop() -> None:
+    llm_client = StubLLMClient(
+        replies=[
+            '{"type":"tool_call","tool_name":"echo","arguments":{"path":"MEMORY.md"}}',
+            "tool-assisted reply",
+        ]
+    )
+    registry = ToolRegistry(
+        [
+            ToolSpec(
+                name="echo",
+                description="echo",
+                arguments=("path",),
+                handler=lambda arguments: {"path": arguments["path"], "content": "memory text"},
+            )
+        ]
+    )
+    tool_loop = ToolLoop(registry=registry, executor=ToolExecutor(registry), max_tool_steps=2)
+    service, store, memory_store = build_service(llm_client, tool_loop=tool_loop)
+
+    reply = service.generate_reply(chat_id=1, user_text="check memory")
+
+    assert reply == "tool-assisted reply"
+    assert memory_store.history_appends == [
+        "User: check memory",
+        "Assistant: tool-assisted reply",
+    ]
+    assert [(turn.user_text, turn.assistant_text) for turn in store.get_history(1)] == [
+        ("check memory", "tool-assisted reply")
+    ]

@@ -6,6 +6,7 @@ from app.llm_client import OpenAICompatibleClient
 from app.memory_policy import MemoryPolicy
 from app.memory_store import MemorySnapshot, MemoryStore, MemoryStoreError
 from app.self_model import default_self_model, format_self_model, parse_self_model
+from app.tools.loop import ToolLoop
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ class AgentService:
         memory_store: MemoryStore,
         memory_policy: MemoryPolicy | None = None,
         consolidator: Consolidator | None = None,
+        tool_loop: ToolLoop | None = None,
     ) -> None:
         self._llm_client = llm_client
         self._system_prompt = system_prompt
@@ -27,6 +29,7 @@ class AgentService:
         self._memory_store = memory_store
         self._memory_policy = memory_policy or MemoryPolicy()
         self._consolidator = consolidator or Consolidator()
+        self._tool_loop = tool_loop
 
     def generate_reply(self, *, chat_id: int, user_text: str) -> str:
         normalized_text = user_text.strip()
@@ -43,7 +46,13 @@ class AgentService:
                 user_text=normalized_text,
             )
 
-            reply_text = self._llm_client.chat(messages)
+            if self._tool_loop is None:
+                reply_text = self._llm_client.chat(messages)
+            else:
+                reply_text = self._tool_loop.run(
+                    llm_client=self._llm_client,
+                    messages=messages,
+                )
             self._conversation_store.append_turn(
                 chat_id,
                 ConversationTurn(user_text=normalized_text, assistant_text=reply_text),

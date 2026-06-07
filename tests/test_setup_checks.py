@@ -37,6 +37,7 @@ def build_settings() -> Settings:
         poll_timeout_seconds=30,
         request_timeout_seconds=30,
         memory_root_dir=Path("memory"),
+        tool_max_steps=3,
     )
 
 
