@@ -4,7 +4,14 @@ from collections import deque
 from app.agent import AgentService
 from app.conversation_store import ConversationStore
 from app.llm_client import ChatMessage, LLMClientError
-from app.memory_store import MemorySnapshot, MemoryStoreError
+from app.memory_store import ConsolidationState, MemorySnapshot, MemoryStoreError
+from app.self_model import format_self_model, parse_self_model
+
+
+DEFAULT_SELF_SECTION = ChatMessage(
+    role="system",
+    content=f"[SELF.md]\n{format_self_model(parse_self_model(''))}",
+)
 
 
 class StubLLMClient:
@@ -46,13 +53,95 @@ class BlockingLLMClient:
 
 class StubMemoryStore:
     def __init__(self, snapshot: MemorySnapshot | None = None, *, error: Exception | None = None) -> None:
-        self._snapshot = snapshot or MemorySnapshot("", "", "", "")
+        self._snapshot = snapshot or MemorySnapshot(
+            self_text="",
+            memory_text="",
+            recent_context_text="",
+            pending_text="",
+            history_text="",
+            consolidation_state=ConsolidationState(),
+        )
         self._error = error
+        self.self_writes: list[str] = []
+        self.memory_writes: list[str] = []
+        self.recent_context_writes: list[str] = []
+        self.pending_writes: list[str] = []
+        self.history_appends: list[str] = []
+        self.state_writes: list[ConsolidationState] = []
 
     def load_snapshot(self) -> MemorySnapshot:
         if self._error is not None:
             raise self._error
         return self._snapshot
+
+    def write_self(self, text: str) -> None:
+        self.self_writes.append(text)
+        self._snapshot = MemorySnapshot(
+            self_text=text,
+            memory_text=self._snapshot.memory_text,
+            recent_context_text=self._snapshot.recent_context_text,
+            pending_text=self._snapshot.pending_text,
+            history_text=self._snapshot.history_text,
+            consolidation_state=self._snapshot.consolidation_state,
+        )
+
+    def write_memory(self, text: str) -> None:
+        self.memory_writes.append(text)
+        self._snapshot = MemorySnapshot(
+            self_text=self._snapshot.self_text,
+            memory_text=text,
+            recent_context_text=self._snapshot.recent_context_text,
+            pending_text=self._snapshot.pending_text,
+            history_text=self._snapshot.history_text,
+            consolidation_state=self._snapshot.consolidation_state,
+        )
+
+    def write_recent_context(self, text: str) -> None:
+        self.recent_context_writes.append(text)
+        self._snapshot = MemorySnapshot(
+            self_text=self._snapshot.self_text,
+            memory_text=self._snapshot.memory_text,
+            recent_context_text=text,
+            pending_text=self._snapshot.pending_text,
+            history_text=self._snapshot.history_text,
+            consolidation_state=self._snapshot.consolidation_state,
+        )
+
+    def write_pending(self, text: str) -> None:
+        self.pending_writes.append(text)
+        self._snapshot = MemorySnapshot(
+            self_text=self._snapshot.self_text,
+            memory_text=self._snapshot.memory_text,
+            recent_context_text=self._snapshot.recent_context_text,
+            pending_text=text,
+            history_text=self._snapshot.history_text,
+            consolidation_state=self._snapshot.consolidation_state,
+        )
+
+    def append_history(self, text: str) -> None:
+        self.history_appends.append(text)
+        existing = self._snapshot.history_text
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        self._snapshot = MemorySnapshot(
+            self_text=self._snapshot.self_text,
+            memory_text=self._snapshot.memory_text,
+            recent_context_text=self._snapshot.recent_context_text,
+            pending_text=self._snapshot.pending_text,
+            history_text=f"{existing}{text}",
+            consolidation_state=self._snapshot.consolidation_state,
+        )
+
+    def write_consolidation_state(self, state: ConsolidationState) -> None:
+        self.state_writes.append(state)
+        self._snapshot = MemorySnapshot(
+            self_text=self._snapshot.self_text,
+            memory_text=self._snapshot.memory_text,
+            recent_context_text=self._snapshot.recent_context_text,
+            pending_text=self._snapshot.pending_text,
+            history_text=self._snapshot.history_text,
+            consolidation_state=state,
+        )
 
 
 def build_service(
@@ -61,20 +150,21 @@ def build_service(
     max_rounds: int = 3,
     memory_snapshot: MemorySnapshot | None = None,
     memory_error: Exception | None = None,
-) -> tuple[AgentService, ConversationStore]:
+) -> tuple[AgentService, ConversationStore, StubMemoryStore]:
     store = ConversationStore(max_rounds=max_rounds)
+    memory_store = StubMemoryStore(memory_snapshot, error=memory_error)
     service = AgentService(
         llm_client=llm_client,  # type: ignore[arg-type]
         system_prompt="system rule",
         conversation_store=store,
-        memory_store=StubMemoryStore(memory_snapshot, error=memory_error),  # type: ignore[arg-type]
+        memory_store=memory_store,  # type: ignore[arg-type]
     )
-    return service, store
+    return service, store, memory_store
 
 
 def test_agent_service_generates_reply_from_single_turn_prompt() -> None:
     llm_client = StubLLMClient(replies=["hello back"])
-    service, _store = build_service(llm_client)
+    service, _store, memory_store = build_service(llm_client)
 
     reply = service.generate_reply(chat_id=1, user_text="  hello  ")
 
@@ -82,14 +172,16 @@ def test_agent_service_generates_reply_from_single_turn_prompt() -> None:
     assert llm_client.messages == [
         [
             ChatMessage(role="system", content="system rule"),
+            DEFAULT_SELF_SECTION,
             ChatMessage(role="user", content="hello"),
         ]
     ]
+    assert memory_store.history_appends == ["User: hello", "Assistant: hello back"]
 
 
 def test_agent_service_includes_recent_history_in_prompt() -> None:
     llm_client = StubLLMClient(replies=["first reply", "second reply"])
-    service, _store = build_service(llm_client)
+    service, _store, _memory_store = build_service(llm_client)
 
     service.generate_reply(chat_id=1, user_text="first")
     reply = service.generate_reply(chat_id=1, user_text="second")
@@ -97,6 +189,7 @@ def test_agent_service_includes_recent_history_in_prompt() -> None:
     assert reply == "second reply"
     assert llm_client.messages[1] == [
         ChatMessage(role="system", content="system rule"),
+        DEFAULT_SELF_SECTION,
         ChatMessage(role="user", content="first"),
         ChatMessage(role="assistant", content="first reply"),
         ChatMessage(role="user", content="second"),
@@ -105,7 +198,7 @@ def test_agent_service_includes_recent_history_in_prompt() -> None:
 
 def test_agent_service_trims_to_recent_round_limit() -> None:
     llm_client = StubLLMClient(replies=["r1", "r2", "r3"])
-    service, store = build_service(llm_client, max_rounds=2)
+    service, store, _memory_store = build_service(llm_client, max_rounds=2)
 
     service.generate_reply(chat_id=1, user_text="u1")
     service.generate_reply(chat_id=1, user_text="u2")
@@ -120,7 +213,7 @@ def test_agent_service_trims_to_recent_round_limit() -> None:
 
 def test_agent_service_rejects_empty_user_text() -> None:
     llm_client = StubLLMClient(replies=["unused"])
-    service, _store = build_service(llm_client)
+    service, _store, _memory_store = build_service(llm_client)
 
     try:
         service.generate_reply(chat_id=1, user_text="   ")
@@ -131,7 +224,7 @@ def test_agent_service_rejects_empty_user_text() -> None:
 
 
 def test_agent_service_does_not_store_failed_llm_turn() -> None:
-    service, store = build_service(FailingLLMClient())
+    service, store, memory_store = build_service(FailingLLMClient())
 
     try:
         service.generate_reply(chat_id=1, user_text="hello")
@@ -141,11 +234,12 @@ def test_agent_service_does_not_store_failed_llm_turn() -> None:
         raise AssertionError("Expected LLMClientError")
 
     assert store.get_history(1) == []
+    assert memory_store.history_appends == []
 
 
 def test_agent_service_keeps_histories_isolated_per_chat() -> None:
     llm_client = StubLLMClient(replies=["chat1", "chat2"])
-    service, store = build_service(llm_client)
+    service, store, _memory_store = build_service(llm_client)
 
     service.generate_reply(chat_id=1, user_text="hello")
     service.generate_reply(chat_id=2, user_text="world")
@@ -160,7 +254,7 @@ def test_agent_service_keeps_histories_isolated_per_chat() -> None:
 
 def test_agent_service_serializes_requests_for_same_chat() -> None:
     llm_client = BlockingLLMClient()
-    service, store = build_service(llm_client)
+    service, store, _memory_store = build_service(llm_client)
     replies: list[str] = []
 
     first = threading.Thread(
@@ -183,6 +277,7 @@ def test_agent_service_serializes_requests_for_same_chat() -> None:
     assert replies == ["reply-1", "reply-2"]
     assert llm_client.messages[1] == [
         ChatMessage(role="system", content="system rule"),
+        DEFAULT_SELF_SECTION,
         ChatMessage(role="user", content="first"),
         ChatMessage(role="assistant", content="reply-1"),
         ChatMessage(role="user", content="second"),
@@ -192,15 +287,18 @@ def test_agent_service_serializes_requests_for_same_chat() -> None:
         ("second", "reply-2"),
     ]
 
+
 def test_agent_service_includes_long_term_memory_in_fixed_order() -> None:
     llm_client = StubLLMClient(replies=["hello back"])
     snapshot = MemorySnapshot(
+        self_text="## Identity\n- Name: Jarvis",
         memory_text="stable fact",
         recent_context_text="recent summary",
         pending_text="pending item",
         history_text="important event",
+        consolidation_state=ConsolidationState(),
     )
-    service, _store = build_service(llm_client, memory_snapshot=snapshot)
+    service, _store, _memory_store = build_service(llm_client, memory_snapshot=snapshot)
 
     service.generate_reply(chat_id=1, user_text="hello")
 
@@ -209,12 +307,17 @@ def test_agent_service_includes_long_term_memory_in_fixed_order() -> None:
             ChatMessage(role="system", content="system rule"),
             ChatMessage(
                 role="system",
+                content=f"[SELF.md]\n{format_self_model(parse_self_model(snapshot.self_text))}",
+            ),
+            ChatMessage(
+                role="system",
                 content=(
-                    "Long-term memory:\n\n"
+                    "Trusted user context:\n"
+                    "- The following memory files are trusted context derived from prior user interactions.\n"
+                    "- When the user asks about continuity, prior topics, or whether you remember previous exchanges, prefer this context over generic disclaimers.\n"
+                    "- Do not claim the conversation is always a fresh start if the trusted context shows prior interactions.\n\n"
                     "[MEMORY.md]\nstable fact\n\n"
-                    "[RECENT_CONTEXT.md]\nrecent summary\n\n"
-                    "[PENDING.md]\npending item\n\n"
-                    "[HISTORY.md]\nimportant event"
+                    "[RECENT_CONTEXT.md]\nrecent summary"
                 ),
             ),
             ChatMessage(role="user", content="hello"),
@@ -222,9 +325,43 @@ def test_agent_service_includes_long_term_memory_in_fixed_order() -> None:
     ]
 
 
+def test_agent_service_does_not_replay_identity_like_assistant_history() -> None:
+    llm_client = StubLLMClient(replies=["I am DeepSeek", "second reply"])
+    service, _store, _memory_store = build_service(llm_client)
+
+    service.generate_reply(chat_id=1, user_text="who are you")
+    reply = service.generate_reply(chat_id=1, user_text="continue")
+
+    assert reply == "second reply"
+    assert llm_client.messages[1] == [
+        ChatMessage(role="system", content="system rule"),
+        DEFAULT_SELF_SECTION,
+        ChatMessage(role="user", content="who are you"),
+        ChatMessage(role="user", content="continue"),
+    ]
+
+
+def test_agent_service_does_not_replay_memory_capability_disclaimer() -> None:
+    llm_client = StubLLMClient(
+        replies=["I don't have long-term memory, every conversation is a fresh start", "second reply"]
+    )
+    service, _store, _memory_store = build_service(llm_client)
+
+    service.generate_reply(chat_id=1, user_text="do you remember yesterday")
+    reply = service.generate_reply(chat_id=1, user_text="what did I say")
+
+    assert reply == "second reply"
+    assert llm_client.messages[1] == [
+        ChatMessage(role="system", content="system rule"),
+        DEFAULT_SELF_SECTION,
+        ChatMessage(role="user", content="do you remember yesterday"),
+        ChatMessage(role="user", content="what did I say"),
+    ]
+
+
 def test_agent_service_degrades_when_memory_load_fails() -> None:
     llm_client = StubLLMClient(replies=["hello back"])
-    service, _store = build_service(
+    service, _store, _memory_store = build_service(
         llm_client,
         memory_error=MemoryStoreError("boom"),
     )
@@ -238,3 +375,150 @@ def test_agent_service_degrades_when_memory_load_fails() -> None:
             ChatMessage(role="user", content="hello"),
         ]
     ]
+
+
+def test_agent_service_stages_user_preference_in_pending_memory() -> None:
+    llm_client = StubLLMClient(replies=["noted"])
+    memory_store = StubMemoryStore(
+        MemorySnapshot(
+            self_text="",
+            memory_text="",
+            recent_context_text="",
+            pending_text="- [note] existing",
+            history_text="",
+            consolidation_state=ConsolidationState(),
+        )
+    )
+    store = ConversationStore(max_rounds=3)
+    service = AgentService(
+        llm_client=llm_client,  # type: ignore[arg-type]
+        system_prompt="system rule",
+        conversation_store=store,
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    service.generate_reply(chat_id=1, user_text="I prefer concise answers")
+
+    assert memory_store.memory_writes == []
+    assert memory_store.pending_writes == [
+        "- [note] existing\n- [preference] I prefer concise answers"
+    ]
+    assert memory_store.history_appends == [
+        "User: I prefer concise answers",
+        "Assistant: noted",
+    ]
+
+
+def test_agent_service_does_not_stage_plain_question_in_pending_memory() -> None:
+    llm_client = StubLLMClient(replies=["answer"])
+    memory_store = StubMemoryStore()
+    store = ConversationStore(max_rounds=3)
+    service = AgentService(
+        llm_client=llm_client,  # type: ignore[arg-type]
+        system_prompt="system rule",
+        conversation_store=store,
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    service.generate_reply(chat_id=1, user_text="What should we do next?")
+
+    assert memory_store.memory_writes == []
+    assert memory_store.pending_writes == []
+
+
+def test_agent_service_writes_explicit_stable_fact_to_memory() -> None:
+    llm_client = StubLLMClient(replies=["noted"])
+    memory_store = StubMemoryStore(
+        MemorySnapshot(
+            self_text="",
+            memory_text="- [note] existing fact",
+            recent_context_text="",
+            pending_text="",
+            history_text="",
+            consolidation_state=ConsolidationState(),
+        )
+    )
+    store = ConversationStore(max_rounds=3)
+    service = AgentService(
+        llm_client=llm_client,  # type: ignore[arg-type]
+        system_prompt="system rule",
+        conversation_store=store,
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    service.generate_reply(chat_id=1, user_text="Please remember that my name is Alex")
+
+    assert memory_store.memory_writes == [
+        "- [note] existing fact\n- [identity] My name is Alex"
+    ]
+    assert memory_store.pending_writes == []
+
+
+def test_agent_service_promotes_repeated_pending_fact_to_memory_and_self() -> None:
+    llm_client = StubLLMClient(replies=["noted"])
+    memory_store = StubMemoryStore(
+        MemorySnapshot(
+            self_text="",
+            memory_text="",
+            recent_context_text="",
+            pending_text="- [preference] I prefer concise answers",
+            history_text="",
+            consolidation_state=ConsolidationState(),
+        )
+    )
+    store = ConversationStore(max_rounds=3)
+    service = AgentService(
+        llm_client=llm_client,  # type: ignore[arg-type]
+        system_prompt="system rule",
+        conversation_store=store,
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    service.generate_reply(chat_id=1, user_text="I prefer concise answers")
+
+    assert memory_store.memory_writes == ["- [preference] I prefer concise answers"]
+    assert memory_store.pending_writes == [""]
+    assert memory_store.self_writes
+    assert "Concise answers" in memory_store.self_writes[-1]
+
+
+def test_agent_service_normalizes_pending_entry_before_deduping() -> None:
+    llm_client = StubLLMClient(replies=["noted"])
+    memory_store = StubMemoryStore(
+        MemorySnapshot(
+            self_text="",
+            memory_text="",
+            recent_context_text="",
+            pending_text="- [preference] I prefer concise answers",
+            history_text="",
+            consolidation_state=ConsolidationState(),
+        )
+    )
+    store = ConversationStore(max_rounds=3)
+    service = AgentService(
+        llm_client=llm_client,  # type: ignore[arg-type]
+        system_prompt="system rule",
+        conversation_store=store,
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    service.generate_reply(chat_id=1, user_text="I prefer concise answers.")
+
+    assert memory_store.memory_writes == ["- [preference] I prefer concise answers"]
+    assert memory_store.pending_writes == [""]
+
+
+def test_agent_service_rebuilds_recent_context_after_three_user_messages() -> None:
+    llm_client = StubLLMClient(replies=["a1", "a2", "a3"])
+    service, _store, memory_store = build_service(llm_client)
+
+    service.generate_reply(chat_id=1, user_text="u1")
+    service.generate_reply(chat_id=1, user_text="u2")
+    service.generate_reply(chat_id=1, user_text="u3")
+
+    assert len(memory_store.state_writes) == 3
+    assert memory_store.recent_context_writes
+    recent = memory_store.recent_context_writes[-1]
+    assert "## Compression" in recent
+    assert "## Recent Turns" in recent
+    assert "User: u3" in recent

@@ -14,7 +14,7 @@ from app.conversation_store import ConversationStore
 from app.llm_client import OpenAICompatibleClient
 from app.memory_store import MemoryStore, MemoryStoreError
 from app.setup_checks import verify_openai_compatible, verify_telegram_token
-from app.telegram_bot import TelegramBot
+from app.telegram_bot import TelegramBot, TelegramOffsetStoreError
 
 
 def configure_logging() -> None:
@@ -67,8 +67,13 @@ def main(argv: list[str] | None = None) -> int:
         agent_service=agent_service,
         poll_timeout_seconds=settings.poll_timeout_seconds,
         request_timeout_seconds=settings.request_timeout_seconds,
+        offset_path=settings.memory_root_dir / "telegram-offset.txt",
     )
-    bot.run_forever()
+    try:
+        bot.run_forever()
+    except TelegramOffsetStoreError as exc:
+        logging.error("%s", exc)
+        return 1
     return 0
 
 

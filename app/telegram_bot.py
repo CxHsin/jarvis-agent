@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -12,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 class TelegramAPIError(RuntimeError):
     """Raised when the Telegram Bot API returns an invalid response."""
+
+
+class TelegramOffsetStoreError(RuntimeError):
+    """Raised when the Telegram polling offset cannot be read or written."""
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,7 @@ class TelegramBot:
         agent_service: AgentService,
         poll_timeout_seconds: int,
         request_timeout_seconds: int,
+        offset_path: Path | None = None,
         session: requests.Session | None = None,
     ) -> None:
         self._agent_service = agent_service
@@ -36,10 +42,11 @@ class TelegramBot:
         self._request_timeout_seconds = request_timeout_seconds
         self._session = session or requests.Session()
         self._base_url = f"https://api.telegram.org/bot{bot_token}"
+        self._offset_path = Path(offset_path) if offset_path is not None else None
 
     def run_forever(self) -> None:
         logger.info("Starting Telegram polling loop")
-        offset: int | None = None
+        offset = self._load_offset()
         while True:
             try:
                 updates = self._get_updates(offset=offset)
@@ -52,6 +59,7 @@ class TelegramBot:
 
             for update in updates:
                 offset = update["update_id"] + 1
+                self._store_offset(offset)
                 message = _parse_incoming_message(update)
                 if message is None:
                     continue
@@ -110,6 +118,30 @@ class TelegramBot:
         data = response.json()
         if not data.get("ok"):
             raise TelegramAPIError("Invalid sendMessage response")
+
+    def _load_offset(self) -> int | None:
+        if self._offset_path is None or not self._offset_path.exists():
+            return None
+        try:
+            raw = self._offset_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise TelegramOffsetStoreError("Failed to read Telegram offset") from exc
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise TelegramOffsetStoreError("Telegram offset file is invalid") from exc
+        return value if value >= 0 else None
+
+    def _store_offset(self, offset: int) -> None:
+        if self._offset_path is None:
+            return
+        try:
+            self._offset_path.parent.mkdir(parents=True, exist_ok=True)
+            self._offset_path.write_text(str(offset), encoding="utf-8")
+        except OSError as exc:
+            raise TelegramOffsetStoreError("Failed to write Telegram offset") from exc
 
 
 def _parse_incoming_message(update: dict[str, Any]) -> IncomingMessage | None:
