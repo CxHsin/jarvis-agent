@@ -21,5 +21,20 @@ root_dir = "memory"
 max_steps = 3
 
 [plugins]
-enabled = []
+enabled = ["interval_reminder"]
 disabled = []
+
+[proactive]
+enabled = false
+chat_id = ""
+tick_interval_seconds = 300
+cooldown_seconds = 1800
+user_active_grace_seconds = 900
+candidate_limit = 3
+max_sends_per_tick = 1
+
+[plugin_config.interval_reminder]
+enabled = false
+interval_minutes = 240
+priority = 5
+message = "该休息一下，喝点水了。"

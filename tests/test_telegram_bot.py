@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from app.proactive import ProactiveRuntimeState
 from app.telegram_bot import TelegramBot
 
 
@@ -88,3 +89,30 @@ def test_telegram_bot_persists_offset_after_processing_update(tmp_path: Path) ->
     assert bot.observed_offsets == [None, 101]
     assert agent_service.calls == [(7, "hello")]
     assert offset_path.read_text(encoding="utf-8") == "101"
+
+
+def test_telegram_bot_updates_runtime_state_for_user_activity(tmp_path: Path) -> None:
+    offset_path = tmp_path / "telegram-offset.txt"
+    runtime_state = ProactiveRuntimeState()
+    bot = SinglePassTelegramBot(
+        updates=[
+            {
+                "update_id": 100,
+                "message": {"chat": {"id": 7}, "text": "hello"},
+            }
+        ],
+        bot_token="bot-token",
+        agent_service=StubAgentService(reply="ok"),  # type: ignore[arg-type]
+        poll_timeout_seconds=30,
+        request_timeout_seconds=5,
+        offset_path=offset_path,
+        session=StubSession(),  # type: ignore[arg-type]
+        runtime_state=runtime_state,
+    )
+
+    try:
+        bot.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+    assert runtime_state.last_user_message_at is not None

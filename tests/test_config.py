@@ -29,6 +29,15 @@ def test_load_settings_reads_required_values_from_toml(
                 "",
                 "[conversation]",
                 "max_rounds = 8",
+                "",
+                "[proactive]",
+                "enabled = true",
+                'chat_id = "77"',
+                "tick_interval_seconds = 120",
+                "cooldown_seconds = 900",
+                "user_active_grace_seconds = 180",
+                "candidate_limit = 5",
+                "max_sends_per_tick = 1",
             ]
         ),
         encoding="utf-8",
@@ -49,6 +58,13 @@ def test_load_settings_reads_required_values_from_toml(
     assert settings.tool_max_steps == 3
     assert settings.enabled_plugins == ()
     assert settings.disabled_plugins == ()
+    assert settings.proactive_enabled is True
+    assert settings.proactive_chat_id == 77
+    assert settings.proactive_tick_interval_seconds == 120
+    assert settings.proactive_cooldown_seconds == 900
+    assert settings.proactive_user_active_grace_seconds == 180
+    assert settings.proactive_candidate_limit == 5
+    assert settings.proactive_max_sends_per_tick == 1
 
 
 def test_load_settings_allows_environment_variables_to_override_file_values(
@@ -84,6 +100,8 @@ def test_load_settings_allows_environment_variables_to_override_file_values(
     assert settings.tool_max_steps == 3
     assert settings.enabled_plugins == ()
     assert settings.disabled_plugins == ()
+    assert settings.proactive_enabled is False
+    assert settings.proactive_chat_id is None
 
 
 def test_load_settings_fails_when_required_values_are_missing(
@@ -149,6 +167,13 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
         tool_max_steps=5,
         enabled_plugins=("ping_tool",),
         disabled_plugins=("note_memory",),
+        proactive_enabled=True,
+        proactive_chat_id="77",
+        proactive_tick_interval_seconds=120,
+        proactive_cooldown_seconds=900,
+        proactive_user_active_grace_seconds=180,
+        proactive_candidate_limit=5,
+        proactive_max_sends_per_tick=1,
     )
 
     write_config_file(draft, path=target)
@@ -163,6 +188,10 @@ def test_write_config_file_outputs_expected_toml(tmp_path: Path) -> None:
     assert "max_steps = 5" in content
     assert 'enabled = ["ping_tool"]' in content
     assert 'disabled = ["note_memory"]' in content
+    assert "[proactive]" in content
+    assert "enabled = true" in content
+    assert 'chat_id = "77"' in content
+    assert "tick_interval_seconds = 120" in content
 
 
 def test_setup_wizard_creates_config_file_from_user_input(

@@ -4,7 +4,8 @@ import importlib
 import logging
 import pkgutil
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 from app.memory_normalizer import MemoryEntry
 from app.tools.base import ToolSpec
@@ -14,6 +15,8 @@ from app.plugins.types import (
     MemoryWriteContext,
     ModelCallContext,
     ModelCallResult,
+    ProactiveCandidate,
+    ProactiveContext,
     PluginOutcome,
     PluginSpec,
     TurnContext,
@@ -22,6 +25,7 @@ from app.plugins.types import (
 )
 
 logger = logging.getLogger(__name__)
+BuildPluginFn = Callable[[dict[str, object]], PluginSpec]
 
 
 class PluginError(RuntimeError):
@@ -43,11 +47,13 @@ class PluginHost:
         registry: ToolRegistry,
         enabled_plugins: tuple[str, ...] = (),
         disabled_plugins: tuple[str, ...] = (),
+        plugin_configs: dict[str, dict[str, object]] | None = None,
         plugins_package: str = "app.plugins",
     ) -> None:
         self._registry = registry
         self._enabled = set(enabled_plugins)
         self._disabled = set(disabled_plugins)
+        self._plugin_configs = plugin_configs or {}
         self._plugins_package = plugins_package
         self._plugins: list[PluginSpec] = []
         self._loaded_ids: list[str] = []
@@ -69,6 +75,12 @@ class PluginHost:
     @property
     def available_tools(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self._registry.list_specs())
+
+    @property
+    def proactive_plugin_ids(self) -> tuple[str, ...]:
+        return tuple(
+            plugin.plugin_id for plugin in self._plugins if plugin.collect_proactive_candidates is not None
+        )
 
     def initialize(self) -> None:
         discovered = self._discover_plugins()
@@ -139,6 +151,19 @@ class PluginHost:
             chat_id=result.chat_id,
         )
 
+    def collect_proactive_candidates(self, context: ProactiveContext) -> list[ProactiveCandidate]:
+        return self._run_hook_list(
+            hook_name="collect_proactive_candidates",
+            invoke=(
+                lambda plugin: plugin.collect_proactive_candidates(context)
+                if plugin.collect_proactive_candidates
+                else None
+            ),
+            validator=_validate_proactive_candidates,
+            default=[],
+            chat_id=context.chat_id,
+        )
+
     def _discover_plugins(self) -> list[PluginSpec]:
         try:
             package = importlib.import_module(self._plugins_package)
@@ -169,13 +194,32 @@ class PluginHost:
                 continue
 
             plugin = getattr(module, "PLUGIN", None)
-            if not isinstance(plugin, PluginSpec):
+            builder = getattr(module, "build_plugin", None)
+            plugin_id_hint = getattr(module, "PLUGIN_ID", None)
+            if builder is not None:
+                try:
+                    plugin = self._build_plugin_from_factory(
+                        module_name=module_name,
+                        builder=builder,
+                        plugin_id_hint=plugin_id_hint,
+                    )
+                except PluginError as exc:
+                    self._failures.append(
+                        PluginLoadFailure(
+                            plugin_id=plugin_id_hint,
+                            module_name=module_name,
+                            stage="validation",
+                            message=str(exc),
+                        )
+                    )
+                    continue
+            elif not isinstance(plugin, PluginSpec):
                 self._failures.append(
                     PluginLoadFailure(
                         plugin_id=None,
                         module_name=module_name,
                         stage="validation",
-                        message="Module must export PLUGIN of type PluginSpec.",
+                        message="Module must export PLUGIN or build_plugin(config).",
                     )
                 )
                 continue
@@ -191,7 +235,7 @@ class PluginHost:
                 )
                 continue
             seen_ids.add(plugin.plugin_id)
-            plugins.append(plugin)
+            plugins.append(plugin if builder is not None else self._apply_plugin_config(plugin))
         return plugins
 
     def _filter_enabled_plugins(self, plugins: list[PluginSpec]) -> list[PluginSpec]:
@@ -308,6 +352,29 @@ class PluginHost:
             results.extend(validated)
         return results
 
+    def _apply_plugin_config(self, plugin: PluginSpec) -> PluginSpec:
+        overrides = self._plugin_configs.get(plugin.plugin_id)
+        if not overrides:
+            return plugin
+        merged = dict(plugin.config)
+        merged.update(overrides)
+        return replace(plugin, config=merged)
+
+    def _build_plugin_from_factory(
+        self,
+        *,
+        module_name: str,
+        builder: object,
+        plugin_id_hint: str | None,
+    ) -> PluginSpec:
+        if not callable(builder):
+            raise PluginError(f"{module_name}.build_plugin must be callable.")
+        overrides = dict(self._plugin_configs.get(plugin_id_hint or "", {}))
+        plugin = builder(overrides)
+        if not isinstance(plugin, PluginSpec):
+            raise PluginError(f"{module_name}.build_plugin must return PluginSpec.")
+        return plugin
+
 
 def _validate_text_list(payload: object) -> list[str]:
     if not isinstance(payload, list):
@@ -344,3 +411,22 @@ def _validate_tool_specs(payload: object) -> list[ToolSpec]:
     if not isinstance(payload, list) or not all(isinstance(item, ToolSpec) for item in payload):
         raise PluginError("Expected a list of ToolSpec.")
     return list(payload)
+
+
+def _validate_proactive_candidates(payload: object) -> list[ProactiveCandidate]:
+    if not isinstance(payload, list) or not all(
+        isinstance(item, ProactiveCandidate) for item in payload
+    ):
+        raise PluginError("Expected a list of ProactiveCandidate.")
+    candidates: list[ProactiveCandidate] = []
+    for item in payload:
+        if not item.candidate_id.strip():
+            raise PluginError("ProactiveCandidate.candidate_id must be non-empty.")
+        if not item.plugin_id.strip():
+            raise PluginError("ProactiveCandidate.plugin_id must be non-empty.")
+        if not item.kind.strip():
+            raise PluginError("ProactiveCandidate.kind must be non-empty.")
+        if not item.summary.strip():
+            raise PluginError("ProactiveCandidate.summary must be non-empty.")
+        candidates.append(item)
+    return candidates

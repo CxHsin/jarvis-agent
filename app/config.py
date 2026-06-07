@@ -24,6 +24,14 @@ class Settings:
     tool_max_steps: int
     enabled_plugins: tuple[str, ...] = ()
     disabled_plugins: tuple[str, ...] = ()
+    plugin_configs: dict[str, dict[str, object]] | None = None
+    proactive_enabled: bool = False
+    proactive_chat_id: int | None = None
+    proactive_tick_interval_seconds: int = 300
+    proactive_cooldown_seconds: int = 1800
+    proactive_user_active_grace_seconds: int = 900
+    proactive_candidate_limit: int = 3
+    proactive_max_sends_per_tick: int = 1
 
 
 DEFAULT_CONFIG_PATH = Path("config.toml")
@@ -44,6 +52,13 @@ class ConfigDraft:
     tool_max_steps: int
     enabled_plugins: tuple[str, ...] = ()
     disabled_plugins: tuple[str, ...] = ()
+    proactive_enabled: bool = False
+    proactive_chat_id: str = ""
+    proactive_tick_interval_seconds: int = 300
+    proactive_cooldown_seconds: int = 1800
+    proactive_user_active_grace_seconds: int = 900
+    proactive_candidate_limit: int = 3
+    proactive_max_sends_per_tick: int = 1
 
 
 def _load_config_file(path: Path) -> dict[str, object]:
@@ -82,13 +97,45 @@ def _draft_from_config(config: dict[str, object]) -> ConfigDraft:
         tool_max_steps=_read_int(config, "tools.max_steps", 3),
         enabled_plugins=_read_string_list(config, "plugins.enabled", ()),
         disabled_plugins=_read_string_list(config, "plugins.disabled", ()),
+        proactive_enabled=_read_bool(config, "proactive.enabled", False),
+        proactive_chat_id=_read_string(config, "proactive.chat_id", ""),
+        proactive_tick_interval_seconds=_read_int(config, "proactive.tick_interval_seconds", 300),
+        proactive_cooldown_seconds=_read_int(config, "proactive.cooldown_seconds", 1800),
+        proactive_user_active_grace_seconds=_read_int(
+            config,
+            "proactive.user_active_grace_seconds",
+            900,
+        ),
+        proactive_candidate_limit=_read_int(config, "proactive.candidate_limit", 3),
+        proactive_max_sends_per_tick=_read_int(config, "proactive.max_sends_per_tick", 1),
     )
+
+
+def _read_plugin_configs(config: dict[str, object]) -> dict[str, dict[str, object]]:
+    raw = _lookup_config_value(config, "plugin_config")
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for plugin_id, value in raw.items():
+        if not isinstance(plugin_id, str) or not plugin_id.strip():
+            continue
+        if not isinstance(value, dict):
+            continue
+        result[plugin_id.strip()] = dict(value)
+    return result
 
 
 def _read_string(config: dict[str, object], dotted_key: str, default: str) -> str:
     value = _lookup_config_value(config, dotted_key)
     if isinstance(value, str) and value.strip():
         return value.strip()
+    return default
+
+
+def _read_bool(config: dict[str, object], dotted_key: str, default: bool) -> bool:
+    value = _lookup_config_value(config, dotted_key)
+    if isinstance(value, bool):
+        return value
     return default
 
 
@@ -174,6 +221,49 @@ def _get_int(
             f"Setting {env_name} or '{dotted_key}' in {DEFAULT_CONFIG_PATH} must be greater than zero"
         )
     return value
+
+
+def _get_optional_int(
+    config: dict[str, object],
+    env_name: str,
+    dotted_key: str,
+) -> int | None:
+    env_value = os.getenv(env_name, "").strip()
+    if env_value:
+        raw = env_value
+    else:
+        file_value = _lookup_config_value(config, dotted_key)
+        if file_value is None or (isinstance(file_value, str) and not file_value.strip()):
+            return None
+        raw = str(file_value).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"Setting {env_name} or '{dotted_key}' in {DEFAULT_CONFIG_PATH} must be an integer"
+        ) from exc
+    return value
+
+
+def _get_bool(
+    config: dict[str, object],
+    env_name: str,
+    dotted_key: str,
+    default: bool,
+) -> bool:
+    env_value = os.getenv(env_name, "").strip().lower()
+    if env_value:
+        if env_value in {"1", "true", "yes", "on"}:
+            return True
+        if env_value in {"0", "false", "no", "off"}:
+            return False
+        raise ConfigError(
+            f"Setting {env_name} or '{dotted_key}' in {DEFAULT_CONFIG_PATH} must be a boolean"
+        )
+    file_value = _lookup_config_value(config, dotted_key)
+    if isinstance(file_value, bool):
+        return file_value
+    return default
 
 
 def _get_string_list(
@@ -263,6 +353,48 @@ def settings_from_config(config: dict[str, object]) -> Settings:
             "plugins.disabled",
             (),
         ),
+        plugin_configs=_read_plugin_configs(config),
+        proactive_enabled=_get_bool(
+            config,
+            "PROACTIVE_ENABLED",
+            "proactive.enabled",
+            False,
+        ),
+        proactive_chat_id=_get_optional_int(
+            config,
+            "PROACTIVE_CHAT_ID",
+            "proactive.chat_id",
+        ),
+        proactive_tick_interval_seconds=_get_int(
+            config,
+            "PROACTIVE_TICK_INTERVAL_SECONDS",
+            "proactive.tick_interval_seconds",
+            300,
+        ),
+        proactive_cooldown_seconds=_get_int(
+            config,
+            "PROACTIVE_COOLDOWN_SECONDS",
+            "proactive.cooldown_seconds",
+            1800,
+        ),
+        proactive_user_active_grace_seconds=_get_int(
+            config,
+            "PROACTIVE_USER_ACTIVE_GRACE_SECONDS",
+            "proactive.user_active_grace_seconds",
+            900,
+        ),
+        proactive_candidate_limit=_get_int(
+            config,
+            "PROACTIVE_CANDIDATE_LIMIT",
+            "proactive.candidate_limit",
+            3,
+        ),
+        proactive_max_sends_per_tick=_get_int(
+            config,
+            "PROACTIVE_MAX_SENDS_PER_TICK",
+            "proactive.max_sends_per_tick",
+            1,
+        ),
     )
 
 
@@ -307,6 +439,13 @@ def run_setup_wizard(*, overwrite: bool, path: Path = DEFAULT_CONFIG_PATH) -> Pa
         tool_max_steps=draft.tool_max_steps,
         enabled_plugins=draft.enabled_plugins,
         disabled_plugins=draft.disabled_plugins,
+        proactive_enabled=draft.proactive_enabled,
+        proactive_chat_id=draft.proactive_chat_id,
+        proactive_tick_interval_seconds=draft.proactive_tick_interval_seconds,
+        proactive_cooldown_seconds=draft.proactive_cooldown_seconds,
+        proactive_user_active_grace_seconds=draft.proactive_user_active_grace_seconds,
+        proactive_candidate_limit=draft.proactive_candidate_limit,
+        proactive_max_sends_per_tick=draft.proactive_max_sends_per_tick,
     )
 
     write_config_file(updated, path=path)
@@ -341,6 +480,15 @@ def write_config_file(draft: ConfigDraft, *, path: Path = DEFAULT_CONFIG_PATH) -
             "[plugins]",
             f"enabled = {_toml_list(draft.enabled_plugins)}",
             f"disabled = {_toml_list(draft.disabled_plugins)}",
+            "",
+            "[proactive]",
+            f"enabled = {_toml_bool(draft.proactive_enabled)}",
+            f"chat_id = {_toml_string(draft.proactive_chat_id)}",
+            f"tick_interval_seconds = {draft.proactive_tick_interval_seconds}",
+            f"cooldown_seconds = {draft.proactive_cooldown_seconds}",
+            f"user_active_grace_seconds = {draft.proactive_user_active_grace_seconds}",
+            f"candidate_limit = {draft.proactive_candidate_limit}",
+            f"max_sends_per_tick = {draft.proactive_max_sends_per_tick}",
             "",
         ]
     )
@@ -381,3 +529,7 @@ def _toml_string(value: str) -> str:
 
 def _toml_list(values: tuple[str, ...]) -> str:
     return "[" + ", ".join(_toml_string(value) for value in values) + "]"
+
+
+def _toml_bool(value: bool) -> str:
+    return "true" if value else "false"

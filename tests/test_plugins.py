@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,8 @@ from app.plugins import (
     MemoryWriteContext,
     ModelCallContext,
     ModelCallResult,
+    ProactiveCandidate,
+    ProactiveContext,
     PluginHost,
     PluginOutcome,
     PluginSpec,
@@ -148,6 +151,63 @@ def test_plugin_host_rejects_duplicate_tool_names() -> None:
     assert any(failure.stage == "register_tools" for failure in host.load_failures)
 
 
+def test_plugin_host_collects_proactive_candidates() -> None:
+    registry = ToolRegistry()
+    host = PluginHost(
+        registry=registry,
+        plugins_package="tests.fixtures.proactive_plugins",
+    )
+
+    host.initialize()
+    candidates = host.collect_proactive_candidates(
+        ProactiveContext(
+            chat_id=7,
+            now=datetime.now(UTC),
+            last_user_message_at=None,
+            last_proactive_send_at=None,
+            memory_snapshot=None,
+            available_tools=(),
+            enabled_plugin_ids=host.loaded_plugin_ids,
+        )
+    )
+
+    assert candidates == [
+        ProactiveCandidate(
+            candidate_id="cand-1",
+            plugin_id="simple_candidate",
+            kind="reminder",
+            summary="Remember to drink water.",
+            priority=10,
+            dedupe_key="water-reminder",
+            suggested_message="Remember to drink water.",
+            evidence=("fixture",),
+        )
+    ]
+    assert host.proactive_plugin_ids == ("simple_candidate",)
+
+
+def test_plugin_host_skips_invalid_proactive_candidates(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("WARNING")
+    registry = ToolRegistry()
+    host = PluginHost(registry=registry, plugins_package="tests.fixtures.invalid_plugins")
+
+    host.initialize()
+    candidates = host.collect_proactive_candidates(
+        ProactiveContext(
+            chat_id=1,
+            now=datetime.now(UTC),
+            last_user_message_at=None,
+            last_proactive_send_at=None,
+            memory_snapshot=None,
+            available_tools=(),
+            enabled_plugin_ids=host.loaded_plugin_ids,
+        )
+    )
+
+    assert candidates == []
+    assert "Plugin contribution rejected" in caplog.text
+
+
 def test_agent_service_applies_plugin_context_and_memory_candidates() -> None:
     llm_client = StubLLMClient(replies=["ok"])
     memory_store = StubMemoryStore()
@@ -169,4 +229,3 @@ def test_agent_service_applies_plugin_context_and_memory_candidates() -> None:
 
     assert "Plugin hint: The user explicitly requested concise output." in llm_client.messages[0][2].content
     assert memory_store.memory_writes == ["- [note] buy milk and be concise"]
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable
 
 from app.conversation_store import ConversationTurn
@@ -66,12 +67,37 @@ class TurnResult:
     turn_notes: tuple[TurnNote, ...]
 
 
+@dataclass(frozen=True)
+class ProactiveContext:
+    chat_id: int
+    now: datetime
+    last_user_message_at: datetime | None
+    last_proactive_send_at: datetime | None
+    memory_snapshot: MemorySnapshot | None
+    available_tools: tuple[str, ...]
+    enabled_plugin_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ProactiveCandidate:
+    candidate_id: str
+    plugin_id: str
+    kind: str
+    summary: str
+    priority: int = 0
+    not_before: datetime | None = None
+    dedupe_key: str | None = None
+    suggested_message: str | None = None
+    evidence: tuple[str, ...] = ()
+
+
 RegisterToolsHook = Callable[[], list[ToolSpec]]
 BuildContextHook = Callable[[TurnContext], list[str]]
 BeforeModelCallHook = Callable[[ModelCallContext], list[str]]
 AfterModelCallHook = Callable[[ModelCallResult], list[TurnNote]]
 BeforeMemoryWriteHook = Callable[[MemoryWriteContext], list[MemoryEntry]]
 AfterTurnHook = Callable[[TurnResult], PluginOutcome | None]
+CollectProactiveCandidatesHook = Callable[[ProactiveContext], list[ProactiveCandidate]]
 
 
 @dataclass(frozen=True)
@@ -87,4 +113,5 @@ class PluginSpec:
     after_model_call: AfterModelCallHook | None = None
     before_memory_write: BeforeMemoryWriteHook | None = None
     after_turn: AfterTurnHook | None = None
+    collect_proactive_candidates: CollectProactiveCandidatesHook | None = None
     config: dict[str, object] = field(default_factory=dict)

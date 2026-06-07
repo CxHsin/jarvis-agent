@@ -15,6 +15,7 @@ from app.conversation_store import ConversationStore
 from app.llm_client import OpenAICompatibleClient
 from app.memory_store import MemoryStore, MemoryStoreError
 from app.plugins import PluginError, PluginHost
+from app.proactive import ProactiveConfig, ProactiveRuntimeState, ProactiveScheduler
 from app.setup_checks import verify_openai_compatible, verify_telegram_token
 from app.telegram_bot import TelegramBot, TelegramOffsetStoreError
 from app.tools import ToolExecutor, ToolLoop, build_builtin_tool_registry
@@ -67,12 +68,19 @@ def main(argv: list[str] | None = None) -> int:
         registry=tool_registry,
         enabled_plugins=settings.enabled_plugins,
         disabled_plugins=settings.disabled_plugins,
+        plugin_configs=settings.plugin_configs or {},
     )
     try:
         plugin_host.initialize()
     except PluginError as exc:
         logging.error("%s", exc)
         return 1
+    logging.info(
+        "Runtime plugin state: loaded=%s proactive=%s",
+        ",".join(plugin_host.loaded_plugin_ids) or "(none)",
+        ",".join(plugin_host.proactive_plugin_ids) or "(none)",
+    )
+    proactive_state = ProactiveRuntimeState()
     agent_service = AgentService(
         llm_client=llm_client,
         system_prompt=settings.system_prompt,
@@ -91,13 +99,66 @@ def main(argv: list[str] | None = None) -> int:
         poll_timeout_seconds=settings.poll_timeout_seconds,
         request_timeout_seconds=settings.request_timeout_seconds,
         offset_path=settings.memory_root_dir / "telegram-offset.txt",
+        runtime_state=proactive_state,
     )
+    proactive_scheduler = _build_proactive_scheduler(
+        settings=settings,
+        plugin_host=plugin_host,
+        memory_store=memory_store,
+        telegram_bot=bot,
+        runtime_state=proactive_state,
+    )
+    if proactive_scheduler is not None:
+        logging.info(
+            "Proactive runtime enabled: chat_id=%s interval=%ss cooldown=%ss",
+            settings.proactive_chat_id,
+            settings.proactive_tick_interval_seconds,
+            settings.proactive_cooldown_seconds,
+        )
+        proactive_scheduler.start()
+    else:
+        logging.info("Proactive runtime disabled")
     try:
         bot.run_forever()
     except TelegramOffsetStoreError as exc:
         logging.error("%s", exc)
         return 1
+    finally:
+        if proactive_scheduler is not None:
+            proactive_scheduler.stop()
     return 0
+
+
+def _build_proactive_scheduler(
+    *,
+    settings,
+    plugin_host: PluginHost,
+    memory_store: MemoryStore,
+    telegram_bot: TelegramBot,
+    runtime_state: ProactiveRuntimeState,
+) -> ProactiveScheduler | None:
+    if not settings.proactive_enabled:
+        return None
+    if settings.proactive_chat_id is None:
+        logging.warning("Proactive scheduler enabled but proactive.chat_id is missing; skipping startup")
+        return None
+    config = ProactiveConfig(
+        enabled=True,
+        chat_id=settings.proactive_chat_id,
+        delivery_log_path=settings.memory_root_dir / "proactive_delivery_log.json",
+        tick_interval_seconds=settings.proactive_tick_interval_seconds,
+        cooldown_seconds=settings.proactive_cooldown_seconds,
+        user_active_grace_seconds=settings.proactive_user_active_grace_seconds,
+        candidate_limit=settings.proactive_candidate_limit,
+        max_sends_per_tick=settings.proactive_max_sends_per_tick,
+    )
+    return ProactiveScheduler(
+        config=config,
+        plugin_host=plugin_host,
+        memory_store=memory_store,
+        telegram_bot=telegram_bot,
+        runtime_state=runtime_state,
+    )
 
 
 def _handle_setup(*, overwrite: bool) -> int:

@@ -1,12 +1,16 @@
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import requests
 
 from app.agent import AgentService
 from app.llm_client import LLMClientError
+
+if TYPE_CHECKING:
+    from app.proactive import ProactiveRuntimeState
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,7 @@ class TelegramBot:
         request_timeout_seconds: int,
         offset_path: Path | None = None,
         session: requests.Session | None = None,
+        runtime_state: "ProactiveRuntimeState | None" = None,
     ) -> None:
         self._agent_service = agent_service
         self._poll_timeout_seconds = poll_timeout_seconds
@@ -43,6 +48,7 @@ class TelegramBot:
         self._session = session or requests.Session()
         self._base_url = f"https://api.telegram.org/bot{bot_token}"
         self._offset_path = Path(offset_path) if offset_path is not None else None
+        self._runtime_state = runtime_state
 
     def run_forever(self) -> None:
         logger.info("Starting Telegram polling loop")
@@ -67,6 +73,8 @@ class TelegramBot:
 
     def _handle_message(self, message: IncomingMessage) -> None:
         logger.info("Received Telegram message", extra={"chat_id": message.chat_id})
+        if self._runtime_state is not None:
+            self._runtime_state.record_user_message(datetime.now(UTC))
         try:
             logger.info("Calling LLM", extra={"chat_id": message.chat_id})
             reply_text = self._agent_service.generate_reply(
@@ -88,6 +96,10 @@ class TelegramBot:
             logger.exception("Failed to send Telegram reply")
         except TelegramAPIError:
             logger.exception("Telegram API returned an invalid sendMessage response")
+
+    def send_proactive_message(self, *, chat_id: int, text: str) -> None:
+        self._send_message(chat_id=chat_id, text=text)
+        logger.info("Sent proactive Telegram message", extra={"chat_id": chat_id})
 
     def _get_updates(self, *, offset: int | None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
