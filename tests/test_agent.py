@@ -145,6 +145,42 @@ class StubMemoryStore:
         )
 
 
+class SelectiveFailingMemoryStore(StubMemoryStore):
+    def __init__(self, *, fail_on: str, snapshot: MemorySnapshot | None = None) -> None:
+        super().__init__(snapshot)
+        self._fail_on = fail_on
+
+    def write_self(self, text: str) -> None:
+        if self._fail_on == "write_self":
+            raise MemoryStoreError("write_self failed")
+        super().write_self(text)
+
+    def write_memory(self, text: str) -> None:
+        if self._fail_on == "write_memory":
+            raise MemoryStoreError("write_memory failed")
+        super().write_memory(text)
+
+    def write_pending(self, text: str) -> None:
+        if self._fail_on == "write_pending":
+            raise MemoryStoreError("write_pending failed")
+        super().write_pending(text)
+
+    def append_history(self, text: str) -> None:
+        if self._fail_on == "append_history":
+            raise MemoryStoreError("append_history failed")
+        super().append_history(text)
+
+    def write_recent_context(self, text: str) -> None:
+        if self._fail_on == "write_recent_context":
+            raise MemoryStoreError("write_recent_context failed")
+        super().write_recent_context(text)
+
+    def write_consolidation_state(self, state: ConsolidationState) -> None:
+        if self._fail_on == "write_consolidation_state":
+            raise MemoryStoreError("write_consolidation_state failed")
+        super().write_consolidation_state(state)
+
+
 def build_service(
     llm_client: object,
     *,
@@ -557,3 +593,34 @@ def test_agent_service_can_complete_turn_with_tool_loop() -> None:
     assert [(turn.user_text, turn.assistant_text) for turn in store.get_history(1)] == [
         ("check memory", "tool-assisted reply")
     ]
+
+
+def test_agent_service_keeps_reply_and_conversation_commit_when_memory_persistence_fails() -> None:
+    llm_client = StubLLMClient(replies=["noted"])
+    memory_store = SelectiveFailingMemoryStore(
+        fail_on="write_memory",
+        snapshot=MemorySnapshot(
+            self_text="",
+            memory_text="- [note] existing fact",
+            recent_context_text="",
+            pending_text="",
+            history_text="",
+            consolidation_state=ConsolidationState(),
+        ),
+    )
+    store = ConversationStore(max_rounds=3)
+    service = AgentService(
+        llm_client=llm_client,  # type: ignore[arg-type]
+        system_prompt="system rule",
+        conversation_store=store,
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    reply = service.generate_reply(chat_id=1, user_text="Please remember that my name is Alex")
+
+    assert reply == "noted"
+    assert [(turn.user_text, turn.assistant_text) for turn in store.get_history(1)] == [
+        ("Please remember that my name is Alex", "noted")
+    ]
+    assert memory_store.history_appends == []
+    assert memory_store.state_writes == []

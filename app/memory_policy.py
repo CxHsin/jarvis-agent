@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 
-from app.conversation_store import ConversationTurn
-from app.llm_client import ChatMessage
 from app.memory_normalizer import (
     MemoryEntry,
     classify_user_memory_entry,
@@ -49,32 +47,6 @@ class MemoryPolicy:
     _MAX_MEMORY_LINES = 20
     _DIRECT_MEMORY_TAGS = frozenset({"identity", "requested_memory"})
     _PENDING_TAGS = frozenset({"identity", "preference", "requested_memory"})
-
-    def build_messages(
-        self,
-        *,
-        system_prompt: str,
-        memory_snapshot: MemorySnapshot | None,
-        history: list[ConversationTurn],
-        user_text: str,
-        extra_system_sections: list[str] | None = None,
-    ) -> list[ChatMessage]:
-        messages = [ChatMessage(role="system", content=system_prompt)]
-        memory_sections = self._build_memory_sections(memory_snapshot)
-        messages.extend(ChatMessage(role="system", content=section) for section in memory_sections)
-        messages.extend(
-            ChatMessage(role="system", content=section)
-            for section in (extra_system_sections or [])
-            if section.strip()
-        )
-
-        for turn in history:
-            messages.append(ChatMessage(role="user", content=turn.user_text))
-            if self._should_replay_assistant_text(turn.assistant_text):
-                messages.append(ChatMessage(role="assistant", content=turn.assistant_text))
-
-        messages.append(ChatMessage(role="user", content=user_text))
-        return messages
 
     def build_memory_write_plan(
         self,
@@ -163,7 +135,7 @@ class MemoryPolicy:
             history_entry_text=history_entry_text,
         )
 
-    def _build_memory_sections(self, snapshot: MemorySnapshot | None) -> list[str]:
+    def build_memory_sections(self, snapshot: MemorySnapshot | None) -> list[str]:
         if snapshot is None:
             return []
 
@@ -208,7 +180,7 @@ class MemoryPolicy:
         updated = apply_interaction_style_updates(model, [style_update])
         return format_self_model(updated)
 
-    def _should_replay_assistant_text(self, assistant_text: str) -> bool:
+    def should_replay_assistant_text(self, assistant_text: str) -> bool:
         text = assistant_text.strip()
         if not text:
             return False
