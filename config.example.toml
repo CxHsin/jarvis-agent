@@ -1,0 +1,40 @@
+[telegram]
+# BotFather 给你的 bot token
+bot_token = "123456:replace-me"
+# 建议填你自己的 Telegram chat id；留空表示不限制
+allowed_chat_ids = []
+
+[llm]
+# 当前项目只接一个主模型，但填法参考 akashic 的 OpenAI-compatible 方式。
+# 可以直接填字符串，也可以用 ${ENV_VAR} 引用环境变量。
+#
+# 常见组合：
+# OpenAI:
+# api_key = "${OPENAI_API_KEY}"
+# base_url = "https://api.openai.com/v1"
+# model = "gpt-4.1-mini"
+#
+# DeepSeek:
+# api_key = "${DEEPSEEK_API_KEY}"
+# base_url = "https://api.deepseek.com/v1"
+# model = "deepseek-chat"
+#
+# Qwen 兼容模式:
+# api_key = "${DASHSCOPE_API_KEY}"
+# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# model = "qwen-plus"
+api_key = "${OPENAI_API_KEY}"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+timeout_seconds = 60
+
+[search]
+provider = "duckduckgo"
+
+[runtime]
+workspace = "."
+data_dir = "data"
+log_dir = "logs"
+log_level = "INFO"
+session_history_limit = 12
+max_tool_round_trips = 8
