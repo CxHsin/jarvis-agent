@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from jarvis.memory import MemoryEngine
 from jarvis.runtime.event_bus import EventBus
 from jarvis.runtime.processing import ProcessingState
 from jarvis.services.scheduler import SchedulerTick
@@ -23,9 +24,11 @@ class ProactivePipeline:
         *,
         processing: ProcessingState,
         event_bus: EventBus,
+        memory: MemoryEngine | None = None,
     ) -> None:
         self._processing = processing
         self._event_bus = event_bus
+        self._memory = memory
 
     async def handle_tick(self, tick: SchedulerTick) -> ProactiveOutcome:
         payload = await self._event_bus.emit(
@@ -36,10 +39,15 @@ class ProactivePipeline:
                 "source": tick.source,
             },
         )
+        status = "idle"
+        reason = "no proactive strategy configured"
+        if self._memory is not None:
+            optimized, reason = self._memory.optimize(payload["occurred_at"])
+            status = "memory_optimized" if optimized else "idle"
         outcome = ProactiveOutcome(
-            status="idle",
+            status=status,
             delivered=False,
-            reason="no proactive strategy configured",
+            reason=reason,
             tick_id=str(payload["tick_id"]),
             occurred_at=payload["occurred_at"],
         )

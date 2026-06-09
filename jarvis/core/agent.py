@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from jarvis.config import AppConfig
+from jarvis.memory import build_memory_engine
 from jarvis.pipelines.passive.runner import PassivePipeline
 from jarvis.runtime.event_bus import EventBus
 from jarvis.services.llm import LlmClient
@@ -18,11 +19,13 @@ class Agent:
         sessions: SessionStore,
         tools: ToolRuntime,
     ) -> None:
+        memory = build_memory_engine(config, context_store=sessions.context_store)
         self._pipeline = PassivePipeline(
             config=config,
             llm=llm,
             sessions=sessions,
             tools=tools,
+            memory=memory,
             event_bus=EventBus(),
         )
 

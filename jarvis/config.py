@@ -17,6 +17,7 @@ class LlmConfig(BaseModel):
     api_key: str
     base_url: str = "https://api.openai.com/v1"
     model: str
+    embedding_model: str = "text-embedding-3-small"
     timeout_seconds: int = 60
 
 
@@ -31,6 +32,11 @@ class RuntimeConfig(BaseModel):
     log_level: str = "INFO"
     session_history_limit: int = 12
     max_tool_round_trips: int = 8
+    memory_enabled: bool = True
+    memory_dir: str = "memory"
+    memory_optimizer_enabled: bool = True
+    memory_optimizer_interval_seconds: int = 64800
+    memory_vector_recall_limit: int = 3
 
 
 class AppConfig(BaseModel):
@@ -52,8 +58,16 @@ class AppConfig(BaseModel):
         return self.workspace_path / self.runtime.log_dir
 
     @property
+    def context_store_path(self) -> Path:
+        return self.data_dir_path / "context.json"
+
+    @property
     def session_store_path(self) -> Path:
-        return self.data_dir_path / "sessions.json"
+        return self.context_store_path
+
+    @property
+    def memory_dir_path(self) -> Path:
+        return self.data_dir_path / self.runtime.memory_dir
 
 
 def load_config(path: str | Path = "config.toml") -> AppConfig:

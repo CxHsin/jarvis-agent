@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from jarvis.config import AppConfig
+from jarvis.memory import JsonContextStore, MemoryEngine, build_memory_engine
 from jarvis.pipelines.passive.runner import PassivePipeline
 from jarvis.pipelines.proactive.runner import ProactivePipeline
 from jarvis.runtime.app import AppRuntime
@@ -20,6 +21,8 @@ class RuntimeContainer:
     app: AppRuntime
     passive_pipeline: PassivePipeline
     proactive_pipeline: ProactivePipeline
+    context_store: JsonContextStore
+    memory: MemoryEngine
     sessions: SessionStore
     tools: ToolRuntime
     llm: LlmClient
@@ -34,8 +37,15 @@ class RuntimeContainer:
 def build_runtime(config: AppConfig) -> RuntimeContainer:
     config.data_dir_path.mkdir(parents=True, exist_ok=True)
     config.log_dir_path.mkdir(parents=True, exist_ok=True)
+    config.memory_dir_path.mkdir(parents=True, exist_ok=True)
 
-    sessions = SessionStore(config.session_store_path, config.runtime.session_history_limit)
+    context_store = JsonContextStore(config.context_store_path, config.runtime.session_history_limit)
+    sessions = SessionStore(
+        config.context_store_path,
+        config.runtime.session_history_limit,
+        context_store=context_store,
+    )
+    memory = build_memory_engine(config, context_store=context_store)
     llm = LlmClient(config.llm)
     tools = build_tool_runtime(config.workspace_path)
     event_bus = EventBus()
@@ -49,11 +59,13 @@ def build_runtime(config: AppConfig) -> RuntimeContainer:
         llm=llm,
         sessions=sessions,
         tools=tools,
+        memory=memory,
         event_bus=event_bus,
     )
     proactive_pipeline = ProactivePipeline(
         processing=processing,
         event_bus=event_bus,
+        memory=memory,
     )
     app = AppRuntime(
         passive_pipeline,
@@ -68,6 +80,8 @@ def build_runtime(config: AppConfig) -> RuntimeContainer:
         app=app,
         passive_pipeline=passive_pipeline,
         proactive_pipeline=proactive_pipeline,
+        context_store=context_store,
+        memory=memory,
         sessions=sessions,
         tools=tools,
         llm=llm,

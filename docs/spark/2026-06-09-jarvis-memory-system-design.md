@@ -27,6 +27,12 @@ It also adopts the same high-level shape as Akashic:
 - lightweight post-turn consolidation
 - lower-frequency background optimization
 
+Within that shape, `SELF.md` and `MEMORY.md` are full-injection memory files.
+
+They are not truncated and are not retrieval-gated during prompt assembly.
+
+That is why the optimizer must keep them compact.
+
 ## Product Goal
 
 This phase is successful when Jarvis has a memory subsystem that:
@@ -122,8 +128,8 @@ Callers should depend on its protocols, not on any specific storage implementati
 
 Responsibilities:
 
-- run after committed turns
-- decide whether enough new conversation has accumulated
+- run a consolidation check after each committed agent turn
+- decide whether enough new conversation has accumulated to run full consolidation
 - extract history events and pending long-term memory candidates
 - refresh recent-context summary
 
@@ -140,6 +146,13 @@ Responsibilities:
 - reconcile corrections and duplicates
 
 This component exists specifically so that high-frequency turn handling does not keep rewriting long-term prompt memory.
+
+The default runtime behavior is a background optimizer task enabled at agent startup.
+
+Suggested defaults:
+
+- `memory_optimizer_enabled = true`
+- `memory_optimizer_interval_seconds = 64800`
 
 ### `PromptContextAssembler`
 
@@ -201,6 +214,8 @@ Rules:
 - it is separate from user long-term memory
 - it should stay compact enough for full prompt injection
 
+`SELF.md` is a full-injection file and should remain compact enough to inject in full on every turn.
+
 ### `MEMORY.md`
 
 Purpose:
@@ -213,6 +228,10 @@ Rules:
 - it should be prompt-friendly and compact
 - it should not be used as a high-frequency write target
 
+`MEMORY.md` is a full-injection file.
+
+It is not truncated and is not retrieval-gated during prompt assembly.
+
 ### `RECENT_CONTEXT.md`
 
 Purpose:
@@ -222,9 +241,11 @@ Purpose:
 
 Rules:
 
-- it is updated by consolidation
+- its `Compression` block is updated by consolidation
 - it contains compressed recent context, not the only source of recent raw turns
 - assistant suggestions must not be converted into user facts during compression
+- the `Compression` block is generated only from `USER` messages
+- the `Recent Turns` block is refreshed separately after each turn without requiring full consolidation
 
 Suggested structure:
 
@@ -234,6 +255,8 @@ Suggested structure:
 - `## Recent Turns`
 
 The `Recent Turns` block is a lightweight view and does not replace the separate recent-turn context capability.
+
+The `Compression` block is produced by the second consolidation LLM call and should follow strict extraction rules rather than freeform assistant-authored summarization.
 
 ### `HISTORY.md`
 
@@ -247,6 +270,7 @@ Rules:
 
 - append-only
 - not directly injected into the main prompt
+- used for grep-style lookup and as traceable context for consolidation itself
 - each entry includes an invisible consolidation marker for idempotency
 
 Each entry should be represented as:
@@ -344,14 +368,20 @@ This keeps:
 
 ## Consolidation Lifecycle
 
-Consolidation runs after a turn is committed, but not necessarily after every turn.
+Consolidation check runs after each agent reply is committed through a `TurnCommitted`-style event.
 
-It should be gated by a minimum new-message threshold.
+That check does not imply that full consolidation runs after every turn.
 
-The exact threshold may be implementation-specific, but it should follow the same spirit as Akashic:
+Instead, full consolidation is gated by a minimum new-message threshold measured from the last successful consolidation position.
+
+A good default is:
+
+- `min_new_messages = max(5, keep_count // 2)`
+
+This preserves the intended behavior:
 
 - do not pay full consolidation cost on every tiny exchange
-- refresh lightweight recent-turn view more often
+- refresh the lightweight `Recent Turns` view after every turn
 - run structured extraction once enough new material exists
 
 ### Consolidation Inputs
@@ -375,20 +405,19 @@ The default logical outputs are:
 
 ### Consolidation LLM Call Shape
 
-The design should be configurable.
+The default consolidation shape should be two LLM calls plus a separate lightweight refresh path:
 
-Default behavior should align with Akashic:
+- first LLM call: extract `history_entries[]` and `pending_items[]`
+- second LLM call: generate the `RECENT_CONTEXT.md` `Compression` block
+- separate lightweight path: refresh the `RECENT_CONTEXT.md` `Recent Turns` block after each turn
 
-- one extraction-oriented LLM call for `history_entries[]` and `pending_items[]`
-- one summarization-oriented LLM call for `recent_context compression`
+This default should be treated as the canonical first implementation shape.
 
-However, the implementation should not hard-code "always two calls".
+The second call should follow strict rules:
 
-It should be legal to:
-
-- keep two calls
-- compress into one call later
-- switch by configuration or implementation strategy
+- extract only from `USER` messages
+- do not convert assistant suggestions into user facts
+- compress recent continuity without turning the block into long-term memory
 
 ### Consolidation Writes
 
@@ -399,12 +428,12 @@ Consolidation should write:
 - `RECENT_CONTEXT.md`
 - `journal/YYYY-MM-DD.md`
 
-When the threshold is not met, the system may still:
+When the threshold is not met, the system should still:
 
 - update the recent-turn window
-- lightly refresh the `Recent Turns` portion of `RECENT_CONTEXT.md`
+- refresh the `Recent Turns` portion of `RECENT_CONTEXT.md`
 
-without running the full extraction path.
+without running the two-call full consolidation path.
 
 ### Consolidation Idempotency
 
@@ -436,6 +465,20 @@ The optimizer is responsible for:
 - keeping prompt-injected memory compact
 
 This separation exists to reduce churn in long-term prompt memory and to keep passive turns lighter.
+
+The default optimizer flow should be:
+
+1. read `MEMORY.md` and `PENDING.md`
+2. run an LLM archival pass that decides, for each pending item, whether it is:
+   - a new fact to add
+   - a conflicting fact that should update or replace an existing entry
+   - a duplicate that should be ignored
+   - a correction that should overwrite the corrected old entry
+3. write the updated `MEMORY.md`
+4. update `SELF.md` when relevant self-model changes are part of the optimization pass
+5. `clear_pending()` only after the write succeeds
+
+This is why `PENDING.md` must support recoverable processing semantics rather than acting as a fire-and-forget queue.
 
 ## Vector Memory Design
 
@@ -527,6 +570,8 @@ Expected capabilities:
 
 The default `MemoryEngine` should compose these dependencies rather than exposing storage details directly to pipelines.
 
+Even before full vector retrieval is implemented, these interfaces should exist so the boundary is fixed early and concrete implementations can evolve behind it.
+
 ## File and Data Structure Guidance
 
 The memory subsystem should live in its own package rather than being hidden under the old narrow state folder.
@@ -553,6 +598,7 @@ That local database may store:
 - optimizer snapshot state
 - recent-turn window records
 - maintenance progress metadata
+- last successful consolidation position
 
 ## Integration With Current Jarvis Runtime
 
@@ -597,6 +643,8 @@ The optimizer should attach to the scheduler/proactive side because:
 
 The current empty `ProactivePipeline` is a natural future host for this behavior.
 
+The intended first implementation is a background task registered at main agent startup and controlled by the optimizer enable/interval settings.
+
 ## Error Handling and Degradation
 
 Memory must not be allowed to break the core reply path.
@@ -627,6 +675,7 @@ Goals:
 - introduce `ContextStore`
 - introduce memory interfaces
 - route passive context assembly through the new boundary
+- define `EmbeddingProvider` and `VectorStore` interfaces even if their initial implementations are placeholders
 
 Acceptance:
 
@@ -684,6 +733,12 @@ This spec does not define:
 - final multi-user memory permissioning
 
 Those decisions should remain open as long as the architecture above is preserved.
+
+This spec also does not prioritize making every memory behavior highly configurable from day one.
+
+The first priority is to make the default behavior correct and stable.
+
+Configuration surface can expand later where it clearly improves iteration without weakening the boundary design.
 
 ## Final Design Summary
 

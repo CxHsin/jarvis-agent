@@ -26,6 +26,8 @@ allowed_chat_ids = []
 api_key = "${OPENAI_API_KEY}"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1-mini"
+
+embedding_model = "text-embedding-3-small"
 timeout_seconds = 60
 
 [search]
@@ -38,3 +40,8 @@ log_dir = "logs"
 log_level = "INFO"
 session_history_limit = 12
 max_tool_round_trips = 8
+memory_enabled = true
+memory_dir = "memory"
+memory_optimizer_enabled = true
+memory_optimizer_interval_seconds = 64800
+memory_vector_recall_limit = 3

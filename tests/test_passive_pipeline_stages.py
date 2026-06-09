@@ -16,7 +16,7 @@ def _config(tmp_path: Path) -> AppConfig:
         telegram=TelegramConfig(bot_token="token", allowed_chat_ids=[]),
         llm=LlmConfig(api_key="key", model="demo"),
         search=SearchConfig(),
-        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs"),
+        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs", memory_enabled=False),
     )
 
 

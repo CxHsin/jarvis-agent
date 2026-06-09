@@ -1,3 +1,4 @@
-from jarvis.state.session_store import SessionMessage, SessionStore
+from jarvis.memory.context import SessionStore
+from jarvis.memory.models import SessionMessage
 
 __all__ = ["SessionMessage", "SessionStore"]

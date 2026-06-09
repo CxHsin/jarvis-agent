@@ -37,6 +37,7 @@ Examples:
 api_key = "${OPENAI_API_KEY}"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1-mini"
+embedding_model = "text-embedding-3-small"
 ```
 
 ```toml
@@ -44,6 +45,7 @@ model = "gpt-4.1-mini"
 api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
+embedding_model = "text-embedding-3-small"
 ```
 
 ```toml
@@ -51,6 +53,7 @@ model = "deepseek-chat"
 api_key = "${DASHSCOPE_API_KEY}"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 model = "qwen-plus"
+embedding_model = "text-embedding-3-small"
 ```
 
 ## Commands
@@ -63,6 +66,7 @@ py -3.12 -m app.main run
 
 ## Notes
 
-- session state is stored in `data/sessions.json`
+- recent turn context is stored in `data/context.json`
+- long-term memory files live in `data/memory/`
 - logs are written to `logs/jarvis.log`
 - tools currently run with local full access

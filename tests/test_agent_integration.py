@@ -135,7 +135,7 @@ def test_agent_tool_round_trip_with_unlock(tmp_path: Path) -> None:
         telegram=TelegramConfig(bot_token="token", allowed_chat_ids=[]),
         llm=LlmConfig(api_key="key", model="demo"),
         search=SearchConfig(),
-        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs"),
+        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs", memory_enabled=False),
     )
     store = SessionStore(tmp_path / "data" / "sessions.json", history_limit=12)
     tools = build_tool_runtime(tmp_path)
@@ -159,6 +159,7 @@ def test_agent_forces_final_answer_when_tool_round_limit_is_hit(tmp_path: Path) 
             data_dir="data",
             log_dir="logs",
             max_tool_round_trips=1,
+            memory_enabled=False,
         ),
     )
     store = SessionStore(tmp_path / "data" / "sessions.json", history_limit=12)
@@ -175,7 +176,7 @@ def test_agent_breaks_repeated_tool_loop_and_forces_summary(tmp_path: Path) -> N
         telegram=TelegramConfig(bot_token="token", allowed_chat_ids=[]),
         llm=LlmConfig(api_key="key", model="demo"),
         search=SearchConfig(),
-        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs"),
+        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs", memory_enabled=False),
     )
     store = SessionStore(tmp_path / "data" / "sessions.json", history_limit=12)
     tools = build_tool_runtime(tmp_path)
@@ -191,7 +192,7 @@ def test_agent_does_not_flag_repeated_tool_when_arguments_change(tmp_path: Path)
         telegram=TelegramConfig(bot_token="token", allowed_chat_ids=[]),
         llm=LlmConfig(api_key="key", model="demo"),
         search=SearchConfig(),
-        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs"),
+        runtime=RuntimeConfig(workspace=str(tmp_path), data_dir="data", log_dir="logs", memory_enabled=False),
     )
     store = SessionStore(tmp_path / "data" / "sessions.json", history_limit=12)
     tools = build_tool_runtime(tmp_path)
