@@ -177,12 +177,13 @@ class ContextManager:
         if not window:
             return f"tokens: estimated {estimated_tokens}; window: unknown; compression: disabled (window not configured)"
         ratio = estimated_tokens / window
+        source = getattr(self.config, "context_window_source", "unknown")
         actual = ""
         if self.last_usage_tokens is not None:
             actual = f"; last_prompt_tokens: {self.last_usage_tokens} ({self.last_usage_method})"
         return (
             f"tokens: estimated {estimated_tokens}/{window} ({ratio:.1%}); "
-            f"compression_threshold: {threshold:.0%}{actual}"
+            f"window_source: {source}; compression_threshold: {threshold:.0%}{actual}"
         )
 
     def _render_status(self, estimated_tokens: int) -> str:
@@ -247,6 +248,7 @@ class ContextManager:
         self.last_metrics = {
             "estimated_tokens": total,
             "window_tokens": window,
+            "window_source": getattr(self.config, "context_window_source", "unknown"),
             "threshold": threshold,
             "compression_triggered": self.last_compression_event is not None,
             "method": "estimated",

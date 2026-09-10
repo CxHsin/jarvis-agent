@@ -13,6 +13,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -77,9 +78,16 @@ class Config:
     max_search_matches: int = 20
     compression_model: str | None = None
     context_window_tokens: int | None = None
+    context_window_source: str = "unknown"
     context_compression_threshold: float = 0.86
     context_compression_target: float = 0.65
     context_summary_max_chars: int = 6_000
+    tool_output_preview_chars: int = 500
+    verbose_tool_output: bool = False
+
+    def __post_init__(self) -> None:
+        if self.context_window_tokens is not None and self.context_window_source == "unknown":
+            object.__setattr__(self, "context_window_source", "configured")
 
     @classmethod
     def from_env(cls, dotenv_path: Path | None = None) -> "Config":
@@ -123,6 +131,17 @@ class Config:
                 raise ConfigurationError(f"{name} 必须是 0 到 1 之间的小数。")
             return result
 
+        def boolean(name: str, default: bool = False) -> bool:
+            raw = _setting(values, name)
+            if raw is None:
+                return default
+            normalised = raw.strip().casefold()
+            if normalised in {"1", "true", "yes", "on"}:
+                return True
+            if normalised in {"0", "false", "no", "off"}:
+                return False
+            raise ConfigurationError(f"{name} 必须是 true/false。")
+
         root_value = _setting(values, "ROOT_DIR", str(Path.cwd()))
         root_dir = Path(root_value or Path.cwd()).expanduser().resolve()
         if not root_dir.exists() or not root_dir.is_dir():
@@ -150,6 +169,7 @@ class Config:
         if context_target >= context_threshold:
             raise ConfigurationError("CONTEXT_COMPRESSION_TARGET 必须小于 CONTEXT_COMPRESSION_THRESHOLD。")
 
+        context_window = optional_positive_int("CONTEXT_WINDOW_TOKENS")
         return cls(
             base_url=base_url.rstrip("/"),
             api_key=_setting(values, "API_KEY", "") or "",
@@ -161,10 +181,13 @@ class Config:
             max_read_chars=positive_int("MAX_READ_CHARS", 12_000),
             max_search_matches=positive_int("MAX_SEARCH_MATCHES", 20),
             compression_model=_setting(values, "COMPRESSION_MODEL") or None,
-            context_window_tokens=optional_positive_int("CONTEXT_WINDOW_TOKENS"),
+            context_window_tokens=context_window,
+            context_window_source="configured" if context_window is not None else "unknown",
             context_compression_threshold=context_threshold,
             context_compression_target=context_target,
             context_summary_max_chars=positive_int("CONTEXT_SUMMARY_MAX_CHARS", 6_000),
+            tool_output_preview_chars=positive_int("TOOL_OUTPUT_PREVIEW_CHARS", 500),
+            verbose_tool_output=boolean("VERBOSE_TOOL_OUTPUT"),
         )
 
 
@@ -332,6 +355,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 
 
 class ChatCompletionsClient:
+    CONTEXT_WINDOW_KEYS = (
+        "context_window",
+        "context_length",
+        "max_context_length",
+        "max_model_len",
+        "max_input_tokens",
+        "input_token_limit",
+    )
+
     def __init__(self, config: Config):
         self.config = config
         self.last_usage: dict[str, Any] | None = None
@@ -343,6 +375,64 @@ class ChatCompletionsClient:
         if base.endswith("/v1"):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
+
+    def _models_endpoint(self, model: str | None = None) -> str:
+        base = self.config.base_url.rstrip("/")
+        if base.endswith("/chat/completions"):
+            base = base[: -len("/chat/completions")]
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        suffix = f"/{quote(model, safe='')}" if model else ""
+        return f"{base}/models{suffix}"
+
+    @classmethod
+    def _extract_context_window(cls, payload: Any) -> int | None:
+        """Read common provider metadata fields without guessing from model names."""
+        if isinstance(payload, Mapping):
+            for key in cls.CONTEXT_WINDOW_KEYS:
+                value = payload.get(key)
+                if isinstance(value, bool):
+                    continue
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+            for value in payload.values():
+                found = cls._extract_context_window(value)
+                if found is not None:
+                    return found
+        elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+            for value in payload:
+                found = cls._extract_context_window(value)
+                if found is not None:
+                    return found
+        return None
+
+    def discover_context_window(self) -> int | None:
+        """Best-effort discovery from OpenAI-compatible model metadata.
+
+        The compatibility API does not require a context-window field, so all
+        discovery failures intentionally fall back to manual configuration.
+        """
+        headers = {
+            **({"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}),
+            "Accept": "application/json",
+        }
+        timeout = min(self.config.request_timeout, 5.0)
+        endpoints = [self._models_endpoint(self.config.model), self._models_endpoint()]
+        for endpoint in endpoints:
+            request = urllib.request.Request(endpoint, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+                continue
+            discovered = self._extract_context_window(payload)
+            if discovered is not None:
+                return discovered
+        return None
 
     def complete(
         self,
@@ -404,17 +494,26 @@ class Agent:
         client: ChatCompletionsClient | Any | None = None,
         compression_client: ChatCompletionsClient | Any | None = None,
     ):
-        self.config = config
-        self.workspace = Workspace(config)
         self.client = client or ChatCompletionsClient(config)
+        self.config = config
+        if self.config.context_window_tokens is None and isinstance(self.client, ChatCompletionsClient):
+            discovered_window = self.client.discover_context_window()
+            if discovered_window is not None:
+                self.config = replace(
+                    self.config,
+                    context_window_tokens=discovered_window,
+                    context_window_source="upstream",
+                )
+                print(f"[上下文] 已从上游模型元数据获取窗口: {discovered_window} tokens")
+        self.workspace = Workspace(self.config)
         if compression_client is not None:
             self.compression_client = compression_client
-        elif config.compression_model and config.compression_model != config.model and isinstance(self.client, ChatCompletionsClient):
-            self.compression_client = ChatCompletionsClient(replace(config, model=config.compression_model))
+        elif self.config.compression_model and self.config.compression_model != self.config.model and isinstance(self.client, ChatCompletionsClient):
+            self.compression_client = ChatCompletionsClient(replace(self.config, model=self.config.compression_model))
         else:
             self.compression_client = self.client
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
-        self.context = ContextManager(config)
+        self.context = ContextManager(self.config)
         self.tool_functions: dict[str, ToolFunction] = {
             "list_directory": self.workspace.list_directory,
             "search_file_content": self.workspace.search_file_content,
@@ -458,6 +557,49 @@ class Agent:
         except (TypeError, WorkspaceError, OSError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
+    def _tool_result_for_display(self, name: str, result: Mapping[str, Any]) -> str:
+        """Render a compact terminal preview without changing the model result."""
+        if self.config.verbose_tool_output:
+            return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+        if not result.get("ok"):
+            preview = f"ok=false error={result.get('error', '工具调用失败')}"
+        elif name == "list_directory":
+            entries = result.get("entries", [])
+            names = [str(entry.get("name", "?")) for entry in entries[:5] if isinstance(entry, Mapping)]
+            suffix = "..." if len(entries) > 5 else ""
+            preview = (
+                f"ok=true path={result.get('path', '?')} entries={len(entries)}"
+                f" [{', '.join(names)}{suffix}]"
+            )
+        elif name == "search_file_content":
+            matches = result.get("matches", [])
+            references = [
+                f"{item.get('path', '?')}:{item.get('line', '?')}"
+                for item in matches[:5]
+                if isinstance(item, Mapping)
+            ]
+            suffix = "..." if len(matches) > 5 else ""
+            preview = (
+                f"ok=true query={result.get('query', '')!r} matches={len(matches)}"
+                f" truncated={bool(result.get('truncated'))}"
+                f" [{', '.join(references)}{suffix}]"
+            )
+        elif name == "read_file":
+            content = str(result.get("content", "")).replace("\n", " ")
+            preview = (
+                f"ok=true path={result.get('path', '?')} "
+                f"lines={result.get('start_line', '?')}-{result.get('end_line', '?')} "
+                f"truncated={bool(result.get('truncated'))} preview={content}"
+            )
+        else:
+            preview = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+        limit = self.config.tool_output_preview_chars
+        if len(preview) > limit:
+            preview = preview[:limit].rstrip() + "..."
+        return preview
+
     @staticmethod
     def _assistant_message(message: Mapping[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {"role": "assistant", "content": message.get("content")}
@@ -482,7 +624,7 @@ class Agent:
                 print(
                     f"[上下文] 估算 {metrics.get('estimated_tokens', '?')} tokens"
                     + (
-                        f" / 窗口 {metrics['window_tokens']}"
+                        f" / 窗口 {metrics['window_tokens']} ({metrics.get('window_source', 'unknown')})"
                         if metrics.get("window_tokens")
                         else " / 窗口未配置"
                     )
@@ -522,7 +664,7 @@ class Agent:
                     except KeyboardInterrupt:
                         result = {"ok": False, "cancelled": True, "error": "工具调用已取消。"}
                         result_text = json.dumps(result, ensure_ascii=False)
-                        print(f"[工具结果] {result_text}")
+                        print(f"[工具结果] {self._tool_result_for_display(name, result)}")
                         self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
                         try:
                             normalised_arguments = self._normalise_args(arguments)
@@ -555,7 +697,7 @@ class Agent:
                         print("\n已取消当前请求。已完成的工具结果已保留，未完成的调用已标记为取消。")
                         return None
                     result_text = json.dumps(result, ensure_ascii=False)
-                    print(f"[工具结果] {result_text}")
+                    print(f"[工具结果] {self._tool_result_for_display(name, result)}")
                     self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
                     try:
                         normalised_arguments = self._normalise_args(arguments)

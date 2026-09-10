@@ -1,10 +1,13 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
-from jarvis_agent import Config, Workspace, Agent, ModelRequestError, TOOL_DEFINITIONS
+from jarvis_agent import ChatCompletionsClient, Config, Workspace, Agent, ModelRequestError, TOOL_DEFINITIONS
 
 
 class FakeClient:
@@ -22,6 +25,20 @@ class FakeClient:
 class FailingClient:
     def complete(self, messages, tools, tool_choice):
         raise ModelRequestError("test failure")
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class CancellingWorkspace:
@@ -64,6 +81,52 @@ class WorkspaceTests(unittest.TestCase):
 
 
 class AgentTests(unittest.TestCase):
+    def test_context_window_can_be_discovered_from_upstream_model_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="secret",
+                model="test-model",
+                root_dir=Path(directory),
+            )
+            client = ChatCompletionsClient(config)
+            with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse({"context_length": 32768})) as urlopen:
+                self.assertEqual(client.discover_context_window(), 32768)
+            request = urlopen.call_args.args[0]
+            self.assertEqual(request.full_url, "http://example.test/v1/models/test-model")
+            self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_agent_uses_upstream_context_window_when_not_explicitly_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="",
+                model="test-model",
+                root_dir=Path(directory),
+            )
+            client = ChatCompletionsClient(config)
+            with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse({"data": [{"id": "test-model", "max_model_len": 65536}]})):
+                agent = Agent(config, client)
+            self.assertEqual(agent.config.context_window_tokens, 65536)
+            self.assertEqual(agent.config.context_window_source, "upstream")
+
+    def test_explicit_context_window_skips_upstream_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="",
+                model="test-model",
+                root_dir=Path(directory),
+                context_window_tokens=16384,
+                context_window_source="configured",
+            )
+            client = ChatCompletionsClient(config)
+            with patch("jarvis_agent.urllib.request.urlopen") as urlopen:
+                agent = Agent(config, client)
+            self.assertEqual(agent.config.context_window_tokens, 16384)
+            self.assertEqual(agent.config.context_window_source, "configured")
+            urlopen.assert_not_called()
+
     def test_model_failure_discards_incomplete_request(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory))
@@ -106,6 +169,42 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(request_messages[-1]["role"], "user")
             self.assertIn("<agent_status>", request_messages[-1]["content"])
             self.assertNotIn("<agent_status>", "\n".join(str(message) for message in agent.messages))
+
+    def test_tool_result_terminal_output_is_compact_but_model_result_stays_full(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "large.md").write_text("重要内容\n" * 200, encoding="utf-8")
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="",
+                model="test",
+                root_dir=root,
+                max_rounds=2,
+                tool_output_preview_chars=120,
+            )
+            client = FakeClient(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {"id": "1", "function": {"name": "read_file", "arguments": '{"path":"large.md"}'}},
+                        ],
+                    },
+                    {"role": "assistant", "content": "已读取。"},
+                ]
+            )
+            agent = Agent(config, client)
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(agent.run_request("读取大文件"), "已读取。")
+
+            terminal = output.getvalue()
+            self.assertIn("preview=", terminal)
+            self.assertIn("...", terminal)
+            self.assertLess(len(terminal), 2_000)
+            tool_message = next(message for message in agent.messages if message["role"] == "tool")
+            self.assertGreater(len(tool_message["content"]), 1_000)
 
     def test_context_manager_records_repeated_evidence_without_creating_new_entry(self):
         config = Config(
