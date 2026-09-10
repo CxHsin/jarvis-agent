@@ -13,9 +13,11 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+
+from context_manager import ContextManager
 
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
@@ -73,6 +75,11 @@ class Config:
     request_timeout: float = 60.0
     max_read_chars: int = 12_000
     max_search_matches: int = 20
+    compression_model: str | None = None
+    context_window_tokens: int | None = None
+    context_compression_threshold: float = 0.86
+    context_compression_target: float = 0.65
+    context_summary_max_chars: int = 6_000
 
     @classmethod
     def from_env(cls, dotenv_path: Path | None = None) -> "Config":
@@ -92,6 +99,28 @@ class Config:
                 raise ConfigurationError(f"{name} 必须是正整数。") from exc
             if result < 1:
                 raise ConfigurationError(f"{name} 必须是正整数。")
+            return result
+
+        def optional_positive_int(name: str) -> int | None:
+            raw = _setting(values, name)
+            if raw is None or not raw.strip():
+                return None
+            try:
+                result = int(raw)
+            except ValueError as exc:
+                raise ConfigurationError(f"{name} 必须是正整数。") from exc
+            if result < 1:
+                raise ConfigurationError(f"{name} 必须是正整数。")
+            return result
+
+        def ratio(name: str, default: float) -> float:
+            raw = _setting(values, name, str(default))
+            try:
+                result = float(raw or default)
+            except ValueError as exc:
+                raise ConfigurationError(f"{name} 必须是 0 到 1 之间的小数。") from exc
+            if not 0 < result < 1:
+                raise ConfigurationError(f"{name} 必须是 0 到 1 之间的小数。")
             return result
 
         root_value = _setting(values, "ROOT_DIR", str(Path.cwd()))
@@ -116,6 +145,11 @@ class Config:
         if timeout <= 0:
             raise ConfigurationError("REQUEST_TIMEOUT 必须大于 0。")
 
+        context_threshold = ratio("CONTEXT_COMPRESSION_THRESHOLD", 0.86)
+        context_target = ratio("CONTEXT_COMPRESSION_TARGET", 0.65)
+        if context_target >= context_threshold:
+            raise ConfigurationError("CONTEXT_COMPRESSION_TARGET 必须小于 CONTEXT_COMPRESSION_THRESHOLD。")
+
         return cls(
             base_url=base_url.rstrip("/"),
             api_key=_setting(values, "API_KEY", "") or "",
@@ -126,6 +160,11 @@ class Config:
             request_timeout=timeout,
             max_read_chars=positive_int("MAX_READ_CHARS", 12_000),
             max_search_matches=positive_int("MAX_SEARCH_MATCHES", 20),
+            compression_model=_setting(values, "COMPRESSION_MODEL") or None,
+            context_window_tokens=optional_positive_int("CONTEXT_WINDOW_TOKENS"),
+            context_compression_threshold=context_threshold,
+            context_compression_target=context_target,
+            context_summary_max_chars=positive_int("CONTEXT_SUMMARY_MAX_CHARS", 6_000),
         )
 
 
@@ -295,6 +334,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 class ChatCompletionsClient:
     def __init__(self, config: Config):
         self.config = config
+        self.last_usage: dict[str, Any] | None = None
 
     def _endpoint(self) -> str:
         base = self.config.base_url.rstrip("/")
@@ -310,6 +350,7 @@ class ChatCompletionsClient:
         tools: Sequence[Mapping[str, Any]],
         tool_choice: str = "auto",
     ) -> dict[str, Any]:
+        self.last_usage = None
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": list(messages),
@@ -343,6 +384,9 @@ class ChatCompletionsClient:
             raise ModelRequestError("模型接口返回的不是有效 JSON。") from exc
         if not isinstance(data, dict) or not data.get("choices"):
             raise ModelRequestError(f"模型接口响应缺少 choices: {json.dumps(data, ensure_ascii=False)[:1000]}")
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            self.last_usage = usage
         choice = data["choices"][0]
         message = choice.get("message") if isinstance(choice, dict) else None
         if not isinstance(message, dict):
@@ -354,11 +398,23 @@ ToolFunction = Callable[..., dict[str, Any]]
 
 
 class Agent:
-    def __init__(self, config: Config, client: ChatCompletionsClient | Any | None = None):
+    def __init__(
+        self,
+        config: Config,
+        client: ChatCompletionsClient | Any | None = None,
+        compression_client: ChatCompletionsClient | Any | None = None,
+    ):
         self.config = config
         self.workspace = Workspace(config)
         self.client = client or ChatCompletionsClient(config)
+        if compression_client is not None:
+            self.compression_client = compression_client
+        elif config.compression_model and config.compression_model != config.model and isinstance(self.client, ChatCompletionsClient):
+            self.compression_client = ChatCompletionsClient(replace(config, model=config.compression_model))
+        else:
+            self.compression_client = self.client
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
+        self.context = ContextManager(config)
         self.tool_functions: dict[str, ToolFunction] = {
             "list_directory": self.workspace.list_directory,
             "search_file_content": self.workspace.search_file_content,
@@ -411,18 +467,38 @@ class Agent:
 
     def run_request(self, user_text: str) -> str | None:
         history_start = len(self.messages)
+        self.context.begin_task(user_text)
         self.messages.append({"role": "user", "content": user_text})
         active_calls: list[Mapping[str, Any]] = []
         handled_call_indexes: set[int] = set()
         try:
             for round_number in range(1, self.config.max_rounds + 1):
                 final_round = round_number == self.config.max_rounds
+                self.context.set_round(round_number)
                 print(f"\n[第 {round_number}/{self.config.max_rounds} 轮] 请求模型" + ("（收尾）" if final_round else ""))
+                tools = [] if final_round else TOOL_DEFINITIONS
+                request_messages = self.context.prepare_messages(self.messages, tools, self.compression_client)
+                metrics = self.context.last_metrics
+                print(
+                    f"[上下文] 估算 {metrics.get('estimated_tokens', '?')} tokens"
+                    + (
+                        f" / 窗口 {metrics['window_tokens']}"
+                        if metrics.get("window_tokens")
+                        else " / 窗口未配置"
+                    )
+                )
+                if self.context.last_compression_event:
+                    event = self.context.last_compression_event
+                    print(
+                        f"[上下文压缩] {event.method}: {event.before_tokens} -> {event.after_tokens} tokens"
+                        + (f"；{event.warning}" if event.warning else "")
+                    )
                 message = self.client.complete(
-                    self.messages,
-                    [] if final_round else TOOL_DEFINITIONS,
+                    request_messages,
+                    tools,
                     "none" if final_round else "auto",
                 )
+                self.context.record_usage(getattr(self.client, "last_usage", None))
                 assistant = self._assistant_message(message)
                 self.messages.append(assistant)
                 calls = self._tool_calls(message)
@@ -448,6 +524,11 @@ class Agent:
                         result_text = json.dumps(result, ensure_ascii=False)
                         print(f"[工具结果] {result_text}")
                         self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+                        try:
+                            normalised_arguments = self._normalise_args(arguments)
+                        except WorkspaceError:
+                            normalised_arguments = {}
+                        self.context.record_tool_result(name, normalised_arguments, result, call_id)
                         handled_call_indexes.add(call_index)
                         for pending_call in calls[call_index + 1 :]:
                             pending_data = pending_call.get("function", {}) if isinstance(pending_call, Mapping) else {}
@@ -460,12 +541,27 @@ class Agent:
                             self.messages.append(
                                 {"role": "tool", "tool_call_id": pending_id, "name": pending_name, "content": pending_result}
                             )
+                            try:
+                                pending_arguments = self._normalise_args(pending_data.get("arguments", {}))
+                            except WorkspaceError:
+                                pending_arguments = {}
+                            self.context.record_tool_result(
+                                pending_name,
+                                pending_arguments,
+                                {"ok": False, "cancelled": True, "error": "工具调用因用户取消而未执行。"},
+                                pending_id,
+                            )
                         active_calls = []
                         print("\n已取消当前请求。已完成的工具结果已保留，未完成的调用已标记为取消。")
                         return None
                     result_text = json.dumps(result, ensure_ascii=False)
                     print(f"[工具结果] {result_text}")
                     self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+                    try:
+                        normalised_arguments = self._normalise_args(arguments)
+                    except WorkspaceError:
+                        normalised_arguments = {}
+                    self.context.record_tool_result(name, normalised_arguments, result, call_id)
                     handled_call_indexes.add(call_index)
                 active_calls = []
             print("已达到轮次上限，本次请求未完成。")
@@ -482,6 +578,16 @@ class Agent:
                     ensure_ascii=False,
                 )
                 self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+                try:
+                    normalised_arguments = self._normalise_args(function_data.get("arguments", {}))
+                except WorkspaceError:
+                    normalised_arguments = {}
+                self.context.record_tool_result(
+                    name,
+                    normalised_arguments,
+                    {"ok": False, "cancelled": True, "error": "工具调用因用户取消而未执行。"},
+                    call_id,
+                )
             print("\n已取消当前请求。已完成的工具结果已保留，未完成的调用不会被视为成功。")
             return None
         except ModelRequestError as exc:
