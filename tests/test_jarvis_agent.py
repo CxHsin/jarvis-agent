@@ -10,6 +10,17 @@ from context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
 from jarvis_agent import ChatCompletionsClient, Config, Workspace, Agent, ModelRequestError, TOOL_DEFINITIONS
 
 
+_STATE_ROOT = Path(tempfile.mkdtemp(prefix="jarvis-test-state-"))
+
+
+def make_agent(case, config, client=None, **kwargs):
+    """Build an Agent whose session file is closed when the test ends."""
+
+    agent = Agent(config, client, **kwargs)
+    case.addCleanup(agent.close)
+    return agent
+
+
 class FakeClient:
     def __init__(self, messages):
         self.responses = iter(messages)
@@ -104,10 +115,11 @@ class AgentTests(unittest.TestCase):
                 model="test-model",
                 max_output_tokens=1024,
                 root_dir=Path(directory),
+                state_dir=_STATE_ROOT,
             )
             client = ChatCompletionsClient(config)
             with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse({"data": [{"id": "test-model", "max_model_len": 65536}]})):
-                agent = Agent(config, client)
+                agent = make_agent(self, config, client)
             self.assertEqual(agent.config.context_window_tokens, 65536)
             self.assertEqual(agent.config.context_window_source, "upstream")
 
@@ -121,18 +133,20 @@ class AgentTests(unittest.TestCase):
                 root_dir=Path(directory),
                 context_window_tokens=16384,
                 context_window_source="configured",
+                state_dir=_STATE_ROOT,
             )
             client = ChatCompletionsClient(config)
             with patch("jarvis_agent.urllib.request.urlopen") as urlopen:
-                agent = Agent(config, client)
+                agent = make_agent(self, config, client)
             self.assertEqual(agent.config.context_window_tokens, 16384)
             self.assertEqual(agent.config.context_window_source, "configured")
             urlopen.assert_not_called()
 
     def test_model_failure_discards_incomplete_request(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory))
-            agent = Agent(config, FailingClient())
+            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory),
+                            state_dir=_STATE_ROOT)
+            agent = make_agent(self, config, FailingClient())
             self.assertIsNone(agent.run_request("接口失败测试"))
             self.assertEqual([message["role"] for message in agent.messages], ["system"])
 
@@ -140,7 +154,8 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "note.md").write_text("agent loop", encoding="utf-8")
-            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=root, max_rounds=2)
+            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=root, max_rounds=2,
+                            state_dir=_STATE_ROOT)
             client = FakeClient(
                 [
                     {
@@ -154,7 +169,7 @@ class AgentTests(unittest.TestCase):
                     {"role": "assistant", "content": "找到了 note.md。"},
                 ]
             )
-            agent = Agent(config, client)
+            agent = make_agent(self, config, client)
             answer = agent.run_request("找找 agent")
             self.assertEqual(answer, "找到了 note.md。")
             self.assertEqual(client.calls, [(3, 3, "auto"), (6, 0, "none")])
@@ -162,9 +177,10 @@ class AgentTests(unittest.TestCase):
 
     def test_status_bar_is_appended_to_model_context(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory))
+            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory),
+                            state_dir=_STATE_ROOT)
             client = FakeClient([{"role": "assistant", "content": "完成"}])
-            agent = Agent(config, client)
+            agent = make_agent(self, config, client)
 
             self.assertEqual(agent.run_request("检查上下文"), "完成")
             request_messages = client.requests[0][0]
@@ -183,6 +199,7 @@ class AgentTests(unittest.TestCase):
                 root_dir=root,
                 max_rounds=2,
                 tool_output_preview_chars=120,
+                state_dir=_STATE_ROOT,
             )
             client = FakeClient(
                 [
@@ -196,7 +213,7 @@ class AgentTests(unittest.TestCase):
                     {"role": "assistant", "content": "已读取。"},
                 ]
             )
-            agent = Agent(config, client)
+            agent = make_agent(self, config, client)
             output = StringIO()
             with redirect_stdout(output):
                 self.assertEqual(agent.run_request("读取大文件"), "已读取。")
@@ -269,7 +286,8 @@ class AgentTests(unittest.TestCase):
 
     def test_cancelled_tool_calls_are_marked(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory))
+            config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory),
+                            state_dir=_STATE_ROOT)
             client = FakeClient(
                 [
                     {
@@ -282,7 +300,7 @@ class AgentTests(unittest.TestCase):
                     }
                 ]
             )
-            agent = Agent(config, client)
+            agent = make_agent(self, config, client)
             agent.workspace = CancellingWorkspace()
             agent.tool_functions = {
                 "list_directory": agent.workspace.list_directory,

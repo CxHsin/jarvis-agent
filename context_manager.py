@@ -20,6 +20,7 @@ CONTEXT_SUMMARY_OPEN = "<context_summary>"
 CONTEXT_SUMMARY_CLOSE = "</context_summary>"
 CONTEXT_COMPRESSED_MARKER = "[CONTEXT_COMPRESSED]"
 CONTEXT_FALLBACK_MARKER = "[CONTEXT_COMPRESSED_FALLBACK]"
+CONTEXT_RECOVERED_MARKER = "[CONTEXT_RECOVERED]"
 
 
 def estimate_tokens(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]) -> int:
@@ -48,8 +49,24 @@ class CompressionEvent:
 class ContextManager:
     """Maintain session evidence, task state, status messages and compression."""
 
-    def __init__(self, config: Any):
+    _SNAPSHOT_FIELDS = (
+        "task_number",
+        "current_task",
+        "session_evidence",
+        "session_archive",
+        "_evidence_by_key",
+        "_seen_call_keys",
+        "last_usage_tokens",
+        "last_usage_method",
+        "_usage_anchor",
+        "last_metrics",
+        "last_compression_event",
+        "_compression_failures",
+    )
+
+    def __init__(self, config: Any, recorder: Any = None):
         self.config = config
+        self.recorder = recorder
         self.task_number = 0
         self.current_task: dict[str, Any] = {}
         self.session_evidence: list[dict[str, Any]] = []
@@ -74,6 +91,82 @@ class ContextManager:
             "events": [],
             "round": 0,
         }
+        if self.recorder is not None:
+            self.recorder.record_task(self.task_number, goal)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Capture every mutable field so a failed request can be undone."""
+
+        return {name: deepcopy(getattr(self, name)) for name in self._SNAPSHOT_FIELDS}
+
+    def restore(self, state: Mapping[str, Any]) -> None:
+        """Undo a failed request back to a snapshot taken by :meth:`snapshot`."""
+
+        for name in self._SNAPSHOT_FIELDS:
+            setattr(self, name, deepcopy(state[name]))
+
+    def restore_session(
+        self,
+        entries: Sequence[Mapping[str, Any]],
+        compressed_call_ids: Sequence[str] = (),
+    ) -> None:
+        """Rebuild evidence and archive state from persisted archive entries."""
+
+        self.session_archive = []
+        self.session_evidence = []
+        self._evidence_by_key = {}
+        self._seen_call_keys = set()
+        compressed = {str(call_id) for call_id in compressed_call_ids}
+        for entry in entries:
+            name = str(entry.get("tool", ""))
+            arguments = entry.get("arguments") if isinstance(entry.get("arguments"), Mapping) else {}
+            result = entry.get("result") if isinstance(entry.get("result"), Mapping) else {}
+            call_id = str(entry.get("call_id", ""))
+            try:
+                task_number = int(entry.get("task") or 0)
+            except (TypeError, ValueError):
+                task_number = 0
+            key = self._canonical_key(name, arguments)
+            self._seen_call_keys.add(key)
+            refs = self._source_refs(name, result)
+            evidence_id: str | None = None
+            if result.get("ok") and refs:
+                evidence_id = self._evidence_by_key.get(key)
+                if evidence_id is None:
+                    evidence_id = f"E{len(self.session_evidence) + 1}"
+                    self._evidence_by_key[key] = evidence_id
+                    self.session_evidence.append(
+                        {
+                            "id": evidence_id,
+                            "task": task_number,
+                            "tool": name,
+                            "refs": refs,
+                            "repeated": False,
+                            "compressed": False,
+                        }
+                    )
+                else:
+                    for evidence in self.session_evidence:
+                        if evidence["id"] == evidence_id:
+                            evidence["repeated"] = True
+            self.session_archive.append(
+                {
+                    "task": task_number,
+                    "call_id": call_id,
+                    "tool": name,
+                    "arguments": dict(arguments),
+                    "result": dict(result),
+                    "evidence_id": evidence_id,
+                    "compressed": call_id in compressed,
+                }
+            )
+        compressed_evidence = {
+            entry["evidence_id"]
+            for entry in self.session_archive
+            if entry.get("compressed") and entry.get("evidence_id")
+        }
+        for evidence in self.session_evidence:
+            evidence["compressed"] = evidence["id"] in compressed_evidence
 
     def set_round(self, round_number: int) -> None:
         if self.current_task:
@@ -157,17 +250,18 @@ class ContextManager:
             "ok": bool(result.get("ok")),
         }
         self.current_task["events"].append(event)
-        self.session_archive.append(
-            {
-                "task": self.task_number,
-                "call_id": call_id,
-                "tool": name,
-                "arguments": dict(arguments),
-                "result": dict(result),
-                "evidence_id": evidence_id,
-                "compressed": False,
-            }
-        )
+        archive_entry = {
+            "task": self.task_number,
+            "call_id": call_id,
+            "tool": name,
+            "arguments": dict(arguments),
+            "result": dict(result),
+            "evidence_id": evidence_id,
+            "compressed": False,
+        }
+        self.session_archive.append(archive_entry)
+        if self.recorder is not None:
+            self.recorder.record_archive(archive_entry)
 
     def record_usage(self, usage: Mapping[str, Any] | None, messages=None, tools=None) -> None:
         self.last_usage_tokens = cache_usage(usage)["input"]
@@ -343,6 +437,7 @@ class ContextManager:
             if message.get("role") == "tool"
             and CONTEXT_COMPRESSED_MARKER not in str(message.get("content", ""))
             and CONTEXT_FALLBACK_MARKER not in str(message.get("content", ""))
+            and CONTEXT_RECOVERED_MARKER not in str(message.get("content", ""))
         ]
         if not all_candidates:
             self.last_compression_event = CompressionEvent(
@@ -422,12 +517,14 @@ class ContextManager:
         summary = summary[:getattr(self.config, "context_summary_max_chars", 6000)]
         self._usage_anchor = None
         first_message["content"] = f"{CONTEXT_COMPRESSED_MARKER}\n{summary}"
+        self._record_replacement(first_message, first_index)
         for index, message in candidates[1:]:
             call_id = str(message.get("tool_call_id", f"message-{index}"))
             message["content"] = (
                 f"{CONTEXT_COMPRESSED_MARKER}\n"
                 f"tool result {call_id} 已纳入 {first_call_id} 的压缩摘要；原始内容在会话归档中。"
             )
+            self._record_replacement(message, index)
         compressed_ids = tuple(str(message.get("tool_call_id", f"message-{index}")) for index, message in candidates)
         for evidence in self.session_evidence:
             if evidence["id"] in {record.get("evidence_id") for record in records}:
@@ -444,3 +541,9 @@ class ContextManager:
             compressed_ids,
             warning,
         )
+
+    def _record_replacement(self, message: Mapping[str, Any], index: int) -> None:
+        if self.recorder is None:
+            return
+        call_id = str(message.get("tool_call_id", f"message-{index}"))
+        self.recorder.record_replacement(call_id, str(message.get("content", "")))
