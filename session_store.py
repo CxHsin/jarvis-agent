@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 SESSION_FORMAT_VERSION = 1
@@ -24,6 +24,7 @@ RECORD_MESSAGE = "message"
 RECORD_TASK = "task"
 RECORD_ARCHIVE = "archive"
 RECORD_REPLACE = "replace"
+RECORD_COMPACT = "compact"
 
 
 class SessionError(RuntimeError):
@@ -95,6 +96,7 @@ class SessionContents:
     messages: list[dict[str, Any]] = field(default_factory=list)
     archive: list[dict[str, Any]] = field(default_factory=list)
     replacements: dict[str, str] = field(default_factory=dict)
+    compressed_call_ids: list[str] = field(default_factory=list)
     task_number: int = 0
     warnings: tuple[str, ...] = ()
 
@@ -310,8 +312,22 @@ class SessionStore:
         payload["result"] = dict(entry.get("result") or {})
         self._append({"type": RECORD_ARCHIVE, "entry": payload})
 
-    def record_replacement(self, tool_call_id: str, content: str) -> None:
-        self._append({"type": RECORD_REPLACE, "tool_call_id": str(tool_call_id), "content": str(content)})
+    def record_compact(
+        self,
+        kept_from: int,
+        content: str,
+        method: str,
+        compressed_call_ids: Sequence[str] = (),
+    ) -> None:
+        self._append(
+            {
+                "type": RECORD_COMPACT,
+                "kept_from": int(kept_from),
+                "content": str(content),
+                "method": str(method),
+                "compressed_call_ids": [str(call_id) for call_id in compressed_call_ids],
+            }
+        )
 
     def mark(self) -> int:
         if self._file is None:
@@ -334,6 +350,7 @@ class SessionStore:
         text = self.path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         warnings: list[str] = []
+        compact_compressed_ids: list[str] = []
         complete = text.endswith("\n") or text == ""
         for index, line in enumerate(lines):
             if not line.strip():
@@ -365,11 +382,19 @@ class SessionStore:
                 call_id = record.get("tool_call_id")
                 if isinstance(call_id, str):
                     contents.replacements[call_id] = str(record.get("content", ""))
+            elif kind == RECORD_COMPACT:
+                kept_from = int(record.get("kept_from") or 1)
+                kept_log_index = max(0, kept_from - 1)
+                checkpoint = {"role": "user", "content": str(record.get("content", ""))}
+                contents.messages = [checkpoint] + contents.messages[kept_log_index:]
+                for call_id in record.get("compressed_call_ids") or []:
+                    compact_compressed_ids.append(str(call_id))
             elif kind == RECORD_TASK:
                 try:
                     contents.task_number = max(contents.task_number, int(record.get("number") or 0))
                 except (TypeError, ValueError):
                     continue
+        contents.compressed_call_ids = list(contents.replacements) + compact_compressed_ids
         for message in contents.messages:
             if message.get("role") != "tool":
                 continue

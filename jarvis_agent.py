@@ -86,7 +86,6 @@ class Config:
     context_window_tokens: int | None = None
     context_window_source: str = "unknown"
     context_compression_threshold: float = 0.90
-    context_compression_target: float = 0.80
     context_safety_margin: float = 0.02
     max_output_tokens: int = 32768
     model_max_output_tokens: int | None = None
@@ -97,6 +96,8 @@ class Config:
     compression_context_window_tokens: int | None = None
     compression_max_output_tokens: int | None = None
     context_summary_max_chars: int = 6_000
+    context_keep_recent_tokens: int = 20_000
+    context_compaction_failure_limit: int = 3
     tool_output_preview_chars: int = 500
     verbose_tool_output: bool = False
 
@@ -182,10 +183,6 @@ class Config:
             raise ConfigurationError("REQUEST_TIMEOUT 必须大于 0。")
 
         context_threshold = ratio("CONTEXT_COMPRESSION_THRESHOLD", 0.90)
-        context_target = ratio("CONTEXT_COMPRESSION_TARGET", 0.80)
-        if context_target >= context_threshold:
-            raise ConfigurationError("CONTEXT_COMPRESSION_TARGET 必须小于 CONTEXT_COMPRESSION_THRESHOLD。")
-
         context_window = optional_positive_int("CONTEXT_WINDOW_TOKENS")
         return cls(
             base_url=base_url.rstrip("/"),
@@ -202,7 +199,6 @@ class Config:
             context_window_tokens=context_window,
             context_window_source="configured" if context_window is not None else "unknown",
             context_compression_threshold=context_threshold,
-            context_compression_target=context_target,
             context_safety_margin=ratio("CONTEXT_SAFETY_MARGIN", 0.02),
             max_output_tokens=positive_int("MAX_OUTPUT_TOKENS", 32768),
             model_capabilities_file=Path(_setting(values, "MODEL_CAPABILITIES_FILE")).expanduser().resolve()
@@ -210,6 +206,8 @@ class Config:
             compression_context_window_tokens=optional_positive_int("COMPRESSION_CONTEXT_WINDOW_TOKENS"),
             compression_max_output_tokens=optional_positive_int("COMPRESSION_MAX_OUTPUT_TOKENS"),
             context_summary_max_chars=positive_int("CONTEXT_SUMMARY_MAX_CHARS", 6_000),
+            context_keep_recent_tokens=positive_int("CONTEXT_KEEP_RECENT_TOKENS", 20_000),
+            context_compaction_failure_limit=positive_int("CONTEXT_COMPACTION_FAILURE_LIMIT", 3),
             tool_output_preview_chars=positive_int("TOOL_OUTPUT_PREVIEW_CHARS", 500),
             verbose_tool_output=boolean("VERBOSE_TOOL_OUTPUT"),
         )
@@ -481,9 +479,17 @@ class ChatCompletionsClient:
                          capability_checked_at=capability.get("checked_at", "unknown"))
         reserve = config.max_output_tokens + math.ceil(window * config.context_safety_margin)
         available = min(window - reserve, config.model_max_input_tokens or window)
-        if available <= 0 or available * config.context_compression_target + reserve >= window * config.context_compression_threshold:
+        if available <= 0:
             raise ConfigurationError(
-                f"模型 {config.model} 的输出预留/安全余量过大，或压缩目标不低于触发线；请调整 MAX_OUTPUT_TOKENS 和上下文参数。"
+                f"模型 {config.model} 的输出预留/安全余量过大；请调整 MAX_OUTPUT_TOKENS 和上下文参数。"
+            )
+        if config.context_keep_recent_tokens >= available:
+            raise ConfigurationError(
+                f"CONTEXT_KEEP_RECENT_TOKENS 必须小于可用输入预算 ({available})。"
+            )
+        if config.context_keep_recent_tokens + reserve >= window * config.context_compression_threshold:
+            raise ConfigurationError(
+                f"CONTEXT_KEEP_RECENT_TOKENS 过大，压缩后无法降到触发线以下；请调小该值或窗口参数。"
             )
         self.config = config
         return config
@@ -578,10 +584,12 @@ class Agent:
             or config.compression_max_output_tokens is not None
             or config.compression_context_window_tokens is not None
         ):
+            # 压缩客户端只生成摘要，不参与主上下文的切点保留，因此不继承主模型的保留窗口。
             compression_config = replace(config, model=config.compression_model or config.model,
                                          context_window_tokens=config.compression_context_window_tokens,
                                          context_window_source="configured" if config.compression_context_window_tokens else "unknown",
-                                         max_output_tokens=config.compression_max_output_tokens or config.max_output_tokens)
+                                         max_output_tokens=config.compression_max_output_tokens or config.max_output_tokens,
+                                         context_keep_recent_tokens=1)
             self.compression_client = ChatCompletionsClient(compression_config)
             self.compression_client.resolve_config()
         else:
@@ -612,7 +620,7 @@ class Agent:
             return
         self.messages.extend(contents.messages)
         self.context.task_number = contents.task_number
-        self.context.restore_session(contents.archive, list(contents.replacements))
+        self.context.restore_session(contents.archive, contents.compressed_call_ids)
         restored = len(contents.messages)
         self._repair_interrupted_calls()
         last_user = next(

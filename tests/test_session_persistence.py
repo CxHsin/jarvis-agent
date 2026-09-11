@@ -271,11 +271,46 @@ class SessionWriteThroughTests(SessionTestBase):
         resumed = self.agent(FakeClient([]), resume=session_id)
         self.assertEqual(resumed.messages, expected)
 
-    def test_compression_replacements_persist_and_rebuild_original_archive(self):
+    def test_agent_compression_flow_persists_checkpoint_across_resume(self):
+        (self.root / "big.md").write_text("事实 " * 200, encoding="utf-8")
+        client = FakeClient(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "c1", "function": {"name": "read_file", "arguments": '{"path":"big.md"}'}}
+                    ],
+                },
+                {"role": "assistant", "content": "<context_summary>读到了事实。</context_summary>"},
+                {"role": "assistant", "content": "读完了"},
+            ]
+        )
+        agent = self.agent(
+            client,
+            context_window_tokens=3200,
+            max_output_tokens=1000,
+            context_keep_recent_tokens=200,
+            context_compression_threshold=0.5,
+            max_rounds=2,
+        )
+        with redirect_stdout(StringIO()):
+            self.assertEqual(agent.run_request("读大文件"), "读完了")
+
+        self.assertIsNotNone(agent.context.last_compression_event)
+        self.assertIn(CONTEXT_COMPRESSED_MARKER, agent.messages[1]["content"])
+        expected = deepcopy(agent.messages)
+        session_id = agent.store.session_id
+        agent.close()
+
+        resumed = self.agent(FakeClient([]), resume=session_id)
+        self.assertEqual(resumed.messages, expected)
+
+    def test_compaction_span_persists_and_rebuilds_original_archive(self):
         config = self.config(
             context_window_tokens=160,
             context_compression_threshold=0.86,
-            context_compression_target=0.65,
+            context_keep_recent_tokens=1,
         )
         store = SessionStore.create(config)
         session_id = store.session_id
@@ -285,7 +320,8 @@ class SessionWriteThroughTests(SessionTestBase):
         result = {"ok": True, "path": "a.md", "start_line": 1, "end_line": 20, "content": original}
         manager.record_tool_result("read_file", {"path": "a.md"}, result, "call-1")
         messages = [
-            {"role": "user", "content": "找结论"},
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "任务一"},
             {
                 "role": "assistant",
                 "content": None,
@@ -294,15 +330,17 @@ class SessionWriteThroughTests(SessionTestBase):
                 ],
             },
             {"role": "tool", "tool_call_id": "call-1", "name": "read_file", "content": json.dumps(result, ensure_ascii=False)},
+            {"role": "assistant", "content": "任务一完成"},
+            {"role": "user", "content": "任务二"},
         ]
-        for message in messages:
+        for message in messages[1:]:
             store.record_message(message)
         compression_client = FakeClient(
             [{"role": "assistant", "content": "<context_summary>来自 a.md 第 1-20 行的事实。</context_summary>"}]
         )
         with redirect_stdout(StringIO()):
             manager.prepare_messages(messages, TOOL_DEFINITIONS, compression_client)
-        self.assertIn(CONTEXT_COMPRESSED_MARKER, messages[2]["content"])
+        self.assertIn(CONTEXT_COMPRESSED_MARKER, messages[1]["content"])
         store.close()
 
         reopened = SessionStore.resume(config, session_id)
@@ -310,11 +348,12 @@ class SessionWriteThroughTests(SessionTestBase):
             contents = reopened.load()
         finally:
             reopened.close()
-        self.assertIn(CONTEXT_COMPRESSED_MARKER, contents.messages[2]["content"])
+        self.assertIn(CONTEXT_COMPRESSED_MARKER, contents.messages[0]["content"])
+        self.assertEqual([message["role"] for message in contents.messages], ["user", "user"])
 
         restored = ContextManager(config)
         restored.task_number = contents.task_number
-        restored.restore_session(contents.archive, list(contents.replacements))
+        restored.restore_session(contents.archive, contents.compressed_call_ids)
         self.assertEqual(restored.session_archive[0]["result"]["content"], original)
         self.assertTrue(restored.session_archive[0]["compressed"])
         self.assertTrue(restored.session_evidence[0]["compressed"])
@@ -324,7 +363,7 @@ class SessionWriteThroughTests(SessionTestBase):
         config = self.config(
             context_window_tokens=160,
             context_compression_threshold=0.86,
-            context_compression_target=0.65,
+            context_keep_recent_tokens=1,
         )
         manager = ContextManager(config)
         manager.begin_task("回滚测试")
@@ -332,7 +371,8 @@ class SessionWriteThroughTests(SessionTestBase):
         manager.record_tool_result("read_file", {"path": "a.md"}, result, "call-1")
         snapshot = manager.snapshot()
         messages = [
-            {"role": "user", "content": "找结论"},
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "任务一"},
             {
                 "role": "assistant",
                 "content": None,
@@ -341,6 +381,8 @@ class SessionWriteThroughTests(SessionTestBase):
                 ],
             },
             {"role": "tool", "tool_call_id": "call-1", "name": "read_file", "content": json.dumps(result, ensure_ascii=False)},
+            {"role": "assistant", "content": "任务一完成"},
+            {"role": "user", "content": "任务二"},
         ]
         compression_client = FakeClient(
             [{"role": "assistant", "content": "<context_summary>摘要</context_summary>"}]

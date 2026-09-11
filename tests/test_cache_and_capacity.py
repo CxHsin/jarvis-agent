@@ -132,7 +132,7 @@ class CapacityTests(unittest.TestCase):
             ChatCompletionsClient(self.config(context_window_tokens=1000)).resolve_config()
 
     def test_budget_guard_stops_oversized_request(self):
-        client = ChatCompletionsClient(self.config(context_window_tokens=20000))
+        client = ChatCompletionsClient(self.config(context_window_tokens=20000, context_keep_recent_tokens=4000))
         client.resolve_config()
         with patch("jarvis_agent.urllib.request.urlopen") as network:
             with self.assertRaises(ModelRequestError):
@@ -167,8 +167,14 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(len(agent.usage_ledger.records), 1)
         self.assertEqual(agent.messages[2]["reasoning_content"], "reason")
 
-    def test_compression_uses_input_target_and_records_compression_usage(self):
-        manager = ContextManager(self.config(context_window_tokens=10000, context_summary_max_chars=100))
+    def test_compression_uses_cut_point_and_records_compression_usage(self):
+        manager = ContextManager(
+            self.config(
+                context_window_tokens=10000,
+                context_summary_max_chars=100,
+                context_keep_recent_tokens=1000,
+            )
+        )
         manager.begin_task("find facts")
         messages = [{"role": "system", "content": "stable"}, {"role": "user", "content": "find facts"}]
         for index in range(2):
@@ -185,7 +191,10 @@ class CapacityTests(unittest.TestCase):
         ledger = UsageLedger()
         with redirect_stdout(StringIO()):
             prepared = manager.prepare_messages(messages, [], MeasuredClient(Compressor(), ledger, "压缩模型", "test"))
-        self.assertLessEqual(estimate_tokens(prepared, []), manager.input_budget() * .8)
+        self.assertIsNotNone(manager.last_compression_event)
+        self.assertEqual(manager.last_compression_event.cut_index, 4)
+        self.assertEqual(manager.last_compression_event.compressed_call_ids, ("0",))
+        self.assertEqual([m["role"] for m in prepared], ["system", "user", "assistant", "tool"])
         self.assertFalse(manager.last_metrics["over_budget"])
         self.assertEqual(len(ledger.records), 1)
         self.assertEqual(ledger.records[0]["role"], "压缩模型")
