@@ -166,8 +166,11 @@ class SessionRecoveryTests(SessionTestBase):
             prepared = resumed.context.prepare_messages(
                 resumed.messages, TOOL_DEFINITIONS, resumed.compression_client
             )
-        self.assertIn("E1", prepared[-1]["content"])
-        self.assertIn("read_file", prepared[-1]["content"])
+        self.assertEqual(
+            [message["role"] for message in prepared],
+            [message["role"] for message in resumed.messages],
+        )
+        self.assertNotIn("<agent_status>", "\n".join(str(message) for message in prepared))
 
     def test_interrupted_tool_call_is_repaired_without_replay(self):
         (self.root / "note.md").write_text("第一份\n", encoding="utf-8")

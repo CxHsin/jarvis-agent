@@ -6,7 +6,6 @@ information that is appended to or projected into each request.
 
 from __future__ import annotations
 
-import html
 import json
 import math
 from dataclasses import dataclass
@@ -268,8 +267,8 @@ class ContextManager:
         self.last_usage_method = "actual" if self.last_usage_tokens is not None else None
         self._usage_anchor = None
         if self.last_usage_tokens is not None and messages:
-            # The final status message is ephemeral, never a stable history prefix.
-            self._usage_anchor = (deepcopy(list(messages[:-1])), deepcopy(list(tools or [])),
+            # The previous request is the stable prefix for the next estimate.
+            self._usage_anchor = (deepcopy(list(messages)), deepcopy(list(tools or [])),
                                   estimate_tokens(messages, tools or []), self.config.model)
 
     def _estimate_request(self, messages, tools) -> int:
@@ -295,68 +294,13 @@ class ContextManager:
         return (input_tokens + reserved > window * self.config.context_compression_threshold
                 or input_tokens > self.input_budget())
 
-    def _budget_text(self, estimated_tokens: int) -> str:
-        window = getattr(self.config, "context_window_tokens", None)
-        threshold = getattr(self.config, "context_compression_threshold", 0.90)
-        if not window:
-            return f"tokens: estimated {estimated_tokens}; window: unknown; compression: disabled (window not configured)"
-        ratio = estimated_tokens / window
-        source = getattr(self.config, "context_window_source", "unknown")
-        actual = ""
-        if self.last_usage_tokens is not None:
-            actual = f"; last_prompt_tokens: {self.last_usage_tokens} ({self.last_usage_method})"
-        return (
-            f"tokens: estimated {estimated_tokens}/{window} ({ratio:.1%}); "
-            f"window_source: {source}; output_reserve: {self.config.max_output_tokens}; "
-            f"safety_reserve: {math.ceil(window * self.config.context_safety_margin)}; "
-            f"compression_threshold_with_reserves: {threshold:.0%}{actual}"
-        )
-
-    def _render_status(self, estimated_tokens: int) -> str:
-        task = self.current_task or {"number": "?", "goal": "未命名任务", "tool_calls": 0, "repeated_calls": 0, "errors": [], "round": 0}
-        goal = html.escape(str(task.get("goal", "")))
-        lines = [
-            "<agent_status>",
-            f"Task: #{task.get('number')} {goal}",
-            f"Round: {task.get('round', 0)}; tool_calls: {task.get('tool_calls', 0)}; repeated_calls: {task.get('repeated_calls', 0)}; errors: {len(task.get('errors', []))}",
-            f"Budget: {html.escape(self._budget_text(estimated_tokens))}",
-            "Evidence index:",
-        ]
-        visible = self.session_evidence[-20:]
-        if not visible:
-            lines.append("- (none)")
-        else:
-            for evidence in visible:
-                refs = ", ".join(evidence["refs"])
-                flags = []
-                if evidence.get("repeated"):
-                    flags.append("repeated")
-                if evidence.get("compressed"):
-                    flags.append("compressed")
-                suffix = f" [{' '.join(flags)}]" if flags else ""
-                lines.append(f"- {evidence['id']}: {evidence['tool']} -> {html.escape(refs)}{suffix}")
-        if task.get("errors"):
-            lines.append("Recent errors:")
-            for error in task["errors"][-3:]:
-                lines.append(f"- {html.escape(str(error))}")
-        if self.last_compression_event:
-            event = self.last_compression_event
-            lines.append(
-                f"Compression: {event.method}; {event.before_tokens} -> {event.after_tokens} tokens"
-                + (f"; warning: {html.escape(event.warning)}" if event.warning else "")
-            )
-        lines.append("</agent_status>")
-        return "\n".join(lines)
-
-    def _request_with_status(self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-        base = [dict(message) for message in messages]
-        estimate = self._estimate_request(base, tools)
-        status = self._render_status(estimate)
-        total = self._estimate_request([*base, {"role": "user", "content": status}], tools)
-        # One second pass makes the status percentage include its own size.
-        status = self._render_status(total)
-        total = self._estimate_request([*base, {"role": "user", "content": status}], tools)
-        return [*base, {"role": "user", "content": status}], total
+    def _prepare_request(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        prepared = [dict(message) for message in messages]
+        return prepared, self._estimate_request(prepared, tools)
 
     def prepare_messages(
         self,
@@ -365,12 +309,12 @@ class ContextManager:
         compression_client: Any,
     ) -> list[dict[str, Any]]:
         self.last_compression_event = None
-        _, before_tokens = self._request_with_status(messages, tools)
+        _, before_tokens = self._prepare_request(messages, tools)
         window = getattr(self.config, "context_window_tokens", None)
         threshold = getattr(self.config, "context_compression_threshold", 0.90)
         if self.should_compress(before_tokens):
             self._compress(messages, tools, compression_client, before_tokens)
-        prepared, total = self._request_with_status(messages, tools)
+        prepared, total = self._prepare_request(messages, tools)
         budget = self.input_budget()
         if self.last_compression_event and self.should_compress(total):
             event = self.last_compression_event
@@ -465,7 +409,7 @@ class ContextManager:
                         message["content"] = CONTEXT_COMPRESSED_MARKER + "\n" + ("📝" * getattr(self.config, "context_summary_max_chars", 6000))
                     else:
                         message["content"] = CONTEXT_COMPRESSED_MARKER + f"\n{call_id} included in {first_id}"
-                _, projected_tokens = self._request_with_status(projected, tools)
+                _, projected_tokens = self._prepare_request(projected, tools)
                 if projected_tokens <= target_tokens:
                     break
             candidates = selected
@@ -533,7 +477,7 @@ class ContextManager:
             if archive["call_id"] in compressed_ids:
                 archive["compressed"] = True
 
-        _, after_tokens = self._request_with_status(messages, tools)
+        _, after_tokens = self._prepare_request(messages, tools)
         self.last_compression_event = CompressionEvent(
             before_tokens,
             after_tokens,
