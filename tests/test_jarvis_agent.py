@@ -172,10 +172,10 @@ class AgentTests(unittest.TestCase):
             agent = make_agent(self, config, client)
             answer = agent.run_request("找找 agent")
             self.assertEqual(answer, "找到了 note.md。")
-            self.assertEqual(client.calls, [(3, 3, "auto"), (6, 0, "none")])
+            self.assertEqual(client.calls, [(2, 3, "auto"), (5, 0, "none")])
             self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant", "tool", "tool", "assistant"])
 
-    def test_status_bar_is_appended_to_model_context(self):
+    def test_no_status_bar_is_appended_to_model_context(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory),
                             state_dir=_STATE_ROOT)
@@ -184,9 +184,9 @@ class AgentTests(unittest.TestCase):
 
             self.assertEqual(agent.run_request("检查上下文"), "完成")
             request_messages = client.requests[0][0]
-            self.assertEqual(request_messages[-1]["role"], "user")
-            self.assertIn("<agent_status>", request_messages[-1]["content"])
-            self.assertNotIn("<agent_status>", "\n".join(str(message) for message in agent.messages))
+            self.assertEqual([message["role"] for message in request_messages], ["system", "user"])
+            self.assertEqual(request_messages[-1]["content"], "检查上下文")
+            self.assertNotIn("<agent_status>", "\n".join(str(message) for message in request_messages))
 
     def test_tool_result_terminal_output_is_compact_but_model_result_stays_full(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -282,7 +282,7 @@ class AgentTests(unittest.TestCase):
             self.assertIn(CONTEXT_COMPRESSED_MARKER, messages[3]["content"])
             self.assertEqual(len(manager.session_archive), 1)
             self.assertTrue(manager.session_archive[0]["compressed"])
-            self.assertEqual(prepared[-1]["role"], "user")
+            self.assertEqual([message["role"] for message in prepared], ["system", "user", "assistant", "tool"])
 
     def test_cancelled_tool_calls_are_marked(self):
         with tempfile.TemporaryDirectory() as directory:

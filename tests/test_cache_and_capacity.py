@@ -149,9 +149,9 @@ class CapacityTests(unittest.TestCase):
     def test_usage_anchor_includes_cache_and_resets_after_history_changes(self):
         manager = ContextManager(self.config(context_window_tokens=10000))
         base = [{"role": "system", "content": "stable"}, {"role": "user", "content": "hello"}]
-        old = [*base, {"role": "user", "content": "status"}]
+        old = list(base)
         manager.record_usage({"prompt_tokens": 2000, "prompt_cache_hit_tokens": 1800}, old, [])
-        new = [*base, {"role": "assistant", "content": "answer"}, {"role": "user", "content": "next status"}]
+        new = [*base, {"role": "assistant", "content": "answer"}]
         self.assertEqual(manager._estimate_request(new, []), 2000 + estimate_tokens(new, []) - estimate_tokens(old, []))
         changed = [{"role": "system", "content": "changed"}, *new[1:]]
         self.assertEqual(manager._estimate_request(changed, []), estimate_tokens(changed, []))
