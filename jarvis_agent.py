@@ -14,14 +14,16 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from urllib.parse import quote
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from context_manager import ContextManager, estimate_tokens
+from context_manager import CONTEXT_RECOVERED_MARKER, ContextManager, estimate_tokens
 from cache_metrics import MeasuredClient, UsageLedger
 from model_capabilities import load_capability
+from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
 
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
@@ -75,6 +77,7 @@ class Config:
     model: str
     max_rounds: int = 5
     root_dir: Path = field(default_factory=Path.cwd)
+    state_dir: Path | None = None
     text_extensions: tuple[str, ...] = DEFAULT_TEXT_EXTENSIONS
     request_timeout: float = 60.0
     max_read_chars: int = 12_000
@@ -158,6 +161,8 @@ class Config:
         root_dir = Path(root_value or Path.cwd()).expanduser().resolve()
         if not root_dir.exists() or not root_dir.is_dir():
             raise ConfigurationError(f"ROOT_DIR 不是可访问的目录: {root_dir}")
+        state_value = _setting(values, "STATE_DIR")
+        state_dir = Path(state_value).expanduser().resolve() if state_value else None
 
         extensions_value = _setting(values, "TEXT_EXTENSIONS", ",".join(DEFAULT_TEXT_EXTENSIONS))
         extensions = tuple(
@@ -188,6 +193,7 @@ class Config:
             model=model,
             max_rounds=positive_int("MAX_ROUNDS", 5),
             root_dir=root_dir,
+            state_dir=state_dir,
             text_extensions=extensions,
             request_timeout=timeout,
             max_read_chars=positive_int("MAX_READ_CHARS", 12_000),
@@ -548,8 +554,14 @@ class Agent:
         config: Config,
         client: ChatCompletionsClient | Any | None = None,
         compression_client: ChatCompletionsClient | Any | None = None,
+        store: SessionStore | None = None,
+        resume: str | None = None,
     ):
         self.client = client or ChatCompletionsClient(config)
+        self.store = store
+        if self.store is None and resume is not None:
+            # Fail on a missing or busy session before touching the model.
+            self.store = SessionStore.resume(config, resume or None)
         self.config = self.client.resolve_config() if isinstance(self.client, ChatCompletionsClient) else config
         if isinstance(self.client, ChatCompletionsClient):
             print(f"[模型容量] {config.model}: 窗口={self.config.context_window_tokens} "
@@ -578,13 +590,79 @@ class Agent:
         self.compression_client = MeasuredClient(self.compression_client, self.usage_ledger,
                                                 "压缩模型", config.compression_model or config.model)
         self.client = MeasuredClient(self.client, self.usage_ledger, "主模型", config.model)
+        if self.store is None:
+            self.store = SessionStore.create(self.config)
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
-        self.context = ContextManager(self.config)
+        self.context = ContextManager(self.config, recorder=self.store)
         self.tool_functions: dict[str, ToolFunction] = {
             "list_directory": self.workspace.list_directory,
             "search_file_content": self.workspace.search_file_content,
             "read_file": self.workspace.read_file,
         }
+        self._restore_session()
+
+    def _restore_session(self) -> None:
+        """Load persisted history into this process, repairing interrupted rounds."""
+
+        contents: SessionContents = self.store.load()
+        for warning in contents.warnings:
+            print(f"[会话恢复] {warning}")
+        if not contents.messages:
+            print(f"[会话] 新会话 {self.store.session_id}")
+            return
+        self.messages.extend(contents.messages)
+        self.context.task_number = contents.task_number
+        self.context.restore_session(contents.archive, list(contents.replacements))
+        restored = len(contents.messages)
+        self._repair_interrupted_calls()
+        last_user = next(
+            (
+                str(message.get("content", "")).replace("\n", " ")
+                for message in reversed(self.messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        summary = (last_user[:60] + "…") if len(last_user) > 60 else last_user
+        print(f"[会话恢复] {self.store.session_id}；消息 {restored} 条" + (f"；最后输入: {summary}" if summary else ""))
+
+    def _repair_interrupted_calls(self) -> None:
+        """Give unanswered tool calls a placeholder result instead of re-running them."""
+
+        answered = {
+            str(message.get("tool_call_id"))
+            for message in self.messages
+            if message.get("role") == "tool" and message.get("tool_call_id") is not None
+        }
+        missing: list[tuple[str, str]] = []
+        for message in self.messages:
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, Mapping):
+                    continue
+                call_id = str(call.get("id") or "")
+                if not call_id or call_id in answered:
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), Mapping) else {}
+                missing.append((call_id, str(function.get("name", ""))))
+                answered.add(call_id)
+        for call_id, name in missing:
+            payload = {"ok": False, "recovered": True, "error": "进程在工具执行前中断，该调用未执行。"}
+            content = f"{CONTEXT_RECOVERED_MARKER}\n{json.dumps(payload, ensure_ascii=False)}"
+            self._append_message({"role": "tool", "tool_call_id": call_id, "name": name, "content": content})
+            print(f"[会话恢复] 工具调用 {name or '?'} ({call_id}) 缺少结果，已补写中断占位。")
+
+    def _append_message(self, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+        if self.store is not None:
+            self.store.record_message(message)
+
+    def close(self) -> None:
+        if self.store is not None:
+            self.store.close()
+            self.store = None
+        self.context.recorder = None
 
     def _system_prompt(self) -> str:
         extensions = ", ".join(self.config.text_extensions)
@@ -676,10 +754,12 @@ class Agent:
         return result
 
     def run_request(self, user_text: str) -> str | None:
-        history_start = len(self.messages)
+        request_offset = self.store.mark() if self.store is not None else None
+        message_snapshot = deepcopy(self.messages)
+        context_snapshot = self.context.snapshot()
         self.context.begin_task(user_text)
         self.usage_ledger.reset()
-        self.messages.append({"role": "user", "content": user_text})
+        self._append_message({"role": "user", "content": user_text})
         active_calls: list[Mapping[str, Any]] = []
         handled_call_indexes: set[int] = set()
         try:
@@ -713,7 +793,7 @@ class Agent:
                 )
                 self.context.record_usage(self.client.last_usage, request_messages, tools)
                 assistant = self._assistant_message(message)
-                self.messages.append(assistant)
+                self._append_message(assistant)
                 calls = self._tool_calls(message)
                 active_calls = calls
                 handled_call_indexes = set()
@@ -736,7 +816,7 @@ class Agent:
                         result = {"ok": False, "cancelled": True, "error": "工具调用已取消。"}
                         result_text = json.dumps(result, ensure_ascii=False)
                         print(f"[工具结果] {self._tool_result_for_display(name, result)}")
-                        self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+                        self._append_message({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
                         try:
                             normalised_arguments = self._normalise_args(arguments)
                         except WorkspaceError:
@@ -751,7 +831,7 @@ class Agent:
                                 {"ok": False, "cancelled": True, "error": "工具调用因用户取消而未执行。"},
                                 ensure_ascii=False,
                             )
-                            self.messages.append(
+                            self._append_message(
                                 {"role": "tool", "tool_call_id": pending_id, "name": pending_name, "content": pending_result}
                             )
                             try:
@@ -769,7 +849,7 @@ class Agent:
                         return None
                     result_text = json.dumps(result, ensure_ascii=False)
                     print(f"[工具结果] {self._tool_result_for_display(name, result)}")
-                    self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+                    self._append_message({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
                     try:
                         normalised_arguments = self._normalise_args(arguments)
                     except WorkspaceError:
@@ -790,7 +870,7 @@ class Agent:
                     {"ok": False, "cancelled": True, "error": "工具调用因用户取消而未执行。"},
                     ensure_ascii=False,
                 )
-                self.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+                self._append_message({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
                 try:
                     normalised_arguments = self._normalise_args(function_data.get("arguments", {}))
                 except WorkspaceError:
@@ -804,7 +884,10 @@ class Agent:
             print("\n已取消当前请求。已完成的工具结果已保留，未完成的调用不会被视为成功。")
             return None
         except ModelRequestError as exc:
-            del self.messages[history_start:]
+            self.messages[:] = message_snapshot
+            self.context.restore(context_snapshot)
+            if self.store is not None and request_offset is not None:
+                self.store.truncate_to(request_offset)
             print(f"模型请求失败: {exc}")
             return None
         finally:
@@ -812,32 +895,57 @@ class Agent:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Jarvis 第一阶段命令行 Agent")
     parser.add_argument("--env-file", type=Path, default=Path.cwd() / ".env", help="配置文件路径")
+    parser.add_argument("--resume", nargs="?", const="", default=None,
+                        help="恢复会话：不带值取当前工作区最近的会话，或指定会话标识")
+    parser.add_argument("--list", action="store_true", dest="list_sessions",
+                        help="列出当前工作区可恢复的会话")
     args = parser.parse_args(argv)
     try:
         config = Config.from_env(args.env_file)
-        agent = Agent(config)
     except ConfigurationError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
+    if args.list_sessions:
+        sessions = SessionStore.list_sessions(config)
+        if not sessions:
+            print("当前工作区没有会话记录。")
+            return 0
+        print(f"当前工作区的会话（{config.root_dir}）：")
+        for session in sessions:
+            preview = session.last_user_text.replace("\n", " ")[:40]
+            print(f"  {session.id}  {session.started_at}  消息 {session.message_count} 条"
+                  + (f"  最后输入: {preview}" if preview else ""))
+        return 0
+    try:
+        agent = Agent(config, resume=args.resume)
+    except ConfigurationError as exc:
+        print(f"配置错误: {exc}", file=sys.stderr)
+        return 2
+    except (SessionNotFoundError, SessionLockedError) as exc:
+        print(f"会话错误: {exc}", file=sys.stderr)
+        return 2
 
     print("Jarvis 已启动。输入 exit 退出，Ctrl+C 取消当前请求。")
-    while True:
-        try:
-            user_text = input("\nYou> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已退出。")
-            return 0
-        if not user_text:
-            continue
-        if user_text.casefold() == "exit":
-            print("已退出。")
-            return 0
-        agent.run_request(user_text)
+    try:
+        while True:
+            try:
+                user_text = input("\nYou> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n已退出。")
+                return 0
+            if not user_text:
+                continue
+            if user_text.casefold() == "exit":
+                print("已退出。")
+                return 0
+            agent.run_request(user_text)
+    finally:
+        agent.close()
 
 
 if __name__ == "__main__":

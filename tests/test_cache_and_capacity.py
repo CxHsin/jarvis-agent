@@ -11,7 +11,10 @@ from cache_metrics import cache_usage, MeasuredClient, UsageLedger
 from context_manager import ContextManager, estimate_tokens
 from jarvis_agent import Config, ConfigurationError, ChatCompletionsClient, Agent, ModelRequestError
 from model_capabilities import load_capability
-from tests.test_jarvis_agent import FakeHTTPResponse, FakeClient
+from tests.test_jarvis_agent import FakeHTTPResponse, FakeClient, make_agent
+
+
+_STATE_ROOT = Path(tempfile.mkdtemp(prefix="jarvis-test-state-"))
 
 
 class CacheTests(unittest.TestCase):
@@ -71,7 +74,7 @@ class CacheTests(unittest.TestCase):
 class CapacityTests(unittest.TestCase):
     def config(self, **kwargs):
         return Config(base_url="https://example.test/v1", api_key="", model="test",
-                      max_output_tokens=1000, **kwargs)
+                      max_output_tokens=1000, state_dir=_STATE_ROOT, **kwargs)
 
     def test_official_catalog_matches_endpoint_and_alias_exactly(self):
         for base in ("https://api.deepseek.com", "https://api.deepseek.com/v1/chat/completions"):
@@ -120,7 +123,7 @@ class CapacityTests(unittest.TestCase):
         config = self.config(context_window_tokens=50000, compression_model="other",
                              compression_context_window_tokens=20000, compression_max_output_tokens=500)
         with redirect_stdout(StringIO()):
-            agent = Agent(config)
+            agent = make_agent(self, config)
         self.assertEqual(agent.compression_client.client.config.context_window_tokens, 20000)
         self.assertEqual(agent.compression_client.client.config.max_output_tokens, 500)
 
@@ -157,7 +160,7 @@ class CapacityTests(unittest.TestCase):
 
     def test_task_metrics_reset_and_reasoning_history_preserved(self):
         raw = FakeClient([{"content": "a", "reasoning_content": "reason"}, {"content": "b"}])
-        agent = Agent(self.config(), raw)
+        agent = make_agent(self, self.config(), raw)
         with redirect_stdout(StringIO()):
             agent.run_request("a")
             agent.run_request("b")
@@ -190,7 +193,7 @@ class CapacityTests(unittest.TestCase):
 
     def test_uncompressible_history_is_rejected_before_main_call(self):
         raw = FakeClient([])
-        agent = Agent(self.config(context_window_tokens=10000), raw)
+        agent = make_agent(self, self.config(context_window_tokens=10000), raw)
         with redirect_stdout(StringIO()):
             self.assertIsNone(agent.run_request("x" * 50000))
         self.assertEqual(raw.calls, [])
