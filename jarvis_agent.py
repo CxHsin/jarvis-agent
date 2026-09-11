@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import urllib.error
@@ -18,7 +19,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from context_manager import ContextManager
+from context_manager import ContextManager, estimate_tokens
+from cache_metrics import MeasuredClient, UsageLedger
+from model_capabilities import load_capability
 
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
@@ -79,8 +82,17 @@ class Config:
     compression_model: str | None = None
     context_window_tokens: int | None = None
     context_window_source: str = "unknown"
-    context_compression_threshold: float = 0.86
-    context_compression_target: float = 0.65
+    context_compression_threshold: float = 0.90
+    context_compression_target: float = 0.80
+    context_safety_margin: float = 0.02
+    max_output_tokens: int = 32768
+    model_max_output_tokens: int | None = None
+    model_max_input_tokens: int | None = None
+    model_capabilities_file: Path | None = None
+    capability_source: str = "unknown"
+    capability_checked_at: str = "unknown"
+    compression_context_window_tokens: int | None = None
+    compression_max_output_tokens: int | None = None
     context_summary_max_chars: int = 6_000
     tool_output_preview_chars: int = 500
     verbose_tool_output: bool = False
@@ -164,8 +176,8 @@ class Config:
         if timeout <= 0:
             raise ConfigurationError("REQUEST_TIMEOUT 必须大于 0。")
 
-        context_threshold = ratio("CONTEXT_COMPRESSION_THRESHOLD", 0.86)
-        context_target = ratio("CONTEXT_COMPRESSION_TARGET", 0.65)
+        context_threshold = ratio("CONTEXT_COMPRESSION_THRESHOLD", 0.90)
+        context_target = ratio("CONTEXT_COMPRESSION_TARGET", 0.80)
         if context_target >= context_threshold:
             raise ConfigurationError("CONTEXT_COMPRESSION_TARGET 必须小于 CONTEXT_COMPRESSION_THRESHOLD。")
 
@@ -185,6 +197,12 @@ class Config:
             context_window_source="configured" if context_window is not None else "unknown",
             context_compression_threshold=context_threshold,
             context_compression_target=context_target,
+            context_safety_margin=ratio("CONTEXT_SAFETY_MARGIN", 0.02),
+            max_output_tokens=positive_int("MAX_OUTPUT_TOKENS", 32768),
+            model_capabilities_file=Path(_setting(values, "MODEL_CAPABILITIES_FILE")).expanduser().resolve()
+            if _setting(values, "MODEL_CAPABILITIES_FILE") else None,
+            compression_context_window_tokens=optional_positive_int("COMPRESSION_CONTEXT_WINDOW_TOKENS"),
+            compression_max_output_tokens=optional_positive_int("COMPRESSION_MAX_OUTPUT_TOKENS"),
             context_summary_max_chars=positive_int("CONTEXT_SUMMARY_MAX_CHARS", 6_000),
             tool_output_preview_chars=positive_int("TOOL_OUTPUT_PREVIEW_CHARS", 500),
             verbose_tool_output=boolean("VERBOSE_TOOL_OUTPUT"),
@@ -360,8 +378,6 @@ class ChatCompletionsClient:
         "context_length",
         "max_context_length",
         "max_model_len",
-        "max_input_tokens",
-        "input_token_limit",
     )
 
     def __init__(self, config: Config):
@@ -393,21 +409,11 @@ class ChatCompletionsClient:
                 value = payload.get(key)
                 if isinstance(value, bool):
                     continue
-                try:
-                    parsed = int(value)
-                except (TypeError, ValueError):
+                if not (type(value) is int or isinstance(value, str) and value.isdecimal()):
                     continue
+                parsed = int(value)
                 if parsed > 0:
                     return parsed
-            for value in payload.values():
-                found = cls._extract_context_window(value)
-                if found is not None:
-                    return found
-        elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
-            for value in payload:
-                found = cls._extract_context_window(value)
-                if found is not None:
-                    return found
         return None
 
     def discover_context_window(self) -> int | None:
@@ -429,10 +435,52 @@ class ChatCompletionsClient:
                     payload = json.loads(response.read().decode("utf-8"))
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
                 continue
+            if isinstance(payload, Mapping) and isinstance(payload.get("data"), list):
+                matching = [item for item in payload["data"]
+                            if isinstance(item, Mapping) and item.get("id") == self.config.model]
+                payload = matching[0] if len(matching) == 1 else None
+            elif endpoint == endpoints[-1]:
+                payload = None
+            elif isinstance(payload, Mapping) and payload.get("id", self.config.model) != self.config.model:
+                payload = None
             discovered = self._extract_context_window(payload)
             if discovered is not None:
                 return discovered
         return None
+
+    def resolve_config(self) -> Config:
+        config = self.config
+        try:
+            capability = load_capability(config.base_url, config.model, config.model_capabilities_file)
+            if not capability and config.model_capabilities_file:
+                capability = load_capability(config.base_url, config.model)
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        window = config.context_window_tokens
+        source = config.context_window_source
+        if window is None and capability:
+            window = capability["context_window_tokens"]
+            source = "catalog"
+        if window is None:
+            window = self.discover_context_window()
+            source = "upstream" if window else "unknown"
+        if window is None:
+            raise ConfigurationError(f"模型 {config.model} 的窗口未知，请设置 CONTEXT_WINDOW_TOKENS 或模型能力配置。")
+        output_limit = capability.get("max_output_tokens")
+        config = replace(config, context_window_tokens=window, context_window_source=source,
+                         model_max_output_tokens=output_limit,
+                         model_max_input_tokens=capability.get("max_input_tokens"),
+                         max_output_tokens=min(config.max_output_tokens, output_limit) if output_limit else config.max_output_tokens,
+                         capability_source=capability.get("source", source),
+                         capability_checked_at=capability.get("checked_at", "unknown"))
+        reserve = config.max_output_tokens + math.ceil(window * config.context_safety_margin)
+        available = min(window - reserve, config.model_max_input_tokens or window)
+        if available <= 0 or available * config.context_compression_target + reserve >= window * config.context_compression_threshold:
+            raise ConfigurationError(
+                f"模型 {config.model} 的输出预留/安全余量过大，或压缩目标不低于触发线；请调整 MAX_OUTPUT_TOKENS 和上下文参数。"
+            )
+        self.config = config
+        return config
 
     def complete(
         self,
@@ -441,10 +489,17 @@ class ChatCompletionsClient:
         tool_choice: str = "auto",
     ) -> dict[str, Any]:
         self.last_usage = None
+        window = self.config.context_window_tokens
+        if window is not None:
+            estimated = estimate_tokens(messages, tools)
+            safe_input = window - self.config.max_output_tokens - math.ceil(window * self.config.context_safety_margin)
+            if estimated > min(safe_input, self.config.model_max_input_tokens or safe_input):
+                raise ModelRequestError("预计输入超过可用输入预算，压缩不足；请缩小本次输入或开启新会话。")
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": list(messages),
             "temperature": 0,
+            "max_tokens": self.config.max_output_tokens,
         }
         if tools:
             payload["tools"] = list(tools)
@@ -495,23 +550,34 @@ class Agent:
         compression_client: ChatCompletionsClient | Any | None = None,
     ):
         self.client = client or ChatCompletionsClient(config)
-        self.config = config
-        if self.config.context_window_tokens is None and isinstance(self.client, ChatCompletionsClient):
-            discovered_window = self.client.discover_context_window()
-            if discovered_window is not None:
-                self.config = replace(
-                    self.config,
-                    context_window_tokens=discovered_window,
-                    context_window_source="upstream",
-                )
-                print(f"[上下文] 已从上游模型元数据获取窗口: {discovered_window} tokens")
+        self.config = self.client.resolve_config() if isinstance(self.client, ChatCompletionsClient) else config
+        if isinstance(self.client, ChatCompletionsClient):
+            print(f"[模型容量] {config.model}: 窗口={self.config.context_window_tokens} "
+                  f"输出上限={self.config.max_output_tokens} 窗口来源={self.config.context_window_source} "
+                  f"能力来源={self.config.capability_source} "
+                  f"核对日期={self.config.capability_checked_at}")
         self.workspace = Workspace(self.config)
         if compression_client is not None:
             self.compression_client = compression_client
-        elif self.config.compression_model and self.config.compression_model != self.config.model and isinstance(self.client, ChatCompletionsClient):
-            self.compression_client = ChatCompletionsClient(replace(self.config, model=self.config.compression_model))
+            if isinstance(compression_client, ChatCompletionsClient):
+                compression_client.resolve_config()
+        elif isinstance(self.client, ChatCompletionsClient) and (
+            config.compression_model and config.compression_model != config.model
+            or config.compression_max_output_tokens is not None
+            or config.compression_context_window_tokens is not None
+        ):
+            compression_config = replace(config, model=config.compression_model or config.model,
+                                         context_window_tokens=config.compression_context_window_tokens,
+                                         context_window_source="configured" if config.compression_context_window_tokens else "unknown",
+                                         max_output_tokens=config.compression_max_output_tokens or config.max_output_tokens)
+            self.compression_client = ChatCompletionsClient(compression_config)
+            self.compression_client.resolve_config()
         else:
             self.compression_client = self.client
+        self.usage_ledger = UsageLedger()
+        self.compression_client = MeasuredClient(self.compression_client, self.usage_ledger,
+                                                "压缩模型", config.compression_model or config.model)
+        self.client = MeasuredClient(self.client, self.usage_ledger, "主模型", config.model)
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         self.context = ContextManager(self.config)
         self.tool_functions: dict[str, ToolFunction] = {
@@ -603,6 +669,8 @@ class Agent:
     @staticmethod
     def _assistant_message(message: Mapping[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {"role": "assistant", "content": message.get("content")}
+        if "reasoning_content" in message:
+            result["reasoning_content"] = message["reasoning_content"]
         if message.get("tool_calls"):
             result["tool_calls"] = message["tool_calls"]
         return result
@@ -610,6 +678,7 @@ class Agent:
     def run_request(self, user_text: str) -> str | None:
         history_start = len(self.messages)
         self.context.begin_task(user_text)
+        self.usage_ledger.reset()
         self.messages.append({"role": "user", "content": user_text})
         active_calls: list[Mapping[str, Any]] = []
         handled_call_indexes: set[int] = set()
@@ -635,12 +704,14 @@ class Agent:
                         f"[上下文压缩] {event.method}: {event.before_tokens} -> {event.after_tokens} tokens"
                         + (f"；{event.warning}" if event.warning else "")
                     )
+                if metrics.get("over_budget"):
+                    raise ModelRequestError("压缩后输入仍超过可用输入预算；请缩小本次输入或开启新会话。")
                 message = self.client.complete(
                     request_messages,
                     tools,
                     "none" if final_round else "auto",
                 )
-                self.context.record_usage(getattr(self.client, "last_usage", None))
+                self.context.record_usage(self.client.last_usage, request_messages, tools)
                 assistant = self._assistant_message(message)
                 self.messages.append(assistant)
                 calls = self._tool_calls(message)
@@ -736,6 +807,8 @@ class Agent:
             del self.messages[history_start:]
             print(f"模型请求失败: {exc}")
             return None
+        finally:
+            self.usage_ledger.summary()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -747,11 +820,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = Config.from_env(args.env_file)
+        agent = Agent(config)
     except ConfigurationError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
 
-    agent = Agent(config)
     print("Jarvis 已启动。输入 exit 退出，Ctrl+C 取消当前请求。")
     while True:
         try:

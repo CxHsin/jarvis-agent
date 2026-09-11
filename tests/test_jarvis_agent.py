@@ -102,6 +102,7 @@ class AgentTests(unittest.TestCase):
                 base_url="http://example.test/v1",
                 api_key="",
                 model="test-model",
+                max_output_tokens=1024,
                 root_dir=Path(directory),
             )
             client = ChatCompletionsClient(config)
@@ -116,6 +117,7 @@ class AgentTests(unittest.TestCase):
                 base_url="http://example.test/v1",
                 api_key="",
                 model="test-model",
+                max_output_tokens=1024,
                 root_dir=Path(directory),
                 context_window_tokens=16384,
                 context_window_source="configured",

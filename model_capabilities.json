@@ -1,0 +1,13 @@
+{
+  "models": [
+    {
+      "base_url": "https://api.deepseek.com",
+      "model_ids": ["deepseek-flash", "deepseek-v4-flash"],
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "source": "https://api-docs.deepseek.com/quick_start/pricing",
+      "checked_at": "2026-09-11",
+      "notes": "API documents 1M; integer capacity follows official V4.1-Flash text_config.max_position_embeddings: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/main/config.json . This is catalog metadata, not a measured API boundary. Legacy v4-flash currently routes to V4.1-Flash."
+    }
+  ]
+}
