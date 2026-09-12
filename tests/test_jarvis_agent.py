@@ -346,6 +346,56 @@ class AgentTests(unittest.TestCase):
             self.assertTrue(manager.session_archive[0]["compressed"])
             self.assertTrue(manager.session_evidence[0]["compressed"])
 
+    def test_explicit_compaction_keeps_task_boundary_and_persists_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "note.md").write_text("agent\n" * 20, encoding="utf-8")
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="",
+                model="test",
+                root_dir=root,
+                max_rounds=2,
+                context_window_tokens=100000,
+                context_keep_recent_tokens=1,
+                state_dir=_STATE_ROOT,
+            )
+            client = FakeClient([
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "1", "function": {"name": "read_file", "arguments": '{"path":"note.md"}'}}
+                    ],
+                },
+                {"role": "assistant", "content": "读完了"},
+            ])
+            agent = make_agent(self, config, client)
+            with redirect_stdout(StringIO()):
+                agent.run_request("读文件")
+
+            tasks_before = agent.context.task_number
+            with redirect_stdout(StringIO()) as output:
+                result = agent.compact_now()
+
+            self.assertTrue(result.compacted)
+            self.assertEqual(result.reason, "manual")
+            self.assertEqual(agent.context.task_number, tasks_before)
+            self.assertIn(CONTEXT_COMPRESSED_MARKER, agent.messages[1]["content"])
+            self.assertIn("收起的调用=", output.getvalue())
+
+            records = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["type"] for record in records].count("task"), 1)
+            self.assertEqual(
+                [record["reason"] for record in records if record["type"] == "compact"], ["manual"]
+            )
+
+            session_id = agent.store.session_id
+            agent.close()
+            with redirect_stdout(StringIO()):
+                resumed = make_agent(self, config, resume=session_id)
+            self.assertIn(CONTEXT_COMPRESSED_MARKER, resumed.messages[1]["content"])
+
     def test_cancelled_tool_calls_are_marked(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory),

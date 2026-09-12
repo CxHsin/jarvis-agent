@@ -16,12 +16,26 @@ Two shapes exist while the flat reserve is rolled out:
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 
 OUTPUT_FLOOR_TOKENS = 4096
+
+
+def estimate_tokens(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]) -> int:
+    """Roughly estimate serialized request tokens; this is not an upper bound."""
+
+    payload = json.dumps(
+        {"messages": list(messages), "tools": list(tools)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    # Four UTF-8 bytes is a deliberately rough cross-provider estimate.
+    return max(1, math.ceil(len(payload.encode("utf-8")) / 4))
 
 
 @dataclass(frozen=True)

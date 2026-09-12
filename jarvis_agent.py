@@ -21,6 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from context_manager import CONTEXT_RECOVERED_MARKER, ContextManager, estimate_tokens
 from cache_metrics import MeasuredClient, UsageLedger
+from compaction import CompactionResult, MANUAL
 from context_budget import ContextBudget
 from model_capabilities import load_capability
 from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
@@ -876,7 +877,8 @@ class Agent:
                 if self.context.last_compression_event:
                     event = self.context.last_compression_event
                     print(
-                        f"[上下文压缩] {event.method}: {event.before_tokens} -> {event.after_tokens} tokens"
+                        f"[上下文压缩/{event.reason}] {event.method}: "
+                        f"{event.before_tokens} -> {event.after_tokens} tokens"
                         + (f"；{event.warning}" if event.warning else "")
                     )
                 if metrics.get("over_budget"):
@@ -988,6 +990,25 @@ class Agent:
         finally:
             self.usage_ledger.summary()
 
+    def compact_now(self, reason: str = MANUAL) -> CompactionResult:
+        """Run an explicit compaction and report what it did.
+
+        This is the same service the automatic trigger uses, so the state effect
+        is identical; it does not start a task and does not touch task_number.
+        """
+
+        result = self.context.compact(self.messages, TOOL_DEFINITIONS, self.compression_client, reason)
+        if result.compacted:
+            print(
+                f"[压缩/{result.reason}] {result.before_tokens} -> {result.after_tokens} tokens；"
+                f"方法={result.method}；收起的调用={len(result.compressed_call_ids)}"
+                f"；保留窗口={self.config.context_keep_recent_tokens}"
+                + (f"；{result.warning}" if result.warning else "")
+            )
+        else:
+            print(f"[压缩/{result.reason}] 未压缩：{result.warning}")
+        return result
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
@@ -1025,7 +1046,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"会话错误: {exc}", file=sys.stderr)
         return 2
 
-    print("Jarvis 已启动。输入 exit 退出，Ctrl+C 取消当前请求。")
+    print("Jarvis 已启动。输入 exit 退出，/compact 主动压缩上下文，Ctrl+C 取消当前请求。")
     try:
         while True:
             try:
@@ -1038,6 +1059,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if user_text.casefold() == "exit":
                 print("已退出。")
                 return 0
+            if user_text.casefold() == "/compact":
+                agent.compact_now()
+                continue
             agent.run_request(user_text)
     finally:
         agent.close()

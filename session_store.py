@@ -318,6 +318,7 @@ class SessionStore:
         content: str,
         method: str,
         compressed_call_ids: Sequence[str] = (),
+        reason: str = "auto",
     ) -> None:
         self._append(
             {
@@ -326,6 +327,7 @@ class SessionStore:
                 "content": str(content),
                 "method": str(method),
                 "compressed_call_ids": [str(call_id) for call_id in compressed_call_ids],
+                "reason": str(reason),
             }
         )
 

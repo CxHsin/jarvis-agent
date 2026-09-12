@@ -57,7 +57,7 @@ class CompactionCutPointTests(unittest.TestCase):
             [{"role": "assistant", "content": "<context_summary>前半段事实</context_summary>"}]
         )
 
-        manager._compress(messages, [], compressor, 5000)
+        manager.compact(messages, [], compressor)
 
         self.assertEqual(manager.last_compression_event.cut_index, 4)
         self.assertEqual(manager.last_compression_event.compressed_call_ids, ("c1",))
@@ -88,7 +88,7 @@ class CompactionCutPointTests(unittest.TestCase):
                 return {"content": "<context_summary>完成</context_summary>"}
 
         compressor = CapturingCompressor()
-        manager._compress(messages, [], compressor, 1000)
+        manager.compact(messages, [], compressor)
         prompt = compressor.prompts[0][-1]["content"]
         self.assertIn("[Assistant]: 我先读一下文件", prompt)
         self.assertIn("[Assistant]: 任务一完成", prompt)
@@ -109,7 +109,7 @@ class CompactionCutPointTests(unittest.TestCase):
             {"role": "user", "content": "任务二"},
         ]
 
-        manager._compress(messages, [], compressor, 1000)
+        manager.compact(messages, [], compressor)
         self.assertIn(CONTEXT_COMPRESSED_MARKER, messages[1]["content"])
         messages.extend(
             [
@@ -117,7 +117,7 @@ class CompactionCutPointTests(unittest.TestCase):
                 {"role": "user", "content": "任务三"},
             ]
         )
-        manager._compress(messages, [], compressor, 1000)
+        manager.compact(messages, [], compressor)
 
         second_prompt = compressor.requests[1][0][-1]["content"]
         self.assertIn("第一批摘要", second_prompt)
@@ -144,13 +144,80 @@ class CompactionCutPointTests(unittest.TestCase):
 
         compressor = InvalidCompressor()
         for _ in range(3):
-            manager._compress(fresh_messages(), [], compressor, 1000)
+            manager.compact(fresh_messages(), [], compressor)
         self.assertEqual(compressor.calls, 3)
-        self.assertEqual(manager._compression_failures, 3)
+        self.assertEqual(manager.compaction_failures, 3)
 
-        manager._compress(fresh_messages(), [], compressor, 1000)
+        manager.compact(fresh_messages(), [], compressor)
         self.assertEqual(compressor.calls, 3)
         self.assertIn("熔断", manager.last_compression_event.warning)
+
+    def test_auto_and_manual_compaction_produce_the_same_effect(self):
+        class Recorder:
+            def __init__(self):
+                self.compacts = []
+
+            def record_task(self, number, goal):
+                pass
+
+            def record_compact(self, kept_from, content, method, call_ids=(), reason="auto"):
+                self.compacts.append({"kept_from": kept_from, "content": content, "method": method,
+                                      "call_ids": tuple(call_ids), "reason": reason})
+
+        def run(reason):
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="",
+                model="test",
+                root_dir=Path.cwd(),
+                context_window_tokens=10000,
+                context_keep_recent_tokens=1,
+            )
+            recorder = Recorder()
+            manager = ContextManager(config, recorder)
+            manager.begin_task("任务")
+            messages = [
+                {"role": "system", "content": "stable"},
+                {"role": "user", "content": "任务一"},
+                {"role": "assistant", "content": "第一批完成"},
+                {"role": "user", "content": "任务二"},
+            ]
+            compressor = FakeClient(
+                [{"role": "assistant", "content": "<context_summary>摘要</context_summary>"}]
+            )
+            result = manager.compact(messages, [], compressor, reason)
+            return messages, result, recorder.compacts
+
+        auto_messages, auto_result, auto_records = run("auto")
+        manual_messages, manual_result, manual_records = run("manual")
+
+        self.assertEqual(auto_messages, manual_messages)
+        self.assertEqual(auto_result.method, manual_result.method)
+        self.assertEqual(auto_result.cut_index, manual_result.cut_index)
+        self.assertEqual(auto_result.after_tokens, manual_result.after_tokens)
+        self.assertEqual(len(auto_records), len(manual_records))
+        self.assertEqual(
+            [{key: value for key, value in record.items() if key != "reason"} for record in auto_records],
+            [{key: value for key, value in record.items() if key != "reason"} for record in manual_records],
+        )
+        self.assertEqual(auto_records[0]["reason"], "auto")
+        self.assertEqual(manual_records[0]["reason"], "manual")
+
+    def test_manual_compaction_without_old_content_changes_nothing(self):
+        manager = make_manager(context_keep_recent_tokens=1000)
+        manager.begin_task("任务")
+        messages = [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "任务一"},
+        ]
+        compressor = FakeClient([{"role": "assistant", "content": "<context_summary>摘要</context_summary>"}])
+
+        result = manager.compact(messages, [], compressor, "manual")
+
+        self.assertFalse(result.compacted)
+        self.assertEqual(result.method, "none")
+        self.assertEqual(len(compressor.requests), 0)
+        self.assertEqual([message["content"] for message in messages], ["stable", "任务一"])
 
 
 if __name__ == "__main__":

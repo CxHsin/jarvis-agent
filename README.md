@@ -18,7 +18,7 @@
 & 'C:\Users\Cx\AppData\Local\Programs\Python\Python312\python.exe' -m venv .venv
 ```
 
-输入 `exit` 退出，`Ctrl+C` 取消当前请求。`--list` 列出当前工作区的会话，`--resume` 接上最近一段，`--resume <id>` 接上指定会话。
+输入 `exit` 退出，`Ctrl+C` 取消当前请求，`/compact` 主动压缩上下文。`--list` 列出当前工作区的会话，`--resume` 接上最近一段，`--resume <id>` 接上指定会话。
 
 ## 第一阶段验收
 
@@ -74,4 +74,4 @@ DeepSeek 缓存默认开启。Jarvis 读取 `prompt_cache_hit_tokens`、`prompt_
 
 ## 结构
 
-`Workspace` 负责工作区边界和三个工具，`ContextManager` 负责证据索引、预算估算和压缩，`SessionStore` 负责会话记录的追加、截断、加锁和加载，`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。
+`Workspace` 负责工作区边界和三个工具，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、截断、加锁和加载，`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。
