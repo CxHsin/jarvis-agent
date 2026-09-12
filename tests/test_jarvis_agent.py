@@ -8,7 +8,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
-from jarvis_agent import ChatCompletionsClient, Config, Workspace, Agent, ModelRequestError, TOOL_DEFINITIONS
+from jarvis_agent import (
+    Agent,
+    ChatCompletionsClient,
+    Config,
+    ModelRequestError,
+    TOOL_DEFINITIONS,
+    Workspace,
+    parse_compact_argument,
+)
 
 
 _STATE_ROOT = Path(tempfile.mkdtemp(prefix="jarvis-test-state-"))
@@ -381,7 +389,7 @@ class AgentTests(unittest.TestCase):
                 root_dir=root,
                 max_rounds=2,
                 context_window_tokens=100000,
-                context_keep_recent_tokens=1,
+                context_keep_recent_tokens=20000,
                 state_dir=_STATE_ROOT,
             )
             client = FakeClient([
@@ -393,10 +401,19 @@ class AgentTests(unittest.TestCase):
                     ],
                 },
                 {"role": "assistant", "content": "读完了"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "2", "function": {"name": "read_file", "arguments": '{"path":"note.md"}'}}
+                    ],
+                },
+                {"role": "assistant", "content": "第二次读完了"},
             ])
             agent = make_agent(self, config, client)
             with redirect_stdout(StringIO()):
                 agent.run_request("读文件")
+                agent.run_request("再读一次")
 
             tasks_before = agent.context.task_number
             with redirect_stdout(StringIO()) as output:
@@ -404,12 +421,15 @@ class AgentTests(unittest.TestCase):
 
             self.assertTrue(result.compacted)
             self.assertEqual(result.reason, "manual")
+            self.assertEqual(result.retired_messages, 4)
             self.assertEqual(agent.context.task_number, tasks_before)
             self.assertIn(CONTEXT_COMPRESSED_MARKER, agent.messages[1]["content"])
-            self.assertIn("收起的调用=", output.getvalue())
+            self.assertIn("再读一次", [message.get("content") for message in agent.messages
+                                     if message["role"] == "user"])
+            self.assertIn("退休 4 条旧消息", output.getvalue())
 
             records = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([record["type"] for record in records].count("task"), 1)
+            self.assertEqual([record["type"] for record in records].count("task"), 2)
             self.assertEqual(
                 [record["reason"] for record in records if record["type"] == "compact"], ["manual"]
             )
@@ -419,6 +439,14 @@ class AgentTests(unittest.TestCase):
             with redirect_stdout(StringIO()):
                 resumed = make_agent(self, config, resume=session_id)
             self.assertIn(CONTEXT_COMPRESSED_MARKER, resumed.messages[1]["content"])
+
+    def test_compact_argument_parsing(self):
+        self.assertIsNone(parse_compact_argument(""))
+        self.assertIsNone(parse_compact_argument("   "))
+        self.assertEqual(parse_compact_argument(" 2000 "), 2000)
+        for bad in ("abc", "0", "-5", "2k"):
+            with self.assertRaises(ValueError):
+                parse_compact_argument(bad)
 
     def test_provider_overflow_compacts_once_and_retries(self):
         with tempfile.TemporaryDirectory() as directory:

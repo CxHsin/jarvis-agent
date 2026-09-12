@@ -240,6 +240,66 @@ class CompactionCutPointTests(unittest.TestCase):
         self.assertEqual(len(compressor.requests), 0)
         self.assertEqual([message["content"] for message in messages], ["stable", "任务一"])
 
+    def test_manual_compaction_retires_older_tasks_below_the_keep_window(self):
+        # 用户报告：聊了几轮、总量远小于保留窗口时 /compact 什么也不做。
+        manager = make_manager(context_keep_recent_tokens=100_000)
+        manager.begin_task("任务一")
+        manager.begin_task("任务二")
+        messages = [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "任务一"},
+            {"role": "assistant", "content": "第一次完成"},
+            {"role": "user", "content": "任务二"},
+            {"role": "assistant", "content": "第二次完成"},
+        ]
+        compressor = FakeClient([{"role": "assistant", "content": "<context_summary>任务一完成</context_summary>"}])
+
+        result = manager.compact(messages, [], compressor, "manual")
+
+        self.assertTrue(result.compacted)
+        self.assertEqual(result.cut_index, 3)
+        self.assertEqual(result.retired_messages, 2)
+        self.assertEqual(result.keep_tokens, 100_000)
+        self.assertEqual([message["role"] for message in messages], ["system", "user", "user", "assistant"])
+        self.assertEqual(messages[2]["content"], "任务二")
+        self.assertIn("任务一完成", messages[1]["content"])
+
+    def test_manual_compaction_honours_an_explicit_keep_target(self):
+        manager = make_manager(context_keep_recent_tokens=100_000)
+        manager.begin_task("任务一")
+        messages = [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "任务一"},
+            {"role": "assistant", "content": "第一轮" + "x" * 400},
+            {"role": "user", "content": "任务二"},
+            {"role": "assistant", "content": "第二轮" + "y" * 400},
+        ]
+        compressor = FakeClient([{"role": "assistant", "content": "<context_summary>摘要</context_summary>"}])
+
+        result = manager.compact(messages, [], compressor, "manual", keep_tokens=50)
+
+        self.assertTrue(result.compacted)
+        self.assertEqual(result.keep_tokens, 50)
+        self.assertEqual(result.cut_index, 4)
+        self.assertEqual([message["role"] for message in messages], ["system", "user", "assistant"])
+
+    def test_manual_compaction_without_older_tasks_reports_the_numbers(self):
+        manager = make_manager(context_keep_recent_tokens=100_000)
+        manager.begin_task("唯一任务")
+        messages = [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "唯一任务"},
+            {"role": "assistant", "content": "完成"},
+        ]
+        compressor = FakeClient([{"role": "assistant", "content": "<context_summary>摘要</context_summary>"}])
+
+        result = manager.compact(messages, [], compressor, "manual")
+
+        self.assertFalse(result.compacted)
+        self.assertIn("没有超出保留窗口", result.warning)
+        self.assertIn("100000", result.warning)
+        self.assertEqual(len(compressor.requests), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

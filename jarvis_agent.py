@@ -71,6 +71,17 @@ def _setting(values: Mapping[str, str], key: str, default: str | None = None) ->
     return values.get(key, default)
 
 
+def parse_compact_argument(argument: str) -> int | None:
+    """Return the optional keep target for the /compact command."""
+
+    text = argument.strip()
+    if not text:
+        return None
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError("用法：/compact [保留的 token 数]，例如 /compact 2000；不带参数时保留当前任务的原文。")
+    return int(text)
+
+
 @dataclass(frozen=True)
 class Config:
     base_url: str
@@ -987,19 +998,21 @@ class Agent:
         finally:
             self.usage_ledger.summary()
 
-    def compact_now(self, reason: str = MANUAL) -> CompactionResult:
+    def compact_now(self, keep_tokens: int | None = None, reason: str = MANUAL) -> CompactionResult:
         """Run an explicit compaction and report what it did.
 
         This is the same service the automatic trigger uses, so the state effect
         is identical; it does not start a task and does not touch task_number.
         """
 
-        result = self.context.compact(self.messages, TOOL_DEFINITIONS, self.compression_client, reason)
+        result = self.context.compact(
+            self.messages, TOOL_DEFINITIONS, self.compression_client, reason, keep_tokens=keep_tokens
+        )
         if result.compacted:
             print(
                 f"[压缩/{result.reason}] {result.before_tokens} -> {result.after_tokens} tokens；"
-                f"方法={result.method}；收起的调用={len(result.compressed_call_ids)}"
-                f"；保留窗口={self.config.context_keep_recent_tokens}"
+                f"退休 {result.retired_messages} 条旧消息（收起 {len(result.compressed_call_ids)} 个工具结果）；"
+                f"方法={result.method}；保留窗口={result.keep_tokens}"
                 + (f"；{result.warning}" if result.warning else "")
             )
         else:
@@ -1043,7 +1056,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"会话错误: {exc}", file=sys.stderr)
         return 2
 
-    print("Jarvis 已启动。输入 exit 退出，/compact 主动压缩上下文，Ctrl+C 取消当前请求。")
+    print("Jarvis 已启动。输入 exit 退出，/compact [保留token] 主动压缩上下文，Ctrl+C 取消当前请求。")
     try:
         while True:
             try:
@@ -1056,8 +1069,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if user_text.casefold() == "exit":
                 print("已退出。")
                 return 0
-            if user_text.casefold() == "/compact":
-                agent.compact_now()
+            command, _, argument = user_text.partition(" ")
+            if command.casefold() == "/compact":
+                try:
+                    keep = parse_compact_argument(argument)
+                except ValueError as exc:
+                    print(str(exc))
+                    continue
+                agent.compact_now(keep)
                 continue
             agent.run_request(user_text)
     finally:

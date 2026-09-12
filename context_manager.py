@@ -327,6 +327,7 @@ class ContextManager:
         tools: Sequence[Mapping[str, Any]],
         compression_client: Any,
         reason: str = "auto",
+        keep_tokens: int | None = None,
     ) -> CompactionResult:
         """Run one compaction through the service and record the outcome.
 
@@ -343,6 +344,7 @@ class ContextManager:
             task=self.current_task,
             evidence=self.session_evidence,
             archive=self.session_archive,
+            keep_tokens=keep_tokens,
         )
         self.compaction_failures = self.compactor.failures
         self.last_compression_event = result

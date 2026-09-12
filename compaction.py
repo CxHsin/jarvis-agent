@@ -53,6 +53,8 @@ class CompactionResult:
     compressed_call_ids: tuple[str, ...] = ()
     warning: str | None = None
     cut_index: int | None = None
+    keep_tokens: int | None = None
+    retired_messages: int = 0
 
     @property
     def compacted(self) -> bool:
@@ -80,22 +82,31 @@ class CompactionService:
         task: Mapping[str, Any] | None = None,
         evidence: Sequence[Mapping[str, Any]] = (),
         archive: Sequence[dict[str, Any]] = (),
+        keep_tokens: int | None = None,
     ) -> CompactionResult:
         """Rewrite ``messages`` in place, returning what the compaction did."""
 
         before_tokens = self.estimator(messages, tools)
-        cut_index = self._find_cut_point(messages)
+        keep = self._keep_target(keep_tokens)
+        # A bare /compact keeps the newest task verbatim; an explicit token
+        # count is a hard target and may cut inside the current task.
+        cap = self._newest_task_index(messages) if reason == MANUAL and keep_tokens is None else None
+        cut_index = self._find_cut_point(messages, keep=keep_tokens, cap=cap)
         if cut_index is None:
-            return self._no_op(reason, before_tokens, "没有可压缩的旧内容")
+            return self._no_op(reason, before_tokens, f"没有可压缩的旧内容（历史 {before_tokens} tokens）", keep)
 
         previous_summary, raw_messages = self._retired_span(messages, cut_index)
         if not raw_messages:
-            return self._no_op(reason, before_tokens, "没有新的旧内容可归档")
-
+            return self._no_op(
+                reason,
+                before_tokens,
+                f"没有超出保留窗口的旧内容（历史 {before_tokens} tokens，保留窗口 {keep}）",
+                keep,
+            )
         failure_limit = int(getattr(self.config, "context_compaction_failure_limit", 3))
         if self.failures >= failure_limit:
             return self._no_op(
-                reason, before_tokens, f"连续 {self.failures} 次摘要失败，已触发熔断器"
+                reason, before_tokens, f"连续 {self.failures} 次摘要失败，已触发熔断器", keep, len(raw_messages)
             )
 
         summary, method, warning = self._summarize(raw_messages, previous_summary, client, task, evidence)
@@ -126,6 +137,22 @@ class CompactionService:
             compressed_call_ids=compressed_call_ids,
             warning=warning,
             cut_index=cut_index,
+            keep_tokens=keep,
+            retired_messages=len(raw_messages),
+        )
+
+    def _keep_target(self, keep_tokens: int | None) -> int:
+        """Keep-recent target for this run: the override or the configuration."""
+
+        if keep_tokens is not None:
+            return int(keep_tokens)
+        return int(getattr(self.config, "context_keep_recent_tokens", 0))
+
+    @staticmethod
+    def _newest_task_index(messages: Sequence[Mapping[str, Any]]) -> int | None:
+        return max(
+            (index for index, message in enumerate(messages) if message.get("role") == "user"),
+            default=None,
         )
 
     # -- cut point ----------------------------------------------------------
@@ -141,11 +168,22 @@ class CompactionService:
             return "tool"
         return None
 
-    def _find_cut_point(self, messages: Sequence[Mapping[str, Any]]) -> int | None:
-        """Return the first index of the kept suffix, snapped to a safe boundary."""
+    def _find_cut_point(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        keep: int | None = None,
+        cap: int | None = None,
+    ) -> int | None:
+        """Return the first index of the kept suffix, snapped to a safe boundary.
 
-        keep = int(getattr(self.config, "context_keep_recent_tokens", 0))
-        if keep <= 0 or len(messages) <= 1:
+        ``keep`` overrides the configured keep-recent target for this run;
+        ``cap`` is the newest task boundary: a manual compaction retires at
+        least everything older than that task, while still honouring a keep
+        target that wants to retire even more.
+        """
+
+        keep_tokens = self._keep_target(keep)
+        if keep_tokens <= 0 or len(messages) <= 1:
             return None
         boundaries = [
             index
@@ -154,14 +192,14 @@ class CompactionService:
         ]
         if not boundaries:
             return None
+        cut = boundaries[0]
         accumulated = 0
         for index in range(len(messages) - 1, 0, -1):
             accumulated += self.estimator([messages[index]], [])
-            if accumulated >= keep:
-                for boundary in reversed(boundaries):
-                    if boundary <= index:
-                        return boundary
-        return boundaries[0]
+            if accumulated >= keep_tokens:
+                cut = next((boundary for boundary in reversed(boundaries) if boundary <= index), cut)
+                break
+        return cut if cap is None else max(cut, cap)
 
     def _retired_span(
         self,
@@ -319,8 +357,16 @@ class CompactionService:
 
     # -- side effects -------------------------------------------------------
 
-    def _no_op(self, reason: str, before_tokens: int, warning: str) -> CompactionResult:
-        return CompactionResult(reason, before_tokens, before_tokens, "none", (), warning)
+    def _no_op(
+        self,
+        reason: str,
+        before_tokens: int,
+        warning: str,
+        keep_tokens: int | None = None,
+        retired_messages: int = 0,
+    ) -> CompactionResult:
+        return CompactionResult(reason, before_tokens, before_tokens, "none", (), warning, None,
+                                keep_tokens, retired_messages)
 
     def _record(
         self,
