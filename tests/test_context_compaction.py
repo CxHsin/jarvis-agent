@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 
+from compaction import is_overflow_error
 from context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
 from jarvis_agent import Config
 from tests.test_jarvis_agent import FakeClient
@@ -9,6 +10,7 @@ from tests.test_jarvis_agent import FakeClient
 def make_manager(**kwargs):
     kwargs.setdefault("context_keep_recent_tokens", 500)
     kwargs.setdefault("context_compaction_failure_limit", 3)
+    kwargs.setdefault("context_reserve_tokens", 1000)
     config = Config(
         base_url="http://example.test/v1",
         api_key="",
@@ -21,6 +23,24 @@ def make_manager(**kwargs):
 
 
 class CompactionCutPointTests(unittest.TestCase):
+    def test_overflow_error_is_recognised_by_message_text(self):
+        # Both bodies were recorded in ADR 0005 against the real endpoint: the
+        # provider uses the same type, code and null param for both, so only the
+        # message text distinguishes an overflow from an invalid max_tokens.
+        overflow = (
+            '模型接口返回 HTTP 400: {"error":{"message":"This model\'s maximum context length is 1048576 tokens. '
+            "However, you requested 1166688 tokens (1166687 in the messages, 1 in the completion). "
+            'Please reduce the length of the messages or completion.","type":"invalid_request_error",'
+            '"param":null,"code":"invalid_request_error"}}'
+        )
+        invalid_output = (
+            '模型接口返回 HTTP 400: {"error":{"message":"Invalid max_tokens value, the valid range of max_tokens '
+            'is [1, 393216]","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}'
+        )
+        self.assertTrue(is_overflow_error(overflow))
+        self.assertFalse(is_overflow_error(invalid_output))
+        self.assertFalse(is_overflow_error("无法连接模型接口: timed out"))
+
     def test_split_turn_keeps_recent_round_and_retires_earlier_round(self):
         manager = make_manager()
         manager.begin_task("长任务")
@@ -172,6 +192,7 @@ class CompactionCutPointTests(unittest.TestCase):
                 root_dir=Path.cwd(),
                 context_window_tokens=10000,
                 context_keep_recent_tokens=1,
+                context_reserve_tokens=1000,
             )
             recorder = Recorder()
             manager = ContextManager(config, recorder)

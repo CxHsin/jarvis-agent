@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from context_manager import CONTEXT_RECOVERED_MARKER, ContextManager, estimate_tokens
 from cache_metrics import MeasuredClient, UsageLedger
-from compaction import CompactionResult, MANUAL
+from compaction import CompactionResult, MANUAL, OVERFLOW, is_overflow_error
 from context_budget import ContextBudget
 from model_capabilities import load_capability
 from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
@@ -88,9 +88,7 @@ class Config:
     compression_model: str | None = None
     context_window_tokens: int | None = None
     context_window_source: str = "unknown"
-    context_compression_threshold: float = 0.90
-    context_safety_margin: float = 0.02
-    context_reserve_tokens: int | None = None
+    context_reserve_tokens: int = 16_384
     max_output_tokens: int = 32768
     model_max_output_tokens: int | None = None
     model_max_input_tokens: int | None = None
@@ -141,16 +139,6 @@ class Config:
                 raise ConfigurationError(f"{name} 必须是正整数。")
             return result
 
-        def ratio(name: str, default: float) -> float:
-            raw = _setting(values, name, str(default))
-            try:
-                result = float(raw or default)
-            except ValueError as exc:
-                raise ConfigurationError(f"{name} 必须是 0 到 1 之间的小数。") from exc
-            if not 0 < result < 1:
-                raise ConfigurationError(f"{name} 必须是 0 到 1 之间的小数。")
-            return result
-
         def boolean(name: str, default: bool = False) -> bool:
             raw = _setting(values, name)
             if raw is None:
@@ -186,7 +174,6 @@ class Config:
         if timeout <= 0:
             raise ConfigurationError("REQUEST_TIMEOUT 必须大于 0。")
 
-        context_threshold = ratio("CONTEXT_COMPRESSION_THRESHOLD", 0.90)
         context_window = optional_positive_int("CONTEXT_WINDOW_TOKENS")
         return cls(
             base_url=base_url.rstrip("/"),
@@ -204,9 +191,7 @@ class Config:
             compression_model=_setting(values, "COMPRESSION_MODEL") or None,
             context_window_tokens=context_window,
             context_window_source="configured" if context_window is not None else "unknown",
-            context_compression_threshold=context_threshold,
-            context_safety_margin=ratio("CONTEXT_SAFETY_MARGIN", 0.02),
-            context_reserve_tokens=optional_positive_int("CONTEXT_RESERVE_TOKENS"),
+            context_reserve_tokens=positive_int("CONTEXT_RESERVE_TOKENS", 16_384),
             max_output_tokens=positive_int("MAX_OUTPUT_TOKENS", 32768),
             model_capabilities_file=Path(_setting(values, "MODEL_CAPABILITIES_FILE")).expanduser().resolve()
             if _setting(values, "MODEL_CAPABILITIES_FILE") else None,
@@ -864,30 +849,42 @@ class Agent:
                 self.context.set_round(round_number)
                 print(f"\n[第 {round_number}/{self.config.max_rounds} 轮] 请求模型" + ("（收尾）" if final_round else ""))
                 tools = [] if final_round else TOOL_DEFINITIONS
-                request_messages = self.context.prepare_messages(self.messages, tools, self.compression_client)
-                metrics = self.context.last_metrics
-                print(
-                    f"[上下文] 估算 {metrics.get('estimated_tokens', '?')} tokens"
-                    + (
-                        f" / 窗口 {metrics['window_tokens']} ({metrics.get('window_source', 'unknown')})"
-                        if metrics.get("window_tokens")
-                        else " / 窗口未配置"
-                    )
-                )
-                if self.context.last_compression_event:
-                    event = self.context.last_compression_event
+                overflow_retried = False
+                while True:
+                    request_messages = self.context.prepare_messages(self.messages, tools, self.compression_client)
+                    metrics = self.context.last_metrics
                     print(
-                        f"[上下文压缩/{event.reason}] {event.method}: "
-                        f"{event.before_tokens} -> {event.after_tokens} tokens"
-                        + (f"；{event.warning}" if event.warning else "")
+                        f"[上下文] 估算 {metrics.get('estimated_tokens', '?')} tokens"
+                        + (
+                            f" / 窗口 {metrics['window_tokens']} ({metrics.get('window_source', 'unknown')})"
+                            if metrics.get("window_tokens")
+                            else " / 窗口未配置"
+                        )
                     )
-                if metrics.get("over_budget"):
-                    raise ModelRequestError("压缩后输入仍超过可用输入预算；请缩小本次输入或开启新会话。")
-                message = self.client.complete(
-                    request_messages,
-                    tools,
-                    "none" if final_round else "auto",
-                )
+                    if self.context.last_compression_event:
+                        event = self.context.last_compression_event
+                        print(
+                            f"[上下文压缩/{event.reason}] {event.method}: "
+                            f"{event.before_tokens} -> {event.after_tokens} tokens"
+                            + (f"；{event.warning}" if event.warning else "")
+                        )
+                    if metrics.get("over_budget"):
+                        raise ModelRequestError("压缩后输入仍超过可用输入预算；请缩小本次输入或开启新会话。")
+                    try:
+                        message = self.client.complete(
+                            request_messages,
+                            tools,
+                            "none" if final_round else "auto",
+                        )
+                        break
+                    except ModelRequestError as exc:
+                        if overflow_retried or not is_overflow_error(exc):
+                            raise
+                        overflow_retried = True
+                        print("[溢出恢复] 服务端报告上下文超限，压缩后重试一次。")
+                        recovered = self.context.compact(self.messages, tools, self.compression_client, OVERFLOW)
+                        if not recovered.compacted:
+                            raise
                 self.context.record_usage(self.client.last_usage, request_messages, tools)
                 assistant = self._assistant_message(message)
                 self._append_message(assistant)

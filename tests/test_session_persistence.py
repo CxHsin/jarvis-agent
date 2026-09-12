@@ -272,7 +272,7 @@ class SessionWriteThroughTests(SessionTestBase):
         self.assertEqual(resumed.messages, expected)
 
     def test_agent_compression_flow_persists_checkpoint_across_resume(self):
-        (self.root / "big.md").write_text("事实 " * 200, encoding="utf-8")
+        (self.root / "big.md").write_text("事实 " * 1000, encoding="utf-8")
         client = FakeClient(
             [
                 {
@@ -282,17 +282,24 @@ class SessionWriteThroughTests(SessionTestBase):
                         {"id": "c1", "function": {"name": "read_file", "arguments": '{"path":"big.md"}'}}
                     ],
                 },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "c2", "function": {"name": "read_file", "arguments": '{"path":"big.md"}'}}
+                    ],
+                },
                 {"role": "assistant", "content": "<context_summary>读到了事实。</context_summary>"},
                 {"role": "assistant", "content": "读完了"},
             ]
         )
         agent = self.agent(
             client,
-            context_window_tokens=3200,
+            context_window_tokens=12000,
             max_output_tokens=1000,
             context_keep_recent_tokens=200,
-            context_compression_threshold=0.5,
-            max_rounds=2,
+            context_reserve_tokens=9500,
+            max_rounds=4,
         )
         with redirect_stdout(StringIO()):
             self.assertEqual(agent.run_request("读大文件"), "读完了")
@@ -309,7 +316,7 @@ class SessionWriteThroughTests(SessionTestBase):
     def test_compaction_span_persists_and_rebuilds_original_archive(self):
         config = self.config(
             context_window_tokens=160,
-            context_compression_threshold=0.86,
+            context_reserve_tokens=1,
             context_keep_recent_tokens=1,
         )
         store = SessionStore.create(config)
@@ -362,7 +369,7 @@ class SessionWriteThroughTests(SessionTestBase):
     def test_snapshot_restore_undoes_compression_state(self):
         config = self.config(
             context_window_tokens=160,
-            context_compression_threshold=0.86,
+            context_reserve_tokens=1,
             context_keep_recent_tokens=1,
         )
         manager = ContextManager(config)

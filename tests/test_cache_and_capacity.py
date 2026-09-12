@@ -1,5 +1,4 @@
 import json
-import math
 import tempfile
 import unittest
 from dataclasses import replace
@@ -120,7 +119,8 @@ class CapacityTests(unittest.TestCase):
             path = Path(directory) / "models.json"
             path.write_text(json.dumps({"models": [{"base_url": "https://example.test", "model_ids": ["test"],
                 "context_window_tokens": 20000, "max_output_tokens": 500, "source": "test", "checked_at": "2026-09-11"}]}), encoding="utf-8")
-            client = ChatCompletionsClient(self.config(model_capabilities_file=path, context_window_tokens=30000))
+            client = ChatCompletionsClient(self.config(model_capabilities_file=path, context_window_tokens=30000,
+                                                      context_keep_recent_tokens=1000))
             with patch("jarvis_agent.urllib.request.urlopen") as network:
                 config = client.resolve_config()
             network.assert_not_called()
@@ -140,65 +140,38 @@ class CapacityTests(unittest.TestCase):
             ChatCompletionsClient(self.config(context_window_tokens=1000)).resolve_config()
 
     def test_budget_guard_stops_oversized_request(self):
-        client = ChatCompletionsClient(self.config(context_window_tokens=20000, context_keep_recent_tokens=4000))
+        client = ChatCompletionsClient(self.config(context_window_tokens=20000, context_reserve_tokens=1000,
+                                                   context_keep_recent_tokens=4000))
         client.resolve_config()
         with patch("jarvis_agent.urllib.request.urlopen") as network:
             with self.assertRaises(ModelRequestError):
                 client.complete([{"role": "user", "content": "x" * 100000}], [])
         network.assert_not_called()
 
-    def test_threshold_strictly_greater_than_ninety_percent_with_reserves(self):
-        manager = ContextManager(self.config(context_window_tokens=10000))
-        # output 1000 + margin 200; equality does not trigger.
-        self.assertFalse(manager.should_compress(7800))
-        self.assertTrue(manager.should_compress(7801))
-        self.assertEqual(manager.input_budget(), 8800)
+    def test_reserve_line_drives_the_trigger_and_the_send_limit(self):
+        manager = ContextManager(self.config(context_window_tokens=10000, context_reserve_tokens=1000))
+        # One reserve: compression starts exactly where sending would be refused.
+        self.assertEqual(manager.input_budget(), 9000)
+        self.assertFalse(manager.should_compress(9000))
+        self.assertTrue(manager.should_compress(9001))
 
-    def test_budget_object_reproduces_legacy_lines(self):
-        cases = [
-            dict(context_window_tokens=10000, max_output_tokens=1000),
-            dict(context_window_tokens=65536, max_output_tokens=8192, context_compression_threshold=0.86,
-                 context_safety_margin=0.05),
-            dict(context_window_tokens=1048576, max_output_tokens=32768),
-            dict(context_window_tokens=50000, max_output_tokens=1000, model_max_input_tokens=20000,
-                 context_compression_threshold=0.75, context_safety_margin=0.01),
-        ]
-        for kwargs in cases:
-            with self.subTest(kwargs=kwargs):
-                config = make_config(**kwargs)
-                budget = ContextBudget.from_config(config)
-                window = config.context_window_tokens
-                margin = math.ceil(window * config.context_safety_margin)
-                legacy_reserve = config.max_output_tokens + margin
-                legacy_limit = min(window - legacy_reserve, config.model_max_input_tokens or window - legacy_reserve)
-                legacy_trigger = min(window * config.context_compression_threshold - legacy_reserve, legacy_limit)
-                self.assertFalse(budget.flat)
-                self.assertEqual(budget.reserve, legacy_reserve)
-                self.assertEqual(budget.input_limit, legacy_limit)
-                self.assertAlmostEqual(budget.trigger, legacy_trigger, places=6)
-                for estimated in (0, int(legacy_trigger) - 1, int(legacy_trigger), int(legacy_trigger) + 1,
-                                  legacy_limit, legacy_limit + 1):
-                    expected = (estimated + legacy_reserve > window * config.context_compression_threshold
-                                or estimated > legacy_limit)
-                    self.assertEqual(budget.should_compress(estimated), expected)
-                self.assertFalse(budget.over_budget(legacy_limit))
-                self.assertTrue(budget.over_budget(legacy_limit + 1))
-
-    def test_flat_reserve_unifies_trigger_and_send_limit(self):
-        budget = ContextBudget.from_config(make_config(context_window_tokens=100000,
-                                                       context_reserve_tokens=16384, max_output_tokens=32768))
-        self.assertTrue(budget.flat)
+    def test_reserve_line_respects_the_model_input_cap(self):
+        budget = ContextBudget.from_config(make_config(context_window_tokens=100000, context_reserve_tokens=16384,
+                                                       model_max_input_tokens=50000, max_output_tokens=32768))
         self.assertEqual(budget.reserve, 16384)
-        self.assertEqual(budget.input_limit, 83616)
-        self.assertEqual(budget.trigger, 83616)
-        self.assertFalse(budget.should_compress(83616))
-        self.assertTrue(budget.should_compress(83617))
-        self.assertTrue(budget.over_budget(83617))
+        self.assertEqual(budget.input_limit, 50000)
+        self.assertEqual(budget.trigger, 50000)
+        self.assertFalse(budget.over_budget(50000))
+        self.assertTrue(budget.over_budget(50001))
+
+    def test_output_limit_follows_the_remaining_window(self):
+        budget = ContextBudget.from_config(make_config(context_window_tokens=100000, context_reserve_tokens=16384,
+                                                       max_output_tokens=32768))
         self.assertEqual(budget.output_limit(50000), 32768)
         self.assertEqual(budget.output_limit(90000), 100000 - 90000 - OUTPUT_FLOOR_TOKENS)
         self.assertEqual(budget.output_limit(99999), 1)
 
-    def test_flat_reserve_clamps_output_on_the_wire_and_still_refuses_oversize(self):
+    def test_output_limit_clamps_on_the_wire_and_still_refuses_oversize(self):
         config = make_config(context_window_tokens=20000, context_reserve_tokens=4096, max_output_tokens=8192,
                              context_keep_recent_tokens=2000)
         client = ChatCompletionsClient(config)
@@ -215,7 +188,7 @@ class CapacityTests(unittest.TestCase):
                 client.complete([{"role": "user", "content": "x" * 200000}], [])
         network.assert_not_called()
 
-    def test_flat_reserve_validation_uses_one_limit(self):
+    def test_reserve_validation_uses_one_limit(self):
         with self.assertRaises(ConfigurationError):
             ChatCompletionsClient(make_config(context_window_tokens=10000, context_reserve_tokens=4096,
                                               context_keep_recent_tokens=6000)).resolve_config()
@@ -245,6 +218,7 @@ class CapacityTests(unittest.TestCase):
         manager = ContextManager(
             self.config(
                 context_window_tokens=10000,
+                context_reserve_tokens=4000,
                 context_summary_max_chars=100,
                 context_keep_recent_tokens=1000,
             )

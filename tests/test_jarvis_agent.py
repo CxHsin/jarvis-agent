@@ -39,6 +39,29 @@ class FailingClient:
         raise ModelRequestError("test failure")
 
 
+OVERFLOW_ERROR = (
+    '模型接口返回 HTTP 400: {"error":{"message":"This model\'s maximum context length is 1048576 tokens. '
+    "However, you requested 1166688 tokens (1166687 in the messages, 1 in the completion). "
+    'Please reduce the length of the messages or completion.","type":"invalid_request_error",'
+    '"param":null,"code":"invalid_request_error"}}'
+)
+
+
+class ScriptedClient:
+    """Answer from a script; an entry that is an exception is raised instead."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+
+    def complete(self, messages, tools, tool_choice):
+        self.calls += 1
+        item = self.script.pop(0) if self.script else {"role": "assistant", "content": "默认回答"}
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 class FakeHTTPResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -186,6 +209,7 @@ class AgentTests(unittest.TestCase):
                 root_dir=Path(directory),
                 context_window_tokens=16384,
                 context_window_source="configured",
+                context_reserve_tokens=1024,
                 context_keep_recent_tokens=4000,
                 state_dir=_STATE_ROOT,
             )
@@ -305,7 +329,7 @@ class AgentTests(unittest.TestCase):
                 model="test",
                 root_dir=Path(directory),
                 context_window_tokens=160,
-                context_compression_threshold=0.86,
+                context_reserve_tokens=1,
                 context_keep_recent_tokens=1,
             )
             manager = ContextManager(config)
@@ -395,6 +419,95 @@ class AgentTests(unittest.TestCase):
             with redirect_stdout(StringIO()):
                 resumed = make_agent(self, config, resume=session_id)
             self.assertIn(CONTEXT_COMPRESSED_MARKER, resumed.messages[1]["content"])
+
+    def test_provider_overflow_compacts_once_and_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "note.md").write_text("agent loop\n", encoding="utf-8")
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="",
+                model="test",
+                root_dir=root,
+                max_rounds=2,
+                context_window_tokens=100000,
+                context_keep_recent_tokens=1,
+                state_dir=_STATE_ROOT,
+            )
+            main = ScriptedClient([
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "1", "function": {"name": "read_file", "arguments": '{"path":"note.md"}'}}
+                    ],
+                },
+                {"role": "assistant", "content": "读完了"},
+                ModelRequestError(OVERFLOW_ERROR),
+                {"role": "assistant", "content": "压缩后回答"},
+            ])
+            compressor = FakeClient([{"role": "assistant", "content": "<context_summary>摘要</context_summary>"}])
+            agent = make_agent(self, config, main, compression_client=compressor)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(agent.run_request("读文件"), "读完了")
+
+            with redirect_stdout(StringIO()) as output:
+                answer = agent.run_request("继续")
+
+            self.assertEqual(answer, "压缩后回答")
+            self.assertIn("溢出恢复", output.getvalue())
+            self.assertEqual(main.calls, 4)
+            self.assertIn(
+                "继续",
+                [message.get("content") for message in agent.messages if message["role"] == "user"],
+            )
+            records = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
+            compacts = [record for record in records if record["type"] == "compact"]
+            self.assertEqual([record["reason"] for record in compacts], ["overflow"])
+
+    def test_provider_overflow_retries_only_once_then_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "note.md").write_text("agent loop\n", encoding="utf-8")
+            config = Config(
+                base_url="http://example.test/v1",
+                api_key="",
+                model="test",
+                root_dir=root,
+                max_rounds=2,
+                context_window_tokens=100000,
+                context_keep_recent_tokens=1,
+                state_dir=_STATE_ROOT,
+            )
+            main = ScriptedClient([
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "1", "function": {"name": "read_file", "arguments": '{"path":"note.md"}'}}
+                    ],
+                },
+                {"role": "assistant", "content": "读完了"},
+                ModelRequestError(OVERFLOW_ERROR),
+                ModelRequestError(OVERFLOW_ERROR),
+            ])
+            compressor = FakeClient([{"role": "assistant", "content": "<context_summary>摘要</context_summary>"}])
+            agent = make_agent(self, config, main, compression_client=compressor)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(agent.run_request("读文件"), "读完了")
+
+            with redirect_stdout(StringIO()) as output:
+                answer = agent.run_request("继续")
+
+            self.assertIsNone(answer)
+            self.assertEqual(main.calls, 4)
+            self.assertIn("模型请求失败", output.getvalue())
+            self.assertNotIn(
+                "继续",
+                [message.get("content") for message in agent.messages if message["role"] == "user"],
+            )
+            records = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["type"] for record in records].count("compact"), 0)
 
     def test_cancelled_tool_calls_are_marked(self):
         with tempfile.TemporaryDirectory() as directory:

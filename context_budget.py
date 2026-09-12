@@ -5,13 +5,9 @@ estimated input is still sendable.  Keeping both answers here stops the same
 window arithmetic from being written three times with slightly different
 rounding.
 
-Two shapes exist while the flat reserve is rolled out:
-
-- legacy: the reserve is the output allowance plus a window-proportional error
-  margin, and compression runs at the earlier of the threshold line and the
-  send limit.
-- flat (``reserve_tokens`` set): one reserve serves as both the trigger and the
-  send limit, and the output cap shrinks with the estimated input.
+One reserve serves as both the compression trigger and the send limit; the
+output cap shrinks with the estimated input instead of being reserved up front
+(ADR 0005).
 """
 
 from __future__ import annotations
@@ -46,9 +42,7 @@ class ContextBudget:
     output_tokens: int
     model_max_output_tokens: int | None = None
     model_max_input_tokens: int | None = None
-    reserve_tokens: int | None = None
-    compression_threshold: float = 0.90
-    safety_margin: float = 0.02
+    reserve_tokens: int = 16_384
     keep_recent_tokens: int = 0
 
     @classmethod
@@ -58,29 +52,13 @@ class ContextBudget:
             output_tokens=int(getattr(config, "max_output_tokens", 0) or 0),
             model_max_output_tokens=getattr(config, "model_max_output_tokens", None),
             model_max_input_tokens=getattr(config, "model_max_input_tokens", None),
-            reserve_tokens=getattr(config, "context_reserve_tokens", None),
-            compression_threshold=float(getattr(config, "context_compression_threshold", 0.90)),
-            safety_margin=float(getattr(config, "context_safety_margin", 0.02)),
+            reserve_tokens=int(getattr(config, "context_reserve_tokens", 16_384) or 16_384),
             keep_recent_tokens=int(getattr(config, "context_keep_recent_tokens", 0) or 0),
         )
 
     @property
-    def flat(self) -> bool:
-        """Whether the flat reserve replaced the threshold and safety margin."""
-
-        return self.reserve_tokens is not None
-
-    @property
-    def error_allowance(self) -> int:
-        if self.flat or not self.window_tokens:
-            return 0
-        return math.ceil(self.window_tokens * self.safety_margin)
-
-    @property
     def reserve(self) -> int:
-        if self.reserve_tokens is not None:
-            return int(self.reserve_tokens)
-        return self.output_tokens + self.error_allowance
+        return self.reserve_tokens
 
     @property
     def input_limit(self) -> int | None:
@@ -94,16 +72,14 @@ class ContextBudget:
         return limit
 
     @property
-    def trigger(self) -> float | None:
-        """Estimated input above which compression runs."""
+    def trigger(self) -> int | None:
+        """Estimated input above which compression runs.
 
-        limit = self.input_limit
-        if limit is None:
-            return None
-        if self.flat:
-            return float(limit)
-        threshold_line = self.window_tokens * self.compression_threshold - self.reserve
-        return min(threshold_line, limit)
+        Compression starts at the send limit: one number decides both when to
+        compress and when to refuse sending (ADR 0005).
+        """
+
+        return self.input_limit
 
     def should_compress(self, estimated_input: int) -> bool:
         trigger = self.trigger
@@ -119,7 +95,7 @@ class ContextBudget:
         cap = self.output_tokens
         if self.model_max_output_tokens:
             cap = min(cap, self.model_max_output_tokens)
-        if not self.flat or not self.window_tokens or estimated_input is None:
+        if not self.window_tokens or estimated_input is None:
             return cap
         remaining = self.window_tokens - estimated_input - OUTPUT_FLOOR_TOKENS
         return max(1, min(cap, remaining))
@@ -134,6 +110,3 @@ class ContextBudget:
             raise ValueError(f"{label} 的输出预留/安全余量过大；请调整 MAX_OUTPUT_TOKENS 和上下文参数。")
         if self.keep_recent_tokens >= limit:
             raise ValueError(f"CONTEXT_KEEP_RECENT_TOKENS 必须小于可用输入预算 ({limit})。")
-        trigger = self.trigger
-        if trigger is not None and self.keep_recent_tokens >= trigger:
-            raise ValueError("CONTEXT_KEEP_RECENT_TOKENS 过大，压缩后无法降到触发线以下；请调小该值或窗口参数。")

@@ -25,6 +25,22 @@ MANUAL = "manual"
 OVERFLOW = "overflow"
 REASONS = (AUTO, MANUAL, OVERFLOW)
 
+# A provider reports "the request is too long" as a plain invalid_request_error,
+# the same type and code as an invalid max_tokens, so only the message text can
+# tell them apart (ADR 0005).
+_OVERFLOW_MARKERS = (
+    "maximum context length",
+    "context_length_exceeded",
+    "reduce the length of the messages",
+)
+
+
+def is_overflow_error(message: Any) -> bool:
+    """Whether a model error looks like the request exceeded the context window."""
+
+    text = str(message).casefold()
+    return any(marker in text for marker in _OVERFLOW_MARKERS)
+
 
 @dataclass
 class CompactionResult:

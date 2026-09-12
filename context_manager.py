@@ -293,7 +293,6 @@ class ContextManager:
         self.last_compression_event = None
         _, before_tokens = self._prepare_request(messages, tools)
         window = getattr(self.config, "context_window_tokens", None)
-        threshold = getattr(self.config, "context_compression_threshold", 0.90)
         if self.should_compress(before_tokens):
             self.compact(messages, tools, compression_client, "auto")
         prepared, total = self._prepare_request(messages, tools)
@@ -304,7 +303,8 @@ class ContextManager:
             "estimated_tokens": total,
             "window_tokens": window,
             "window_source": getattr(self.config, "context_window_source", "unknown"),
-            "threshold": threshold,
+            "reserve": self.budget.reserve,
+            "trigger": self.budget.trigger,
             "compression_triggered": self.last_compression_event is not None,
             "cut_index": (
                 self.last_compression_event.cut_index
