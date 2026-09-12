@@ -13,6 +13,7 @@ from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
 from cache_metrics import cache_usage
+from context_budget import ContextBudget
 
 
 CONTEXT_SUMMARY_OPEN = "<context_summary>"
@@ -67,6 +68,7 @@ class ContextManager:
     def __init__(self, config: Any, recorder: Any = None):
         self.config = config
         self.recorder = recorder
+        self.budget = ContextBudget.from_config(config)
         self.task_number = 0
         self.current_task: dict[str, Any] = {}
         self.session_evidence: list[dict[str, Any]] = []
@@ -281,19 +283,10 @@ class ContextManager:
         return estimate
 
     def input_budget(self) -> int | None:
-        window = getattr(self.config, "context_window_tokens", None)
-        if window is None:
-            return None
-        budget = window - self.config.max_output_tokens - math.ceil(window * self.config.context_safety_margin)
-        return min(budget, getattr(self.config, "model_max_input_tokens", None) or budget)
+        return self.budget.input_limit
 
     def should_compress(self, input_tokens: int) -> bool:
-        window = getattr(self.config, "context_window_tokens", None)
-        if not window:
-            return False
-        reserved = self.config.max_output_tokens + math.ceil(window * self.config.context_safety_margin)
-        return (input_tokens + reserved > window * self.config.context_compression_threshold
-                or input_tokens > self.input_budget())
+        return self.budget.should_compress(input_tokens)
 
     def _prepare_request(
         self,
@@ -316,7 +309,6 @@ class ContextManager:
         if self.should_compress(before_tokens):
             self._compress(messages, tools, compression_client, before_tokens)
         prepared, total = self._prepare_request(messages, tools)
-        budget = self.input_budget()
         if self.last_compression_event and self.should_compress(total):
             event = self.last_compression_event
             event.warning = (event.warning + "；" if event.warning else "") + "压缩后仍超过触发线；可能没有足够旧的原始内容"
@@ -331,7 +323,7 @@ class ContextManager:
                 if self.last_compression_event is not None
                 else None
             ),
-            "over_budget": budget is not None and total > budget,
+            "over_budget": self.budget.over_budget(total),
             "method": "estimated",
         }
         return prepared

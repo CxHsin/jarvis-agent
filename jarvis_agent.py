@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import urllib.error
@@ -22,6 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from context_manager import CONTEXT_RECOVERED_MARKER, ContextManager, estimate_tokens
 from cache_metrics import MeasuredClient, UsageLedger
+from context_budget import ContextBudget
 from model_capabilities import load_capability
 from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
 
@@ -87,6 +87,7 @@ class Config:
     context_window_source: str = "unknown"
     context_compression_threshold: float = 0.90
     context_safety_margin: float = 0.02
+    context_reserve_tokens: int | None = None
     max_output_tokens: int = 32768
     model_max_output_tokens: int | None = None
     model_max_input_tokens: int | None = None
@@ -200,6 +201,7 @@ class Config:
             context_window_source="configured" if context_window is not None else "unknown",
             context_compression_threshold=context_threshold,
             context_safety_margin=ratio("CONTEXT_SAFETY_MARGIN", 0.02),
+            context_reserve_tokens=optional_positive_int("CONTEXT_RESERVE_TOKENS"),
             max_output_tokens=positive_int("MAX_OUTPUT_TOKENS", 32768),
             model_capabilities_file=Path(_setting(values, "MODEL_CAPABILITIES_FILE")).expanduser().resolve()
             if _setting(values, "MODEL_CAPABILITIES_FILE") else None,
@@ -477,20 +479,10 @@ class ChatCompletionsClient:
                          max_output_tokens=min(config.max_output_tokens, output_limit) if output_limit else config.max_output_tokens,
                          capability_source=capability.get("source", source),
                          capability_checked_at=capability.get("checked_at", "unknown"))
-        reserve = config.max_output_tokens + math.ceil(window * config.context_safety_margin)
-        available = min(window - reserve, config.model_max_input_tokens or window)
-        if available <= 0:
-            raise ConfigurationError(
-                f"模型 {config.model} 的输出预留/安全余量过大；请调整 MAX_OUTPUT_TOKENS 和上下文参数。"
-            )
-        if config.context_keep_recent_tokens >= available:
-            raise ConfigurationError(
-                f"CONTEXT_KEEP_RECENT_TOKENS 必须小于可用输入预算 ({available})。"
-            )
-        if config.context_keep_recent_tokens + reserve >= window * config.context_compression_threshold:
-            raise ConfigurationError(
-                f"CONTEXT_KEEP_RECENT_TOKENS 过大，压缩后无法降到触发线以下；请调小该值或窗口参数。"
-            )
+        try:
+            ContextBudget.from_config(config).validate(label=f"模型 {config.model}")
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
         self.config = config
         return config
 
@@ -501,17 +493,15 @@ class ChatCompletionsClient:
         tool_choice: str = "auto",
     ) -> dict[str, Any]:
         self.last_usage = None
-        window = self.config.context_window_tokens
-        if window is not None:
-            estimated = estimate_tokens(messages, tools)
-            safe_input = window - self.config.max_output_tokens - math.ceil(window * self.config.context_safety_margin)
-            if estimated > min(safe_input, self.config.model_max_input_tokens or safe_input):
-                raise ModelRequestError("预计输入超过可用输入预算，压缩不足；请缩小本次输入或开启新会话。")
+        budget = ContextBudget.from_config(self.config)
+        estimated = estimate_tokens(messages, tools)
+        if budget.over_budget(estimated):
+            raise ModelRequestError("预计输入超过可用输入预算，压缩不足；请缩小本次输入或开启新会话。")
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": list(messages),
             "temperature": 0,
-            "max_tokens": self.config.max_output_tokens,
+            "max_tokens": budget.output_limit(estimated),
         }
         if tools:
             payload["tools"] = list(tools)

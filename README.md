@@ -62,6 +62,7 @@
 - `MAX_OUTPUT_TOKENS=32768`：单次输出上限，受目录中的模型输出能力约束，并作为 `max_tokens` 发给服务端。
 - `CONTEXT_SAFETY_MARGIN=0.02`：窗口的 2%，向上取整；用于吸收估算误差，不保证估算始终准确。
 - `CONTEXT_COMPRESSION_THRESHOLD=0.90`：含预留的压缩触发线。
+- `CONTEXT_RESERVE_TOKENS`：留空时沿用上面的触发线与安全余量；设置后触发线与发送上限重合为一个预留值，输出上限按剩余空间收敛。
 - `CONTEXT_KEEP_RECENT_TOKENS=20000`：压缩后保留原文的软目标（绝对 token）；吸附到合法边界时允许略超。
 - `CONTEXT_COMPACTION_FAILURE_LIMIT=3`：连续摘要失败达到该次数后熔断，停止重试。
 - `COMPRESSION_CONTEXT_WINDOW_TOKENS`、`COMPRESSION_MAX_OUTPUT_TOKENS`：单独覆盖压缩模型。不同压缩模型单独解析容量，不继承主模型的窗口。小窗口模型需要相应降低输出上限；输出预留或保留窗口无法容纳的配置会在启动时报错。
