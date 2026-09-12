@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -89,6 +90,58 @@ class WorkspaceTests(unittest.TestCase):
     def test_binary_extension_is_rejected(self):
         with self.assertRaises(ValueError):
             self.workspace.read_file("video.mp4")
+
+    def test_small_results_are_returned_untouched(self):
+        result = self.workspace.read_file("notes/one.md")
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["end_line"], 2)
+        self.assertNotIn("next_start_line", result)
+
+    def test_long_read_is_trimmed_to_the_token_budget_and_can_continue(self):
+        root = Path(self.temp_dir.name)
+        (root / "long.md").write_text(
+            "".join(f"第{number}行 记录自己试验的结论\n" for number in range(1, 401)), encoding="utf-8"
+        )
+        workspace = Workspace(replace(self.config, max_tool_result_tokens=400, max_read_chars=100_000))
+        first = workspace.read_file("long.md")
+        self.assertTrue(first["truncated"])
+        self.assertLessEqual(Workspace._result_tokens(first), 400)
+        self.assertGreater(first["end_line"], 1)
+        self.assertEqual(first["next_start_line"], first["end_line"] + 1)
+        second = workspace.read_file("long.md", first["next_start_line"])
+        self.assertEqual(second["start_line"], first["next_start_line"])
+        self.assertTrue(second["content"].startswith(f"{first['next_start_line']}: "))
+
+    def test_character_cap_still_yields_a_continuation_line(self):
+        root = Path(self.temp_dir.name)
+        (root / "wide.md").write_text(
+            "".join(f"{number} " + "x" * 80 + "\n" for number in range(1, 60)), encoding="utf-8"
+        )
+        workspace = Workspace(replace(self.config, max_read_chars=400))
+        result = workspace.read_file("wide.md")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["next_start_line"], result["end_line"] + 1)
+        self.assertLessEqual(len(result["content"].splitlines()[0]), 400)
+
+    def test_directory_entries_are_capped_and_marked(self):
+        root = Path(self.temp_dir.name)
+        for number in range(60):
+            (root / f"file-{number:03d}.md").write_text("x", encoding="utf-8")
+        result = Workspace(replace(self.config, max_directory_entries=10)).list_directory(".")
+        self.assertEqual(len(result["entries"]), 10)
+        self.assertTrue(result["truncated"])
+
+    def test_oversized_tool_results_stay_within_the_token_budget(self):
+        root = Path(self.temp_dir.name)
+        for number in range(80):
+            (root / f"note-{number:03d}-自己试验.md").write_text("自己试验\n" * 20, encoding="utf-8")
+        workspace = Workspace(replace(self.config, max_tool_result_tokens=300, max_directory_entries=500))
+        listing = workspace.list_directory(".")
+        self.assertTrue(listing["truncated"])
+        self.assertLessEqual(Workspace._result_tokens(listing), 300)
+        found = workspace.search_file_content("自己试验")
+        self.assertTrue(found["truncated"])
+        self.assertLessEqual(Workspace._result_tokens(found), 300)
 
 
 class AgentTests(unittest.TestCase):

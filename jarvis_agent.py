@@ -82,6 +82,8 @@ class Config:
     request_timeout: float = 60.0
     max_read_chars: int = 12_000
     max_search_matches: int = 20
+    max_directory_entries: int = 200
+    max_tool_result_tokens: int = 8_192
     compression_model: str | None = None
     context_window_tokens: int | None = None
     context_window_source: str = "unknown"
@@ -196,6 +198,8 @@ class Config:
             request_timeout=timeout,
             max_read_chars=positive_int("MAX_READ_CHARS", 12_000),
             max_search_matches=positive_int("MAX_SEARCH_MATCHES", 20),
+            max_directory_entries=positive_int("MAX_DIRECTORY_ENTRIES", 200),
+            max_tool_result_tokens=positive_int("MAX_TOOL_RESULT_TOKENS", 8_192),
             compression_model=_setting(values, "COMPRESSION_MODEL") or None,
             context_window_tokens=context_window,
             context_window_source="configured" if context_window is not None else "unknown",
@@ -259,10 +263,85 @@ class Workspace:
                     "path": _display_path(resolved, self.root),
                 }
             )
-        return {"ok": True, "path": _display_path(directory, self.root), "entries": entries}
+        limit = int(getattr(self.config, "max_directory_entries", 0) or 0)
+        truncated = bool(limit) and len(entries) > limit
+        if truncated:
+            entries = entries[:limit]
+        return self._fit_result(
+            "list_directory",
+            {"ok": True, "path": _display_path(directory, self.root), "entries": entries, "truncated": truncated},
+        )
 
     def _is_text_file(self, path: Path) -> bool:
         return path.suffix.lower() in self.config.text_extensions
+
+    @staticmethod
+    def _result_tokens(result: Mapping[str, Any]) -> int:
+        """Tokens the model spends on this result once it becomes a tool message."""
+
+        return estimate_tokens([{"role": "tool", "content": json.dumps(result, ensure_ascii=False)}], [])
+
+    @staticmethod
+    def _leading_line_number(entry: str) -> int | None:
+        head, separator, _ = entry.partition(":")
+        return int(head) if separator and head.isdigit() else None
+
+    def _fit_result(self, name: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Trim a tool result to the token budget before the model sees it.
+
+        Character caps stay as a cheap first filter; this guard bounds what a
+        token-dense result costs in the request and marks every trimmed result
+        so the model knows it is looking at a partial answer.
+        """
+
+        limit = int(getattr(self.config, "max_tool_result_tokens", 0) or 0)
+        if limit <= 0 or self._result_tokens(result) <= limit:
+            return result
+        if name == "read_file" and isinstance(result.get("content"), str):
+            return self._trim_read_result(result, limit)
+        for field, tool in (("matches", "search_file_content"), ("entries", "list_directory")):
+            if name == tool and isinstance(result.get(field), list):
+                return self._trim_list_result(result, field, limit)
+        preview = json.dumps(result, ensure_ascii=False)[:200]
+        return {
+            "ok": bool(result.get("ok")),
+            "truncated": True,
+            "path": result.get("path"),
+            "error": result.get("error"),
+            "preview": preview,
+        }
+
+    def _trim_read_result(self, result: dict[str, Any], limit: int) -> dict[str, Any]:
+        lines = str(result.get("content", "")).split("\n")
+        marker = "[内容已按上下文预算截断]"
+        low, high = 0, len(lines)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = {**result, "content": "\n".join(lines[:middle]) + "\n" + marker, "truncated": True}
+            candidate.pop("next_start_line", None)
+            if self._result_tokens(candidate) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        kept = lines[:low]
+        last = next((number for entry in reversed(kept)
+                     if (number := self._leading_line_number(entry)) is not None), None)
+        if last is None:
+            return {**result, "content": marker, "truncated": True,
+                    "end_line": result.get("start_line", 1) - 1}
+        return {**result, "content": "\n".join(kept) + "\n" + marker, "truncated": True,
+                "end_line": last, "next_start_line": last + 1}
+
+    def _trim_list_result(self, result: dict[str, Any], field: str, limit: int) -> dict[str, Any]:
+        items = list(result[field])
+        low, high = 0, len(items)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self._result_tokens({**result, field: items[:middle], "truncated": True}) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        return {**result, field: items[:low], "truncated": True}
 
     def _read_text(self, path: Path) -> str:
         try:
@@ -300,7 +379,11 @@ class Workspace:
                     )
                     if len(matches) >= self.config.max_search_matches:
                         break
-        return {"ok": True, "query": query, "matches": matches, "truncated": len(matches) >= self.config.max_search_matches}
+        return self._fit_result(
+            "search_file_content",
+            {"ok": True, "query": query, "matches": matches,
+             "truncated": len(matches) >= self.config.max_search_matches},
+        )
 
     def read_file(self, path: str, start_line: int = 1, end_line: int | None = None) -> dict[str, Any]:
         file_path = self._resolve(path)
@@ -313,20 +396,34 @@ class Workspace:
         if start_line < 1 or (end_line is not None and end_line < start_line):
             raise WorkspaceError("行号范围无效。")
         lines = self._read_text(file_path).splitlines()
-        selected_end = end_line or len(lines)
-        selected = lines[start_line - 1 : selected_end]
-        numbered = "\n".join(f"{number}: {line}" for number, line in enumerate(selected, start_line))
-        truncated = len(numbered) > self.config.max_read_chars
-        if truncated:
-            numbered = numbered[: self.config.max_read_chars] + "\n[内容已截断]"
-        return {
+        selected_end = min(end_line or len(lines), len(lines))
+        numbered: list[str] = []
+        used = 0
+        last_line = start_line - 1
+        truncated = False
+        for number, line in enumerate(lines[start_line - 1 : selected_end], start_line):
+            entry = f"{number}: {line}"
+            addition = len(entry) + (1 if numbered else 0)
+            if used + addition > self.config.max_read_chars:
+                if not numbered:
+                    numbered.append(entry[: self.config.max_read_chars])
+                    last_line = number
+                truncated = True
+                break
+            numbered.append(entry)
+            used += addition
+            last_line = number
+        result: dict[str, Any] = {
             "ok": True,
             "path": _display_path(file_path, self.root),
             "start_line": start_line,
-            "end_line": min(selected_end, len(lines)),
-            "content": numbered,
+            "end_line": last_line,
+            "content": "\n".join(numbered) if numbered else "[内容为空]",
             "truncated": truncated,
         }
+        if truncated:
+            result["next_start_line"] = last_line + 1
+        return self._fit_result("read_file", result)
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
