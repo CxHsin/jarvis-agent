@@ -1,11 +1,11 @@
 # Jarvis 第一阶段
 
-这是一个可观察的命令行个人 Agent 基线。它支持 OpenAI 兼容的 Chat Completions 接口，并提供三个文件工具：列目录、搜索文本内容、读取文本文件。对话历史写入状态目录下的会话记录，每次启动默认新建会话，用 `--resume` 显式接上上一段。
+这是一个可观察的命令行个人 Agent 基线。它支持 OpenAI 兼容的 Chat Completions 接口，并提供四个稳定工具：`read`、`edit`、`bash`、`tool_search`，同时保留旧文件工具名称作为兼容别名。对话历史写入状态目录下的会话记录，每次启动默认新建会话，用 `--resume` 显式接上上一段。
 
 ## 启动
 
 1. 复制 `.env.example` 为 `.env`，填写 `MODEL` 和 `API_KEY`；`BASE_URL` 可以指向任何兼容 Chat Completions 的服务。可选的 `COMPRESSION_MODEL` 用于上下文摘要，未填写时使用主模型。
-2. 确认 `ROOT_DIR` 指向允许 Agent 访问的目录。当前验收目录是 `D:\Course\Study\matt video`。会话记录默认写到系统用户状态目录（Windows 为 `%LOCALAPPDATA%\jarvis`），用 `STATE_DIR` 指定其他位置；它放在工作区之外，避免被文件工具读到。
+2. 确认 `ROOT_DIR` 指向默认工作区。当前验收目录是 `D:\Course\Study\matt video`。会话记录默认写到系统用户状态目录（Windows 为 `%LOCALAPPDATA%\jarvis`），用 `STATE_DIR` 指定其他位置；它放在工作区之外。
 3. 使用 Python 3.12 创建的项目虚拟环境运行：
 
 ```powershell
@@ -39,7 +39,7 @@
 - 每次模型调用显示服务端输入 token、缓存命中 token 和占比；任务结束后按主模型/压缩模型分别汇总。缺失或不一致的缓存字段标为“未知”，明确返回 0 才算未命中；总占比按总命中量除以总输入量计算，存在未知调用时不展示误导性的完整占比。
 - 终端默认只显示工具结果摘要和短预览；完整结果仍发送给模型。设置 `VERBOSE_TOOL_OUTPUT=true` 可临时显示完整工具结果，`TOOL_OUTPUT_PREVIEW_CHARS` 控制预览长度。
 
-`MAX_ROUNDS` 按主模型调用次数计数。文件工具只允许访问 `ROOT_DIR` 下的文本文件；目录工具可以列出所有直接子项。
+`MAX_ROUNDS` 按主模型调用次数计数。`read` 和 `read_file` 支持读取工作区外的文本文件：绝对路径直接解析，相对路径以 `ROOT_DIR` 为基准。`edit`、`bash`、`list_directory` 和 `search_file_content` 仍限制在 `ROOT_DIR` 内；目录工具可以列出所有直接子项。
 
 ## 模型容量与缓存
 
@@ -73,4 +73,4 @@ DeepSeek 缓存默认开启。Jarvis 读取 `prompt_cache_hit_tokens`、`prompt_
 
 ## 结构
 
-`Workspace` 负责工作区边界和三个工具，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、截断、加锁和加载，`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。
+`Workspace` 负责文件访问边界和读写工具，`ToolRuntime` 负责稳定工具注册、动态搜索、权限与执行审计，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、截断、加锁和加载，`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。
