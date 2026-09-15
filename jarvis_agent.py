@@ -25,6 +25,7 @@ from compaction import CompactionResult, MANUAL, OVERFLOW, is_overflow_error
 from context_budget import ContextBudget
 from model_capabilities import load_capability
 from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
+from tool_runtime import RegisteredTool, ToolMetadata, ToolRegistry, ToolRuntime
 
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
@@ -646,6 +647,7 @@ class Agent:
         compression_client: ChatCompletionsClient | Any | None = None,
         store: SessionStore | None = None,
         resume: str | None = None,
+        tool_runtime: ToolRuntime | None = None,
     ):
         self.client = client or ChatCompletionsClient(config)
         self.store = store
@@ -659,6 +661,7 @@ class Agent:
                   f"能力来源={self.config.capability_source} "
                   f"核对日期={self.config.capability_checked_at}")
         self.workspace = Workspace(self.config)
+        self.tool_registry = tool_runtime.registry if tool_runtime is not None else ToolRegistry()
         if compression_client is not None:
             self.compression_client = compression_client
             if isinstance(compression_client, ChatCompletionsClient):
@@ -691,6 +694,23 @@ class Agent:
             "search_file_content": self.workspace.search_file_content,
             "read_file": self.workspace.read_file,
         }
+        if tool_runtime is None:
+            for definition in TOOL_DEFINITIONS:
+                schema = definition["function"]
+                self.tool_registry.register(
+                    ToolMetadata(tool_id=str(schema["name"]), version="1", schema=schema),
+                    self.tool_functions[str(schema["name"])],
+                )
+            tool_runtime = ToolRuntime(
+                self.tool_registry,
+                stable=tuple((name, "1") for name in self.tool_functions),
+            )
+        self.tool_runtime = tool_runtime
+        for registered in self.tool_runtime.stable_tools:
+            name = str(registered.metadata.schema.get("name", registered.metadata.tool_id))
+            self.tool_functions.setdefault(name, registered.handler)
+        self._runtime_task_id = "0"
+        self._runtime_handlers = dict(self.tool_functions)
         self._restore_session()
 
     def _restore_session(self) -> None:
@@ -789,7 +809,18 @@ class Agent:
         if function is None:
             return {"ok": False, "error": f"未知工具: {name}"}
         try:
-            return function(**self._normalise_args(arguments))
+            args = self._normalise_args(arguments)
+            registered = self._runtime_handlers.get(name)
+            if registered is not function:
+                # Preserve the existing extension seam used by callers/tests while
+                # keeping normal execution audited by ToolRuntime.
+                entry = self.tool_registry.get(name, "1")
+                self.tool_registry._tools[(name, "1")] = RegisteredTool(entry.metadata, function)
+                self._runtime_handlers[name] = function
+            result = self.tool_runtime.execute(self._runtime_task_id, name, "1", args)
+            if result.get("ok"):
+                return result.get("result")
+            return {"ok": False, "error": result.get("error", "工具调用失败")}
         except (TypeError, WorkspaceError, OSError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -850,6 +881,10 @@ class Agent:
         message_snapshot = deepcopy(self.messages)
         context_snapshot = self.context.snapshot()
         self.context.begin_task(user_text)
+        self._runtime_task_id = str(self.context.task_number)
+        for name in self.tool_functions:
+            if (name, "1") in self.tool_registry._tools:
+                self.tool_runtime.activate(self._runtime_task_id, name, "1")
         self.usage_ledger.reset()
         self._append_message({"role": "user", "content": user_text})
         active_calls: list[Mapping[str, Any]] = []
@@ -859,7 +894,7 @@ class Agent:
                 final_round = round_number == self.config.max_rounds
                 self.context.set_round(round_number)
                 print(f"\n[第 {round_number}/{self.config.max_rounds} 轮] 请求模型" + ("（收尾）" if final_round else ""))
-                tools = [] if final_round else TOOL_DEFINITIONS
+                tools = [] if final_round else self.tool_runtime.schemas(self._runtime_task_id)
                 overflow_retried = False
                 while True:
                     request_messages = self.context.prepare_messages(self.messages, tools, self.compression_client)
@@ -1006,7 +1041,7 @@ class Agent:
         """
 
         result = self.context.compact(
-            self.messages, TOOL_DEFINITIONS, self.compression_client, reason, keep_tokens=keep_tokens
+            self.messages, self.tool_runtime.schemas(self._runtime_task_id), self.compression_client, reason, keep_tokens=keep_tokens
         )
         if result.compacted:
             print(

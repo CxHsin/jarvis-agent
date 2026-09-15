@@ -261,6 +261,20 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(client.calls, [(2, 3, "auto"), (5, 0, "none")])
             self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant", "tool", "tool", "assistant"])
 
+    def test_agent_wires_file_tools_through_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(base_url="http://example.test/v1", api_key="", model="test",
+                            root_dir=Path(directory), state_dir=_STATE_ROOT)
+            agent = make_agent(self, config, FakeClient([{"role": "assistant", "content": "ok"}]))
+            names = [item["function"]["name"] for item in agent.tool_runtime.schemas("0")]
+            self.assertEqual(names, ["list_directory", "search_file_content", "read_file"])
+            agent.run_request("列出文件")
+            self.assertEqual(agent.tool_runtime.registry.active_keys("1"),
+                             {("list_directory", "1"), ("search_file_content", "1"), ("read_file", "1")})
+            result = agent._execute_tool("list_directory", {})
+            self.assertTrue(result["ok"])
+            self.assertEqual(agent.tool_runtime.registry.list()[0].metadata.version, "1")
+
     def test_no_status_bar_is_appended_to_model_context(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Config(base_url="http://example.test/v1", api_key="", model="test", root_dir=Path(directory),

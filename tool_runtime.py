@@ -121,7 +121,9 @@ class ToolRuntime:
                   for tool in self.stable_tools]
         if native_deferred:
             return result
-        dynamic = self.registry.active(task_id)
+        stable_keys = set(self._stable)
+        dynamic = tuple(tool for tool in self.registry.active(task_id)
+                        if (tool.metadata.tool_id, tool.metadata.version) not in stable_keys)
         if query:
             needle = query.casefold().strip()
             dynamic = tuple(tool for tool in dynamic if needle in _canonical(tool.metadata.schema).casefold())
