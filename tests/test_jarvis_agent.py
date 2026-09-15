@@ -258,7 +258,7 @@ class AgentTests(unittest.TestCase):
             agent = make_agent(self, config, client)
             answer = agent.run_request("找找 agent")
             self.assertEqual(answer, "找到了 note.md。")
-            self.assertEqual(client.calls, [(2, 3, "auto"), (5, 0, "none")])
+            self.assertEqual(client.calls, [(2, 7, "auto"), (5, 0, "none")])
             self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant", "tool", "tool", "assistant"])
 
     def test_agent_wires_file_tools_through_runtime(self):
@@ -267,7 +267,7 @@ class AgentTests(unittest.TestCase):
                             root_dir=Path(directory), state_dir=_STATE_ROOT)
             agent = make_agent(self, config, FakeClient([{"role": "assistant", "content": "ok"}]))
             names = [item["function"]["name"] for item in agent.tool_runtime.schemas("0")]
-            self.assertEqual(names, ["list_directory", "search_file_content", "read_file"])
+            self.assertEqual(names, ["read", "edit", "bash", "tool_search"])
             agent.run_request("列出文件")
             self.assertEqual(agent.tool_runtime.registry.active_keys("1"),
                              {("list_directory", "1"), ("search_file_content", "1"), ("read_file", "1")})
