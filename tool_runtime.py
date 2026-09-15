@@ -69,3 +69,12 @@ class ToolDispatcher:
             event.update({"ok": False, "error": type(exc).__name__}); self.audit.append(event)
             return {"ok": False, "error": {"code": "execution_error", "message": str(exc)}, "audit": event}
         finally: self._busy.difference_update(resource)
+
+class PermissionPolicy:
+    MODES = {"approve-all", "approve-dangerous", "broad-access"}
+    def __init__(self, mode="approve-dangerous"): self.mode = mode; self.revoked = False
+    def check(self, metadata: ToolMetadata, confirmed=False):
+        if self.revoked: return False, "policy_revoked"
+        if self.mode == "broad-access" or (self.mode == "approve-all" and not metadata.side_effects): return True, None
+        if metadata.side_effects and not confirmed: return False, "confirmation_required"
+        return True, None
