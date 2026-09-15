@@ -423,54 +423,40 @@ class Workspace:
             result["next_start_line"] = last_line + 1
         return self._fit_result("read_file", result)
 
+    def read(self, path: str, start_line: int = 1, end_line: int | None = None) -> dict[str, Any]:
+        return self.read_file(path, start_line, end_line)
+
+    def edit(self, path: str, content: str, *, start_line: int | None = None, end_line: int | None = None) -> dict[str, Any]:
+        target = self._resolve(path)
+        if target.exists() and not target.is_file(): raise WorkspaceError("不是文件。")
+        if target.exists() and not self._is_text_file(target): raise WorkspaceError("只支持文本文件编辑。")
+        if start_line is None and end_line is not None: raise WorkspaceError("end_line 需要 start_line。")
+        if start_line is None: updated = str(content)
+        else:
+            if start_line < 1 or (end_line is not None and end_line < start_line): raise WorkspaceError("行号范围无效。")
+            lines = self._read_text(target).splitlines() if target.exists() else []
+            if start_line > len(lines) + 1: raise WorkspaceError("start_line 超出文件范围。")
+            finish = min(end_line or start_line, len(lines)); lines[start_line - 1:finish] = str(content).splitlines(); updated = "\n".join(lines) + ("\n" if lines else "")
+        try: target.parent.mkdir(parents=True, exist_ok=True); target.write_text(updated, encoding="utf-8")
+        except OSError as exc: raise WorkspaceError(f"写入文件失败: {exc}") from exc
+        return {"ok": True, "path": _display_path(target, self.root), "bytes": len(updated.encode("utf-8"))}
+
+    def bash(self, command: str, timeout: float = 10.0) -> dict[str, Any]:
+        import subprocess
+        if not command or not command.strip(): raise WorkspaceError("command 不能为空。")
+        try: completed = subprocess.run(command, cwd=self.root, shell=True, capture_output=True, text=True, timeout=max(0.1, min(float(timeout), 60.0)), encoding="utf-8", errors="replace")
+        except subprocess.TimeoutExpired as exc: raise TimeoutError("命令执行超时。") from exc
+        output = (completed.stdout or "") + (completed.stderr or ""); limit = max(1000, self.config.max_read_chars)
+        return {"ok": completed.returncode == 0, "exit_code": completed.returncode, "output": output[:limit], "truncated": len(output) > limit}
+
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "列出工作区中某个目录的直接内容。path 可使用相对工作区的路径，默认是工作区根目录。",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "目录路径，默认 ."}},
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_file_content",
-            "description": "在工作区的文本文件中按不区分大小写的字面字符串搜索，返回片段和行号。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "要搜索的字面字符串"},
-                    "path": {"type": "string", "description": "搜索起点，默认 ."},
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取工作区中文本文件的内容，可选地指定起止行号。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "文件路径"},
-                    "start_line": {"type": "integer", "minimum": 1, "description": "起始行号，默认 1"},
-                    "end_line": {"type": "integer", "minimum": 1, "description": "结束行号，默认文件末尾"},
-                },
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        },
-    },
+ {"type":"function","function":{"name":"read","description":"读取工作区文本文件。","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"edit","description":"编辑工作区文本文件。","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path","content"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"bash","description":"在工作区执行 shell 命令。","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":0.1,"maximum":60}},"required":["command"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"tool_search","description":"搜索可用工具。","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"additionalProperties":False}}},
 ]
+
 
 
 class ChatCompletionsClient:
@@ -690,9 +676,9 @@ class Agent:
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         self.context = ContextManager(self.config, recorder=self.store)
         self.tool_functions: dict[str, ToolFunction] = {
-            "list_directory": self.workspace.list_directory,
-            "search_file_content": self.workspace.search_file_content,
-            "read_file": self.workspace.read_file,
+            "read": self.workspace.read, "edit": self.workspace.edit, "bash": self.workspace.bash,
+            "tool_search": lambda query="", limit=8: {"ok": True, "tools": self.tool_registry.search_tools(query, task_id=self._runtime_task_id, limit=limit)},
+            "list_directory": self.workspace.list_directory, "search_file_content": self.workspace.search_file_content, "read_file": self.workspace.read_file,
         }
         if tool_runtime is None:
             for definition in TOOL_DEFINITIONS:
@@ -701,9 +687,12 @@ class Agent:
                     ToolMetadata(tool_id=str(schema["name"]), version="1", schema=schema),
                     self.tool_functions[str(schema["name"])],
                 )
+            for alias in ("list_directory", "search_file_content", "read_file"):
+                if (alias, "1") not in self.tool_registry._tools:
+                    self.tool_registry.register(ToolMetadata(alias, "1", {"name": alias, "description": "Legacy alias", "parameters": {"type": "object", "additionalProperties": True}}), self.tool_functions[alias])
             tool_runtime = ToolRuntime(
                 self.tool_registry,
-                stable=tuple((name, "1") for name in self.tool_functions),
+                stable=tuple((name, "1") for name in ("read", "edit", "bash", "tool_search")),
             )
         self.tool_runtime = tool_runtime
         for registered in self.tool_runtime.stable_tools:
