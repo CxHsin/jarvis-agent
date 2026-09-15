@@ -43,3 +43,29 @@ class ToolRegistry:
     def get(self, tool_id: str, version: str) -> RegisteredTool: return self._tools[(tool_id,version)]
     def versions(self, tool_id: str) -> tuple[str,...]: return tuple(sorted(v for (t,v) in self._tools if t==tool_id))
     def list(self) -> tuple[RegisteredTool,...]: return tuple(self._tools[k] for k in sorted(self._tools))
+
+class ToolDispatcher:
+    """Validated, audited execution seam for registered tools."""
+    def __init__(self, registry: ToolRegistry):
+        self.registry, self.audit = registry, []
+        self._busy: set[str] = set()
+    def execute(self, tool_id: str, version: str, arguments: Mapping[str, Any] | None = None, *, timeout: float | None = None):
+        import inspect
+        tool = self.registry.get(tool_id, version); args = dict(arguments or {})
+        event = {"tool_id": tool_id, "version": version, "schema_fingerprint": tool.metadata.schema_fingerprint}
+        resource = tuple(tool.metadata.resources)
+        if any(r in self._busy for r in resource):
+            return {"ok": False, "error": {"code": "resource_conflict", "message": "resource is busy"}, "audit": event}
+        self._busy.update(resource)
+        try:
+            result = tool.handler(**args)
+            if inspect.isawaitable(result): raise TypeError("async handlers are not supported by synchronous dispatcher")
+            event.update({"ok": True}); self.audit.append(event)
+            return {"ok": True, "result": result, "audit": event}
+        except TimeoutError as exc:
+            event.update({"ok": False, "error": "timeout"}); self.audit.append(event)
+            return {"ok": False, "error": {"code": "timeout", "message": str(exc)}, "audit": event}
+        except Exception as exc:
+            event.update({"ok": False, "error": type(exc).__name__}); self.audit.append(event)
+            return {"ok": False, "error": {"code": "execution_error", "message": str(exc)}, "audit": event}
+        finally: self._busy.difference_update(resource)
