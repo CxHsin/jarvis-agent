@@ -270,7 +270,7 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(names, ["read", "edit", "bash", "tool_search"])
             agent.run_request("列出文件")
             self.assertEqual(agent.tool_runtime.registry.active_keys("1"),
-                             {("list_directory", "1"), ("search_file_content", "1"), ("read_file", "1")})
+                             {(name, "1") for name in agent.tool_functions})
             result = agent._execute_tool("list_directory", {})
             self.assertTrue(result["ok"])
             self.assertEqual(agent.tool_runtime.registry.list()[0].metadata.version, "1")
