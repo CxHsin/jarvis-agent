@@ -1,6 +1,7 @@
 """Immutable, versioned tool registry used by the agent runtime."""
 from __future__ import annotations
 import hashlib, json
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Iterable
 from enum import Enum
@@ -135,6 +136,13 @@ class ToolRuntime:
             return {"ok": False, "error": {"code": "inactive_tool", "message": "tool is not active for this task"}}
         return ToolDispatcher(self.registry).execute(tool_id, version, arguments)
 
+    def stable_fingerprint(self) -> str:
+        """Fingerprint only the stable prefix; dynamic task history cannot affect it."""
+        payload = [_canonical(tool.metadata.schema) for tool in self.stable_tools]
+        return hashlib.sha256(_canonical(payload).encode()).hexdigest()
+
+    fingerprint_stable_prefix = stable_fingerprint
+
 
 class ProviderCapabilityMode(str, Enum):
     """The provider loading contract selected for a session."""
@@ -249,6 +257,102 @@ class ToolDispatcher:
             event.update({"ok": False, "error": type(exc).__name__}); self.audit.append(event)
             return {"ok": False, "error": {"code": "execution_error", "message": str(exc)}, "audit": event}
         finally: self._busy.difference_update(resource)
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """A scheduled invocation and its explicit result dependencies."""
+    call_id: str
+    tool_id: str
+    version: str
+    arguments: Mapping[str, Any] = field(default_factory=dict)
+    depends_on: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if not self.call_id:
+            raise ValueError("call_id is required")
+        object.__setattr__(self, "depends_on", tuple(self.depends_on))
+
+
+class ToolScheduler:
+    """Dependency and resource aware execution for a batch of tool calls."""
+    def __init__(self, registry: ToolRegistry, *, max_workers: int = 8):
+        self.registry = registry
+        self.max_workers = max(1, int(max_workers))
+        self.dispatcher = ToolDispatcher(registry)
+
+    def _validate(self, calls):
+        calls = tuple(calls)
+        by_id = {}
+        for call in calls:
+            if call.call_id in by_id:
+                return None, {"ok": False, "error": {"code": "duplicate_call_id", "call_id": call.call_id}}
+            by_id[call.call_id] = call
+            try:
+                self.registry.get(call.tool_id, call.version)
+            except KeyError:
+                return None, {"ok": False, "error": {"code": "unavailable_version", "call_id": call.call_id,
+                                                         "tool_id": call.tool_id, "version": call.version}}
+        for call in calls:
+            missing = [dep for dep in call.depends_on if dep not in by_id]
+            if missing:
+                return None, {"ok": False, "error": {"code": "missing_dependency", "call_id": call.call_id,
+                                                         "dependencies": missing}}
+        return by_id, None
+
+    def schedule(self, calls):
+        """Return deterministic execution waves, or a structured validation outcome."""
+        by_id, error = self._validate(calls)
+        if error:
+            return error
+        remaining = set(by_id)
+        waves = []
+        while remaining:
+            ready = [cid for cid in sorted(remaining)
+                     if all(dep not in remaining for dep in by_id[cid].depends_on)]
+            if not ready:
+                return {"ok": False, "error": {"code": "dependency_cycle",
+                                                 "calls": sorted(remaining)}}
+            wave = []
+            used = set()
+            for cid in ready:
+                resources = set(self.registry.get(by_id[cid].tool_id, by_id[cid].version).metadata.resources)
+                if resources & used:
+                    continue
+                wave.append(cid); used.update(resources)
+            if not wave:
+                return {"ok": False, "error": {"code": "resource_conflict", "calls": ready}}
+            waves.append(tuple(wave)); remaining.difference_update(wave)
+        return {"ok": True, "waves": tuple(waves)}
+
+    def execute(self, calls):
+        """Execute independent calls concurrently, preserving dependency waves."""
+        plan = self.schedule(calls)
+        if not plan.get("ok"):
+            return plan
+        by_id = {call.call_id: call for call in calls}
+        results = {}
+        for wave in plan["waves"]:
+            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(wave))) as pool:
+                futures = {pool.submit(self.dispatcher.execute, by_id[cid].tool_id,
+                                        by_id[cid].version, by_id[cid].arguments): cid for cid in wave}
+                wait(futures)
+                for future, cid in futures.items():
+                    try:
+                        results[cid] = future.result()
+                    except Exception as exc:
+                        results[cid] = {"ok": False, "error": {"code": "recovery_error", "message": str(exc)}}
+        return {"ok": True, "results": {cid: results[cid] for cid in sorted(results)}, "waves": plan["waves"]}
+
+
+# Short alias for integrations that call this a dependency scheduler.
+DependencyScheduler = ToolScheduler
+
+def schedule_tool_calls(registry: ToolRegistry, calls, *, max_workers: int = 8):
+    return ToolScheduler(registry, max_workers=max_workers).schedule(calls)
+
+def execute_tool_calls(registry: ToolRegistry, calls, *, max_workers: int = 8):
+    return ToolScheduler(registry, max_workers=max_workers).execute(calls)
 
 class PermissionPolicy:
     MODES = {"approve-all", "approve-dangerous", "broad-access"}
