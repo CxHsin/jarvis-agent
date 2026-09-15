@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib, json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Iterable
+from enum import Enum
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -133,6 +134,95 @@ class ToolRuntime:
         if (tool_id, version) not in self.registry.active_keys(task_id):
             return {"ok": False, "error": {"code": "inactive_tool", "message": "tool is not active for this task"}}
         return ToolDispatcher(self.registry).execute(tool_id, version, arguments)
+
+
+class ProviderCapabilityMode(str, Enum):
+    """The provider loading contract selected for a session."""
+    NATIVE = "native"
+    EMULATED = "emulated"
+
+
+@dataclass
+class ProviderSession:
+    """Persistent provider state; reuse this object for every model call."""
+    mode: ProviderCapabilityMode
+    native_failures: int = 0
+    fallback_count: int = 0
+
+    def __post_init__(self):
+        self.mode = ProviderCapabilityMode(self.mode)
+
+    @classmethod
+    def from_capability(cls, *, native_deferred: bool) -> "ProviderSession":
+        """Create explicit session state from provider capability discovery."""
+        return cls(ProviderCapabilityMode.NATIVE if native_deferred
+                    else ProviderCapabilityMode.EMULATED)
+
+    @property
+    def native_deferred(self) -> bool:
+        return self.mode is ProviderCapabilityMode.NATIVE
+
+
+class ProviderLoadError(RuntimeError):
+    """An error carrying whether retrying native loading is meaningful."""
+    def __init__(self, message: str, *, eligible: bool = True):
+        super().__init__(message)
+        self.eligible = eligible
+
+
+class ToolProviderAdapter:
+    """Load native references when supported, with one safe emulated fallback.
+
+    ``native_loader`` may return a list of references or raise an exception.
+    The result is committed only after the call succeeds, so partial native
+    references can never leak into the emulated retry.
+    """
+    def __init__(self, runtime: ToolRuntime, session: ProviderSession):
+        self.runtime, self.session = runtime, session
+
+    @staticmethod
+    def _eligible(exc: BaseException) -> bool:
+        if isinstance(exc, ProviderLoadError):
+            return exc.eligible
+        value = str(exc).casefold()
+        if getattr(exc, "eligible", None) is not None:
+            return bool(exc.eligible)
+        code = str(getattr(exc, "code", "")).casefold()
+        return any(word in value or word in code for word in
+                   ("network", "timeout", "capability", "unsupported", "deferred", "tool reference"))
+
+    def load(self, task_id: str, native_loader: Callable[[], Any], *,
+             query: str = "", permission=None, limit: int = 8,
+             emulated_loader: Callable[[], Any] | None = None) -> Any:
+        """Return provider references and persist the selected loading mode."""
+        if self.session.mode is ProviderCapabilityMode.EMULATED:
+            return self._emulated(task_id, query, permission, limit, emulated_loader)
+        while True:
+            try:
+                # Do not expose a mutable/partial native response until success.
+                result = native_loader()
+                self.session.native_failures = 0
+                return result
+            except BaseException as exc:
+                if not self._eligible(exc):
+                    raise
+                self.session.native_failures += 1
+                if self.session.native_failures < 3:
+                    continue
+                self.session.mode = ProviderCapabilityMode.EMULATED
+                self.session.fallback_count += 1
+                return self._emulated(task_id, query, permission, limit, emulated_loader)
+
+    def _emulated(self, task_id: str, query: str, permission, limit: int,
+                  loader: Callable[[], Any] | None) -> Any:
+        if loader is not None:
+            return loader()
+        return self.runtime.schemas(task_id, native_deferred=False,
+                                    query=query, permission=permission, limit=limit)
+
+
+# Descriptive alias for callers that model the native provider as an adapter.
+NativeProviderAdapter = ToolProviderAdapter
 
 class ToolDispatcher:
     """Validated, audited execution seam for registered tools."""
