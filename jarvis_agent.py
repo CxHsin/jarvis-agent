@@ -241,6 +241,11 @@ class Workspace:
             raise WorkspaceError("路径超出允许的工作区范围。") from exc
         return candidate
 
+    def _resolve_read(self, user_path: str | None) -> Path:
+        """Resolve a read target without restricting it to the workspace root."""
+        raw = Path(user_path or ".").expanduser()
+        return (raw if raw.is_absolute() else self.root / raw).resolve()
+
     def list_directory(self, path: str = ".") -> dict[str, Any]:
         directory = self._resolve(path)
         if not directory.exists():
@@ -384,7 +389,7 @@ class Workspace:
         )
 
     def read_file(self, path: str, start_line: int = 1, end_line: int | None = None) -> dict[str, Any]:
-        file_path = self._resolve(path)
+        file_path = self._resolve_read(path)
         if not file_path.exists():
             raise WorkspaceError(f"文件不存在: {_display_path(file_path, self.root)}")
         if not file_path.is_file():
@@ -451,7 +456,7 @@ class Workspace:
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
- {"type":"function","function":{"name":"read","description":"读取工作区文本文件。","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"read","description":"读取文本文件；支持工作区外的绝对路径，相对路径以工作区为基准。","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"edit","description":"编辑工作区文本文件。","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path","content"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"bash","description":"在工作区执行 shell 命令。","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":0.1,"maximum":60}},"required":["command"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"tool_search","description":"搜索可用工具。","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"additionalProperties":False}}},
@@ -769,7 +774,7 @@ class Agent:
         extensions = ", ".join(self.config.text_extensions)
         return (
             "你是 Jarvis，一个通用的个人助理。当前阶段可以使用文件工具完成用户请求。\n"
-            f"允许访问的工作区是 {self.config.root_dir}；文本扩展名包括 {extensions}。\n"
+            f"默认工作区是 {self.config.root_dir}；read/read_file 可读取工作区外的文本文件，相对路径以工作区为基准；文本扩展名包括 {extensions}。\n"
             "需要文件信息时先使用工具，不要凭空猜测。工具返回的失败不能证明内容不存在。"
             "回答时区分已确认的事实和不确定性，并使用用户的语言。"
         )

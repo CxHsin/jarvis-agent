@@ -114,9 +114,21 @@ class WorkspaceTests(unittest.TestCase):
         content = self.workspace.read_file("notes/one.md", 2, 2)
         self.assertEqual(content["content"], "2: 然后自己试验")
 
-    def test_path_cannot_escape_root(self):
-        with self.assertRaises(ValueError):
-            self.workspace.read_file("../outside.md")
+    def test_read_can_access_files_outside_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "workspace"
+            root.mkdir()
+            outside = base / "outside.md"
+            outside.write_text("external content", encoding="utf-8")
+            workspace = Workspace(replace(self.config, root_dir=root))
+            for reader in (workspace.read, workspace.read_file):
+                for path in (str(outside), "../outside.md"):
+                    result = reader(path)
+                    self.assertEqual(result["content"], "1: external content")
+                    self.assertEqual(result["path"], str(outside.resolve()))
+            with self.assertRaises(ValueError):
+                workspace.edit(str(outside), "changed")
 
     def test_binary_extension_is_rejected(self):
         with self.assertRaises(ValueError):
