@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from task_history import TaskHistory
 
 
 SESSION_FORMAT_VERSION = 1
@@ -218,6 +219,13 @@ class SessionStore:
         self._file = None
         self._lock = _SessionLock(self.directory / f"{session_id}.lock")
         self._write_lock = RLock()
+        self.memory_directory = self.state_dir / "memory" / workspace_key(self.root_dir)
+        self._recent_task_count = getattr(config, "recent_task_count", 5)
+        self.history = None
+
+    @property
+    def recent_path(self) -> Path:
+        return self.history.recent_path
 
     @classmethod
     def create(cls, config: Any) -> "SessionStore":
@@ -280,6 +288,7 @@ class SessionStore:
         self._lock.acquire()
         try:
             self._file = open(self.path, "a+", encoding="utf-8")
+            self.history = TaskHistory(self.memory_directory, self.session_id, self._recent_task_count)
         except OSError:
             self._lock.release()
             raise
@@ -306,7 +315,20 @@ class SessionStore:
         payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
         self._file.write(payload + "\n")
         self._file.flush()
+        self.history.record(record)
         return self._file.tell()
+
+    def end_task(self, status: str = "completed") -> None:
+        if status == "failed":
+            self.history.record({"type": "task_end", "status": status})
+        else:
+            self._append({"type": "task_end", "status": status})
+
+    def recent_messages(self) -> list[dict[str, Any]]:
+        return self.history.messages()
+
+    def record_recent_context(self, messages: Sequence[Mapping[str, Any]]) -> None:
+        self._append({"type": "recent_context", "messages": list(messages)})
 
     def record_runtime(self, state: Mapping[str, Any]) -> None:
         self._append({"type": "runtime", "state": dict(state)})
@@ -390,6 +412,8 @@ class SessionStore:
                 message = record.get("message")
                 if isinstance(message, Mapping):
                     contents.messages.append(dict(message))
+            elif kind == "recent_context":
+                contents.messages = [dict(message) for message in record.get("messages", [])]
             elif kind == "runtime":
                 contents.runtime = dict(record.get("state") or {})
             elif kind == "tool_audit":

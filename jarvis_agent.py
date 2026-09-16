@@ -94,6 +94,7 @@ class Config:
     max_rounds: int = 5
     root_dir: Path = field(default_factory=Path.cwd)
     state_dir: Path | None = None
+    recent_task_count: int = 5
     text_extensions: tuple[str, ...] = DEFAULT_TEXT_EXTENSIONS
     request_timeout: float = 60.0
     max_read_chars: int = 12_000
@@ -122,6 +123,8 @@ class Config:
     tool_max_timeout: float = 60.0
 
     def __post_init__(self) -> None:
+        if self.recent_task_count < 1:
+            raise ConfigurationError("RECENT_TASK_COUNT 必须大于 0。")
         if self.tool_permission_mode not in PermissionPolicy.MODES:
             raise ConfigurationError("无效的 TOOL_PERMISSION_MODE。")
         if self.provider_tool_mode not in {"native", "emulated"}:
@@ -226,6 +229,7 @@ class Config:
             compression_max_output_tokens=optional_positive_int("COMPRESSION_MAX_OUTPUT_TOKENS"),
             context_summary_max_chars=positive_int("CONTEXT_SUMMARY_MAX_CHARS", 6_000),
             context_keep_recent_tokens=positive_int("CONTEXT_KEEP_RECENT_TOKENS", 20_000),
+            recent_task_count=positive_int("RECENT_TASK_COUNT", 5),
             context_compaction_failure_limit=positive_int("CONTEXT_COMPACTION_FAILURE_LIMIT", 3),
             tool_output_preview_chars=positive_int("TOOL_OUTPUT_PREVIEW_CHARS", 500),
             verbose_tool_output=boolean("VERBOSE_TOOL_OUTPUT"),
@@ -1111,6 +1115,10 @@ class Agent:
         audit_start = len(self.tool_runtime.dispatcher.audit)
         audit_event_start = len(self._audit_events)
         self.context.begin_task(user_text)
+        recent = self.store.recent_messages()
+        if recent:
+            self.messages[1:] = recent
+            self.store.record_recent_context(recent)
         self._runtime_task_id = f"{self.store.session_id}:{self.context.task_number}"
         compatibility = tuple((name, "1") for name in ("list_directory", "search_file_content", "read_file")
                               if self.tool_registry.versions(name))
@@ -1120,6 +1128,7 @@ class Agent:
         self._append_message({"role": "user", "content": user_text})
         active_calls: list[Mapping[str, Any]] = []
         handled_call_indexes: set[int] = set()
+        task_status = "interrupted"
         try:
             for round_number in range(1, self.config.max_rounds + 1):
                 final_round = round_number == self.config.max_rounds
@@ -1176,6 +1185,7 @@ class Agent:
                 if not calls:
                     answer = message.get("content") or "模型没有返回文字回答。"
                     print(f"\nJarvis> {answer}")
+                    task_status = "completed"
                     return str(answer)
                 if final_round:
                     for call in calls:
@@ -1227,6 +1237,7 @@ class Agent:
         except ModelRequestError as exc:
             executed = any(e.get("phase") == "started" for e in self.tool_runtime.dispatcher.audit[audit_start:])
             if not executed:
+                task_status = "failed"
                 self.messages[:] = message_snapshot
                 self.context.restore(context_snapshot)
                 # Policy/fallback decisions survive a failed request; activation does not.
@@ -1242,6 +1253,7 @@ class Agent:
             print(f"模型请求失败: {exc}")
             return None
         finally:
+            self.store.end_task(task_status)
             self.usage_ledger.summary()
 
     def compact_now(self, keep_tokens: int | None = None, reason: str = MANUAL) -> CompactionResult:
