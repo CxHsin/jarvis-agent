@@ -1,13 +1,14 @@
 """Stage-one command-line personal agent.
 
 The implementation deliberately keeps the agent loop visible: a model response
-may request tools, each tool call is executed in order, and the results are
+may request tools, independent calls can run concurrently, and the results are
 returned to the model until it answers or the round limit is reached.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -17,6 +18,7 @@ from copy import deepcopy
 from urllib.parse import quote
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from threading import Event
 from typing import Any, Callable, Mapping, Sequence
 
 from context_manager import CONTEXT_RECOVERED_MARKER, ContextManager, estimate_tokens
@@ -25,7 +27,8 @@ from compaction import CompactionResult, MANUAL, OVERFLOW, is_overflow_error
 from context_budget import ContextBudget
 from model_capabilities import load_capability
 from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
-from tool_runtime import RegisteredTool, ToolMetadata, ToolRegistry, ToolRuntime
+from tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolCall, ToolScheduler,
+                          PermissionPolicy, ProviderSession, ToolProviderAdapter, ProviderLoadError, failure)
 
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
@@ -114,8 +117,17 @@ class Config:
     context_compaction_failure_limit: int = 3
     tool_output_preview_chars: int = 500
     verbose_tool_output: bool = False
+    tool_permission_mode: str = "approve-dangerous"
+    provider_tool_mode: str = "emulated"
+    tool_max_timeout: float = 60.0
 
     def __post_init__(self) -> None:
+        if self.tool_permission_mode not in PermissionPolicy.MODES:
+            raise ConfigurationError("无效的 TOOL_PERMISSION_MODE。")
+        if self.provider_tool_mode not in {"native", "emulated"}:
+            raise ConfigurationError("PROVIDER_TOOL_MODE 必须是 native 或 emulated。")
+        if not 0 < self.tool_max_timeout <= 3600:
+            raise ConfigurationError("TOOL_MAX_TIMEOUT 必须大于 0 且不超过 3600 秒。")
         if self.context_window_tokens is not None and self.context_window_source == "unknown":
             object.__setattr__(self, "context_window_source", "configured")
 
@@ -194,6 +206,9 @@ class Config:
             max_rounds=positive_int("MAX_ROUNDS", 5),
             root_dir=root_dir,
             state_dir=state_dir,
+            tool_permission_mode=_setting(values, "TOOL_PERMISSION_MODE", "approve-dangerous"),
+            provider_tool_mode=_setting(values, "PROVIDER_TOOL_MODE", "emulated"),
+            tool_max_timeout=positive_int("TOOL_MAX_TIMEOUT", 60),
             text_extensions=extensions,
             request_timeout=timeout,
             max_read_chars=positive_int("MAX_READ_CHARS", 12_000),
@@ -321,7 +336,9 @@ class Workspace:
         while low < high:
             middle = (low + high + 1) // 2
             candidate = {**result, "content": "\n".join(lines[:middle]) + "\n" + marker, "truncated": True}
-            candidate.pop("next_start_line", None)
+            last_line = self._leading_line_number(lines[middle - 1])
+            if last_line is not None:
+                candidate.update(end_line=last_line, next_start_line=last_line + 1)
             if self._result_tokens(candidate) <= limit:
                 low = middle
             else:
@@ -398,7 +415,11 @@ class Workspace:
             raise WorkspaceError(f"第一阶段只支持文本文件: {file_path.suffix or '(无扩展名)'}")
         if start_line < 1 or (end_line is not None and end_line < start_line):
             raise WorkspaceError("行号范围无效。")
-        lines = self._read_text(file_path).splitlines()
+        try:
+            file_bytes = file_path.read_bytes()
+        except OSError as exc:
+            raise WorkspaceError(f"读取文件失败: {exc}") from exc
+        lines = file_bytes.decode("utf-8-sig", errors="replace").splitlines()
         selected_end = min(end_line or len(lines), len(lines))
         numbered: list[str] = []
         used = 0
@@ -423,6 +444,7 @@ class Workspace:
             "end_line": last_line,
             "content": "\n".join(numbered) if numbered else "[内容为空]",
             "truncated": truncated,
+            "hash": hashlib.sha256(file_bytes).hexdigest(),
         }
         if truncated:
             result["next_start_line"] = last_line + 1
@@ -431,8 +453,12 @@ class Workspace:
     def read(self, path: str, start_line: int = 1, end_line: int | None = None) -> dict[str, Any]:
         return self.read_file(path, start_line, end_line)
 
-    def edit(self, path: str, content: str, *, start_line: int | None = None, end_line: int | None = None) -> dict[str, Any]:
+    def edit(self, path: str, content: str, *, start_line: int | None = None, end_line: int | None = None,
+             expected_hash: str | None = None, execution_context=None) -> dict[str, Any]:
         target = self._resolve(path)
+        current_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
+        if expected_hash is not None and expected_hash != current_hash:
+            return failure("edit_conflict", "文件已改变，请重新读取后再编辑。", current_hash=current_hash)
         if target.exists() and not target.is_file(): raise WorkspaceError("不是文件。")
         if target.exists() and not self._is_text_file(target): raise WorkspaceError("只支持文本文件编辑。")
         if start_line is None and end_line is not None: raise WorkspaceError("end_line 需要 start_line。")
@@ -442,17 +468,63 @@ class Workspace:
             lines = self._read_text(target).splitlines() if target.exists() else []
             if start_line > len(lines) + 1: raise WorkspaceError("start_line 超出文件范围。")
             finish = min(end_line or start_line, len(lines)); lines[start_line - 1:finish] = str(content).splitlines(); updated = "\n".join(lines) + ("\n" if lines else "")
-        try: target.parent.mkdir(parents=True, exist_ok=True); target.write_text(updated, encoding="utf-8")
-        except OSError as exc: raise WorkspaceError(f"写入文件失败: {exc}") from exc
-        return {"ok": True, "path": _display_path(target, self.root), "bytes": len(updated.encode("utf-8"))}
+        def commit():
+            # Recheck after preparing the edit, then atomically replace the file.
+            import tempfile
+            latest_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
+            if latest_hash != current_hash:
+                return failure("edit_conflict", "文件在编辑期间改变。")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                    temp_path = Path(handle.name)
+                    handle.write(updated.encode("utf-8"))
+                os.replace(temp_path, target)
+            finally:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink()
+            return {"ok": True, "path": _display_path(target, self.root), "bytes": len(updated.encode("utf-8")),
+                    "hash": hashlib.sha256(updated.encode("utf-8")).hexdigest()}
+        try:
+            return execution_context.commit(commit) if execution_context else commit()
+        except OSError as exc:
+            raise WorkspaceError(f"写入文件失败: {exc}") from exc
 
-    def bash(self, command: str, timeout: float = 10.0) -> dict[str, Any]:
+    def bash(self, command: str, timeout: float = 10.0, execution_context=None) -> dict[str, Any]:
         import subprocess
+        import tempfile
+        import time
         if not command or not command.strip(): raise WorkspaceError("command 不能为空。")
-        try: completed = subprocess.run(command, cwd=self.root, shell=True, capture_output=True, text=True, timeout=max(0.1, min(float(timeout), 60.0)), encoding="utf-8", errors="replace")
-        except subprocess.TimeoutExpired as exc: raise TimeoutError("命令执行超时。") from exc
-        output = (completed.stdout or "") + (completed.stderr or ""); limit = max(1000, self.config.max_read_chars)
-        return {"ok": completed.returncode == 0, "exit_code": completed.returncode, "output": output[:limit], "truncated": len(output) > limit}
+        deadline = time.monotonic() + min(float(timeout), 60.0)
+        with tempfile.TemporaryFile() as output_file:
+            def start():
+                return subprocess.Popen(command, cwd=self.root, shell=True, stdout=output_file, stderr=output_file,
+                                        start_new_session=os.name != "nt",
+                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            process = execution_context.commit(start) if execution_context else start()
+            try:
+                while process.poll() is None:
+                    if execution_context:
+                        execution_context.check()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("命令执行超时。")
+                    time.sleep(0.01)
+            finally:
+                if process.poll() is None:
+                    if os.name == "nt":
+                        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       creationflags=subprocess.CREATE_NO_WINDOW)
+                    else:
+                        import signal
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+            output_file.seek(0)
+            limit = max(1000, self.config.max_read_chars)
+            data = output_file.read(limit + 1)
+        return {"ok": process.returncode == 0, "exit_code": process.returncode,
+                "output": data[:limit].decode("utf-8", errors="replace"), "truncated": len(data) > limit}
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -461,6 +533,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
  {"type":"function","function":{"name":"bash","description":"在工作区执行 shell 命令。","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":0.1,"maximum":60}},"required":["command"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"tool_search","description":"搜索可用工具。","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"additionalProperties":False}}},
 ]
+
+TOOL_DEFINITIONS[1]["function"]["parameters"]["properties"]["expected_hash"] = {
+    "type": "string", "description": "先前读取的 SHA-256；新文件使用 missing。"}
+for _definition in TOOL_DEFINITIONS:
+    _properties = _definition["function"]["parameters"]["properties"]
+    _properties["_depends_on"] = {"type": "array", "items": {"type": "string"},
+                                  "description": "同一批次内必须先成功的 tool_call IDs。"}
+    _properties["_version"] = {"type": "string"}
+    _properties["_schema_fingerprint"] = {"type": "string"}
 
 
 
@@ -639,7 +720,11 @@ class Agent:
         store: SessionStore | None = None,
         resume: str | None = None,
         tool_runtime: ToolRuntime | None = None,
+        permission_policy: PermissionPolicy | None = None,
+        confirm_tool: Callable | None = None,
+        native_loader: Callable | None = None,
     ):
+        supplied_runtime = tool_runtime is not None
         self.client = client or ChatCompletionsClient(config)
         self.store = store
         if self.store is None and resume is not None:
@@ -678,19 +763,24 @@ class Agent:
         self.client = MeasuredClient(self.client, self.usage_ledger, "主模型", config.model)
         if self.store is None:
             self.store = SessionStore.create(self.config)
+        self._audit_events = []
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         self.context = ContextManager(self.config, recorder=self.store)
         self.tool_functions: dict[str, ToolFunction] = {
             "read": self.workspace.read, "edit": self.workspace.edit, "bash": self.workspace.bash,
-            "tool_search": lambda query="", limit=8: {"ok": True, "tools": self.tool_registry.search_tools(query, task_id=self._runtime_task_id, limit=limit)},
+            "tool_search": self._search_tools,
             "list_directory": self.workspace.list_directory, "search_file_content": self.workspace.search_file_content, "read_file": self.workspace.read_file,
         }
         if tool_runtime is None:
             for definition in TOOL_DEFINITIONS:
                 schema = definition["function"]
                 self.tool_registry.register(
-                    ToolMetadata(tool_id=str(schema["name"]), version="1", schema=schema),
-                    self.tool_functions[str(schema["name"])],
+                    ToolMetadata(tool_id=str(schema["name"]), version="1", schema=schema,
+                                 risk="high" if schema["name"] == "bash" else "medium" if schema["name"] == "edit" else "low",
+                                 side_effects=("filesystem",) if schema["name"] in {"edit", "bash"} else (),
+                                 concurrency="parallel" if schema["name"] in {"read", "edit"} else "serial"),
+                    self._contextual_edit if schema["name"] == "edit" else self._contextual_bash if schema["name"] == "bash" else self.tool_functions[str(schema["name"])],
+                    contextual=schema["name"] in {"edit", "bash"},
                 )
             for alias in ("list_directory", "search_file_content", "read_file"):
                 if (alias, "1") not in self.tool_registry._tools:
@@ -700,17 +790,84 @@ class Agent:
                 stable=tuple((name, "1") for name in ("read", "edit", "bash", "tool_search")),
             )
         self.tool_runtime = tool_runtime
+        self.tool_runtime.policy = permission_policy or self.tool_runtime.policy
+        if permission_policy is None and not supplied_runtime:
+            self.tool_runtime.policy = PermissionPolicy(self.config.tool_permission_mode,
+                                                       max_timeout=self.config.tool_max_timeout)
+        self.tool_runtime.policy.on_event = self._policy_event
+        self.tool_runtime.dispatcher.policy = self.tool_runtime.policy
+        self.tool_runtime.dispatcher.confirm = confirm_tool
+        self.tool_runtime.dispatcher.recorder = self._record_audit
+        self.tool_runtime.dispatcher.resource_resolver = self._tool_resources
+        self.provider_session = ProviderSession(self.config.provider_tool_mode)
+        self.provider_adapter = ToolProviderAdapter(self.tool_runtime, self.provider_session)
+        self.native_loader = native_loader
         for registered in self.tool_runtime.stable_tools:
             name = str(registered.metadata.schema.get("name", registered.metadata.tool_id))
             self.tool_functions.setdefault(name, registered.handler)
         self._runtime_task_id = "0"
-        self._runtime_handlers = dict(self.tool_functions)
         self._restore_session()
+
+    def _save_runtime(self):
+        if self.store:
+            self.store.record_runtime(dict(self.tool_runtime.snapshot(), provider=self.provider_session.snapshot()))
+
+    def _record_audit(self, event):
+        self._audit_events.append(deepcopy(event))
+        self.store.record_tool_audit(event)
+
+    def _policy_event(self, event):
+        self._record_audit(event)
+        self._save_runtime()
+
+    def _search_tools(self, query="", limit=8):
+        result = self.tool_runtime.discover(self._runtime_task_id, query, limit)
+        self._save_runtime()
+        return result
+
+    def _ensure_dynamic_definitions(self):
+        """Restore only active definitions when compaction retires their search result."""
+        visible = set()
+        for message in self.messages:
+            if message.get("role") == "tool" and message.get("name") == "tool_search":
+                try:
+                    items = json.loads(message.get("content", "{}")).get("tools", [])
+                    visible.update(item["schema_fingerprint"] for item in items if "schema" in item)
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    pass
+            elif message.get("role") == "system" and str(message.get("content", "")).startswith("Active tool definitions:\n"):
+                items = json.loads(message["content"].split("\n", 1)[1])
+                visible.update(item["schema_fingerprint"] for item in items)
+        missing = [item for item in self.tool_runtime.active_definitions(self._runtime_task_id)
+                   if item["schema_fingerprint"] not in visible and item["tool_id"] not in self.tool_functions]
+        if not missing:
+            return False
+        self._append_message({"role": "system", "content": "Active tool definitions:\n" +
+                              json.dumps(missing, ensure_ascii=False, sort_keys=True, separators=(",", ":"))})
+        return True
+
+    def _tool_resources(self, metadata, arguments):
+        if metadata.tool_id in {"read", "read_file", "edit"}:
+            path = arguments.get("path")
+            if not isinstance(path, str):
+                return {"*"}
+            return {"file:" + os.path.normcase(str(self.workspace._resolve_read(path)))}
+        return set()
+
+    def _contextual_edit(self, context, **arguments):
+        return self.workspace.edit(**arguments, execution_context=context)
+
+    def _contextual_bash(self, context, **arguments):
+        return self.workspace.bash(**arguments, execution_context=context)
 
     def _restore_session(self) -> None:
         """Load persisted history into this process, repairing interrupted rounds."""
 
         contents: SessionContents = self.store.load()
+        self.tool_runtime.restore(contents.runtime)
+        if contents.runtime.get("provider"):
+            self.provider_session = ProviderSession(**contents.runtime["provider"])
+            self.provider_adapter.session = self.provider_session
         for warning in contents.warnings:
             print(f"[会话恢复] {warning}")
         if not contents.messages:
@@ -754,7 +911,7 @@ class Agent:
                 missing.append((call_id, str(function.get("name", ""))))
                 answered.add(call_id)
         for call_id, name in missing:
-            payload = {"ok": False, "recovered": True, "error": "进程在工具执行前中断，该调用未执行。"}
+            payload = {"ok": False, "recovered": True, "error": "工具结果未完整记录，执行状态未知；恢复不会重放该调用。"}
             content = f"{CONTEXT_RECOVERED_MARKER}\n{json.dumps(payload, ensure_ascii=False)}"
             self._append_message({"role": "tool", "tool_call_id": call_id, "name": name, "content": content})
             print(f"[会话恢复] 工具调用 {name or '?'} ({call_id}) 缺少结果，已补写中断占位。")
@@ -777,6 +934,9 @@ class Agent:
             f"默认工作区是 {self.config.root_dir}；read/read_file 可读取工作区外的文本文件，相对路径以工作区为基准；文本扩展名包括 {extensions}。\n"
             "需要文件信息时先使用工具，不要凭空猜测。工具返回的失败不能证明内容不存在。"
             "回答时区分已确认的事实和不确定性，并使用用户的语言。"
+            "tool_search 返回并激活工具定义，可在本次任务后续轮次调用；旧任务的定义不代表当前可调用。"
+            "同批调用可用 _depends_on 指定前置调用 ID；参数值可用 "
+            '{"$result":{"call_id":"前置ID","path":["字段"]}} 引用前置结果。'
         )
 
     @staticmethod
@@ -798,25 +958,97 @@ class Agent:
             raise WorkspaceError("工具参数必须是 JSON 对象。")
         return parsed
 
-    def _execute_tool(self, name: str, arguments: Any) -> dict[str, Any]:
-        function = self.tool_functions.get(name)
-        if function is None:
-            return {"ok": False, "error": f"未知工具: {name}"}
+    def _execute_tool(self, name: str, arguments: Any, *, version=None, fingerprint=None,
+                      call_id="", cancellation=None, authorization=None) -> dict[str, Any]:
         try:
             args = self._normalise_args(arguments)
-            registered = self._runtime_handlers.get(name)
-            if registered is not function:
-                # Preserve the existing extension seam used by callers/tests while
-                # keeping normal execution audited by ToolRuntime.
-                entry = self.tool_registry.get(name, "1")
-                self.tool_registry._tools[(name, "1")] = RegisteredTool(entry.metadata, function)
-                self._runtime_handlers[name] = function
-            result = self.tool_runtime.execute(self._runtime_task_id, name, "1", args)
+            key, error = self.tool_runtime.binding(self._runtime_task_id, name, version, fingerprint)
+            if error:
+                self._record_audit(dict(error, tool_id=name, call_id=call_id, phase="rejected"))
+                return error
+            result = self.tool_runtime.execute(self._runtime_task_id, *key, args, fingerprint=fingerprint,
+                                               call_id=call_id, cancellation=cancellation,
+                                               authorization=authorization)
             if result.get("ok"):
-                return result.get("result")
-            return {"ok": False, "error": result.get("error", "工具调用失败")}
+                payload = result.get("result")
+                return payload if isinstance(payload, dict) else {"ok": True, "value": payload}
+            return {k: v for k, v in result.items() if k != "audit"}
         except (TypeError, WorkspaceError, OSError, ValueError) as exc:
-            return {"ok": False, "error": str(exc)}
+            return failure("invalid_arguments", str(exc))
+
+    def _execute_batch(self, calls, on_result):
+        prepared = []
+        errors = {}
+        cancellation = Event()
+        for index, raw in enumerate(calls):
+            function = raw.get("function") or {}
+            name, cid = function.get("name", ""), str(raw.get("id") or f"missing-{index}")
+            try:
+                args = dict(self._normalise_args(function.get("arguments", {})))
+                dependencies = args.pop("_depends_on", raw.get("depends_on", ()))
+                version = args.pop("_version", raw.get("version"))
+                fingerprint = args.pop("_schema_fingerprint", raw.get("schema_fingerprint"))
+                if not isinstance(dependencies, (list, tuple)) or not all(isinstance(x, str) for x in dependencies):
+                    raise ValueError("_depends_on must be an array of call IDs")
+                key, error = self.tool_runtime.binding(self._runtime_task_id, name, version, fingerprint)
+                if error:
+                    errors[cid] = error
+                elif name == "edit" and isinstance(args.get("path"), str) and "expected_hash" not in args:
+                    target = self.workspace._resolve(args["path"])
+                    args["expected_hash"] = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
+                prepared.append(ToolCall(cid, name, key[1] if key else version or "1", args,
+                                         tuple(dependencies), fingerprint))
+            except (ValueError, TypeError, OSError) as exc:
+                errors[cid] = failure("invalid_arguments", str(exc))
+                prepared.append(ToolCall(cid, name, "1"))
+        if errors:
+            # Reject the batch before effects when its dependency graph cannot be trusted.
+            for item in prepared:
+                result = errors.get(item.call_id, failure("batch_rejected", "another call is invalid"))
+                self._record_audit(dict(result, call_id=item.call_id, tool_id=item.tool_id, phase="rejected"))
+                on_result(item, result)
+            return False
+
+        def execute(item, arguments, token, grant):
+            payload = self._execute_tool(item.tool_id, arguments, version=item.version,
+                                         fingerprint=item.fingerprint, call_id=item.call_id, cancellation=token,
+                                         authorization=grant)
+            return {"ok": True, "result": payload} if payload.get("ok", True) else payload
+
+        batch_audit_start = len(self.tool_runtime.dispatcher.audit)
+
+        def record(item, result):
+            if not any(e.get("call_id") == item.call_id and e.get("phase") == "finished"
+                       for e in self.tool_runtime.dispatcher.audit[batch_audit_start:]):
+                self.tool_runtime.dispatcher.record({"call_id": item.call_id, "tool_id": item.tool_id,
+                                                     "phase": "finished", "ok": result.get("ok", False),
+                                                     "error": result.get("error"),
+                                                     "policy_version": self.tool_runtime.policy.version})
+            on_result(item, result.get("result") if result.get("ok") else result)
+
+        scheduler = ToolScheduler(self.tool_registry, dispatcher=self.tool_runtime.dispatcher)
+        outcome = scheduler.execute(prepared, cancellation=cancellation, execute=execute, on_result=record)
+        if not outcome["ok"]:
+            for item in prepared:
+                self._record_audit(dict(outcome, call_id=item.call_id, phase="rejected"))
+                on_result(item, outcome)
+        return cancellation.is_set()
+
+    def _complete_with_tools(self, messages, tools, choice):
+        def native():
+            if self.native_loader is None:
+                raise ProviderLoadError("native deferred adapter is unsupported by this client")
+            return self.native_loader(self.client, deepcopy(messages), deepcopy(tools),
+                                      self.tool_runtime.active_definitions(self._runtime_task_id), choice)
+        try:
+            return self.provider_adapter.load(self._runtime_task_id, native,
+                                              emulated_loader=lambda: self.client.complete(messages, tools, choice))
+        except ProviderLoadError as exc:
+            raise ModelRequestError(str(exc)) from exc
+        except Exception as exc:
+            raise ModelRequestError(str(exc)) from exc
+        finally:
+            self._save_runtime()
 
     def _tool_result_for_display(self, name: str, result: Mapping[str, Any]) -> str:
         """Render a compact terminal preview without changing the model result."""
@@ -874,11 +1106,16 @@ class Agent:
         request_offset = self.store.mark() if self.store is not None else None
         message_snapshot = deepcopy(self.messages)
         context_snapshot = self.context.snapshot()
+        runtime_snapshot = self.tool_runtime.snapshot()
+        provider_snapshot = self.provider_session.snapshot()
+        audit_start = len(self.tool_runtime.dispatcher.audit)
+        audit_event_start = len(self._audit_events)
         self.context.begin_task(user_text)
-        self._runtime_task_id = str(self.context.task_number)
-        for name in self.tool_functions:
-            if (name, "1") in self.tool_registry._tools:
-                self.tool_runtime.activate(self._runtime_task_id, name, "1")
+        self._runtime_task_id = f"{self.store.session_id}:{self.context.task_number}"
+        compatibility = tuple((name, "1") for name in ("list_directory", "search_file_content", "read_file")
+                              if self.tool_registry.versions(name))
+        self.tool_runtime.begin_task(self._runtime_task_id, compatibility)
+        self._save_runtime()
         self.usage_ledger.reset()
         self._append_message({"role": "user", "content": user_text})
         active_calls: list[Mapping[str, Any]] = []
@@ -892,6 +1129,11 @@ class Agent:
                 overflow_retried = False
                 while True:
                     request_messages = self.context.prepare_messages(self.messages, tools, self.compression_client)
+                    if self._ensure_dynamic_definitions():
+                        # Account for restored schemas without repeatedly compacting them away.
+                        request_messages, total = self.context._prepare_request(self.messages, tools)
+                        self.context.last_metrics.update(estimated_tokens=total,
+                                                         over_budget=self.context.budget.over_budget(total))
                     metrics = self.context.last_metrics
                     print(
                         f"[上下文] 估算 {metrics.get('estimated_tokens', '?')} tokens"
@@ -911,7 +1153,7 @@ class Agent:
                     if metrics.get("over_budget"):
                         raise ModelRequestError("压缩后输入仍超过可用输入预算；请缩小本次输入或开启新会话。")
                     try:
-                        message = self.client.complete(
+                        message = self._complete_with_tools(
                             request_messages,
                             tools,
                             "none" if final_round else "auto",
@@ -936,60 +1178,25 @@ class Agent:
                     print(f"\nJarvis> {answer}")
                     return str(answer)
                 if final_round:
+                    for call in calls:
+                        function = call.get("function") or {}
+                        self._append_message({"role": "tool", "tool_call_id": call.get("id", ""),
+                                              "name": function.get("name", ""),
+                                              "content": json.dumps(failure("round_limit"))})
                     print("已达到轮次上限，本次请求未完成。")
                     return None
-                for call_index, call in enumerate(calls):
-                    function_data = call.get("function", {}) if isinstance(call, Mapping) else {}
-                    name = function_data.get("name", "")
-                    arguments = function_data.get("arguments", {})
-                    call_id = call.get("id", "")
-                    print(f"[工具] {name} 参数: {arguments}")
-                    try:
-                        result = self._execute_tool(name, arguments)
-                    except KeyboardInterrupt:
-                        result = {"ok": False, "cancelled": True, "error": "工具调用已取消。"}
-                        result_text = json.dumps(result, ensure_ascii=False)
-                        print(f"[工具结果] {self._tool_result_for_display(name, result)}")
-                        self._append_message({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
-                        try:
-                            normalised_arguments = self._normalise_args(arguments)
-                        except WorkspaceError:
-                            normalised_arguments = {}
-                        self.context.record_tool_result(name, normalised_arguments, result, call_id)
-                        handled_call_indexes.add(call_index)
-                        for pending_call in calls[call_index + 1 :]:
-                            pending_data = pending_call.get("function", {}) if isinstance(pending_call, Mapping) else {}
-                            pending_name = pending_data.get("name", "")
-                            pending_id = pending_call.get("id", "")
-                            pending_result = json.dumps(
-                                {"ok": False, "cancelled": True, "error": "工具调用因用户取消而未执行。"},
-                                ensure_ascii=False,
-                            )
-                            self._append_message(
-                                {"role": "tool", "tool_call_id": pending_id, "name": pending_name, "content": pending_result}
-                            )
-                            try:
-                                pending_arguments = self._normalise_args(pending_data.get("arguments", {}))
-                            except WorkspaceError:
-                                pending_arguments = {}
-                            self.context.record_tool_result(
-                                pending_name,
-                                pending_arguments,
-                                {"ok": False, "cancelled": True, "error": "工具调用因用户取消而未执行。"},
-                                pending_id,
-                            )
-                        active_calls = []
-                        print("\n已取消当前请求。已完成的工具结果已保留，未完成的调用已标记为取消。")
-                        return None
+                def record_result(item, result):
                     result_text = json.dumps(result, ensure_ascii=False)
-                    print(f"[工具结果] {self._tool_result_for_display(name, result)}")
-                    self._append_message({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
-                    try:
-                        normalised_arguments = self._normalise_args(arguments)
-                    except WorkspaceError:
-                        normalised_arguments = {}
-                    self.context.record_tool_result(name, normalised_arguments, result, call_id)
-                    handled_call_indexes.add(call_index)
+                    print(f"[工具结果] {self._tool_result_for_display(item.tool_id, result)}")
+                    self._append_message({"role": "tool", "tool_call_id": item.call_id,
+                                          "name": item.tool_id, "content": result_text})
+                    self.context.record_tool_result(item.tool_id, item.arguments, result, item.call_id)
+                    handled_call_indexes.update(i for i, c in enumerate(calls) if c.get("id") == item.call_id)
+                cancelled = self._execute_batch(calls, record_result)
+                if cancelled:
+                    active_calls = []
+                    print("已取消当前请求。工具结果已保留。")
+                    return None
                 active_calls = []
             print("已达到轮次上限，本次请求未完成。")
             return None
@@ -1018,10 +1225,20 @@ class Agent:
             print("\n已取消当前请求。已完成的工具结果已保留，未完成的调用不会被视为成功。")
             return None
         except ModelRequestError as exc:
-            self.messages[:] = message_snapshot
-            self.context.restore(context_snapshot)
-            if self.store is not None and request_offset is not None:
-                self.store.truncate_to(request_offset)
+            executed = any(e.get("phase") == "started" for e in self.tool_runtime.dispatcher.audit[audit_start:])
+            if not executed:
+                self.messages[:] = message_snapshot
+                self.context.restore(context_snapshot)
+                # Policy/fallback decisions survive a failed request; activation does not.
+                policy = self.tool_runtime.policy.snapshot()
+                self.tool_runtime.restore(dict(runtime_snapshot, policy=policy))
+                self.tool_registry._tasks.pop(self._runtime_task_id, None)
+                if self.store is not None and request_offset is not None:
+                    self.store.truncate_to(request_offset)
+                    for event in self._audit_events[audit_event_start:]:
+                        self.store.record_tool_audit(event)
+                if self.provider_session.snapshot() != provider_snapshot or self.tool_runtime.policy.snapshot() != runtime_snapshot["policy"]:
+                    self._save_runtime()
             print(f"模型请求失败: {exc}")
             return None
         finally:
@@ -1077,7 +1294,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                   + (f"  最后输入: {preview}" if preview else ""))
         return 0
     try:
-        agent = Agent(config, resume=args.resume)
+        def confirm_tool(metadata, arguments):
+            if not sys.stdin.isatty():
+                return False
+            try:
+                return input(f"允许 {metadata.tool_id} ({metadata.risk}) {json.dumps(arguments, ensure_ascii=False)}? [y/N] ").strip().casefold() == "y"
+            except (EOFError, KeyboardInterrupt):
+                return False
+        agent = Agent(config, resume=args.resume, confirm_tool=confirm_tool)
     except ConfigurationError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2

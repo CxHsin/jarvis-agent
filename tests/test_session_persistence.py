@@ -298,7 +298,7 @@ class SessionWriteThroughTests(SessionTestBase):
             context_window_tokens=12000,
             max_output_tokens=1000,
             context_keep_recent_tokens=200,
-            context_reserve_tokens=9500,
+            context_reserve_tokens=9000,
             max_rounds=4,
         )
         with redirect_stdout(StringIO()):

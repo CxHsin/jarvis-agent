@@ -16,6 +16,7 @@
 
 ```powershell
 & 'C:\Users\Cx\AppData\Local\Programs\Python\Python312\python.exe' -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 输入 `exit` 退出，`Ctrl+C` 取消当前请求，`/compact` 主动压缩上下文（`/compact 2000` 指定本次保留的 token 数）。`--list` 列出当前工作区的会话，`--resume` 接上最近一段，`--resume <id>` 接上指定会话。
@@ -25,10 +26,10 @@
 - 不需要文件信息的请求可以直接回答。
 - 模型可以连续调用工具，并依据工具结果继续或结束。
 - 每次启动默认新建会话，`--list` 能列出本工作区的全部会话；`--resume` 接上最近一段（`--resume <id>` 指定）。
-- 会话记录写穿落盘：进程被杀后 `--resume` 仍能接上，缺失结果的工具调用补写「中断未执行」占位而不重新执行。
-- 模型请求失败时，磁盘与内存一起回滚，不留下半轮记录。
+- 会话记录写穿落盘：进程被杀后 `--resume` 仍能接上，缺失结果的工具调用补写「执行状态未知」占位，不重新执行。
+- 尚未执行工具时，模型请求失败会回滚本轮对话；已经执行工具时保留结果与审计，避免遗失副作用证据。权限与供应商回退状态不随对话回滚。
 - 压缩过的历史段落恢复后，仍能从会话归档取回原文，摘要里的来源引用保持可核对。
-- 同一轮的多个工具调用按顺序执行，日志显示工具名、参数和结果。
+- 同一轮的独立工具可并行；依赖调用、同文件操作和声明串行的工具顺序执行，结果按调度顺序记录。
 - 同一次运行可以追问；退出默认开启新会话，`--resume` 才会接上上一段。
 - 工具失败会作为结果交回模型；模型请求失败会结束当前请求并回到输入状态。
 - 达到 `MAX_ROUNDS` 时最后一轮只生成回答，不再执行工具。
@@ -39,7 +40,21 @@
 - 每次模型调用显示服务端输入 token、缓存命中 token 和占比；任务结束后按主模型/压缩模型分别汇总。缺失或不一致的缓存字段标为“未知”，明确返回 0 才算未命中；总占比按总命中量除以总输入量计算，存在未知调用时不展示误导性的完整占比。
 - 终端默认只显示工具结果摘要和短预览；完整结果仍发送给模型。设置 `VERBOSE_TOOL_OUTPUT=true` 可临时显示完整工具结果，`TOOL_OUTPUT_PREVIEW_CHARS` 控制预览长度。
 
-`MAX_ROUNDS` 按主模型调用次数计数。`read` 和 `read_file` 支持读取工作区外的文本文件：绝对路径直接解析，相对路径以 `ROOT_DIR` 为基准。`edit`、`bash`、`list_directory` 和 `search_file_content` 仍限制在 `ROOT_DIR` 内；目录工具可以列出所有直接子项。
+`MAX_ROUNDS` 按主模型调用次数计数。`read` 和 `read_file` 支持读取工作区外的文本文件：绝对路径直接解析，相对路径以 `ROOT_DIR` 为基准。`edit`、`list_directory` 和 `search_file_content` 限制在 `ROOT_DIR` 内；`bash` 以该目录为起点，但没有操作系统沙箱，获准的命令能访问进程有权限访问的位置。
+
+## 工具运行时
+
+固定工具为 `read`、`edit`、`bash`、`tool_search`。动态工具通过 `tool_search` 搜索并激活，定义追加在搜索结果中，固定 `tools` 列表不改变；下一任务必须重新搜索，历史定义保留但不授予执行权限。压缩退休搜索结果时，仅补回当前任务已激活的定义，不插入空标记或任务边界标记。这里保证确定性序列化，不承诺供应商一定命中缓存。
+
+`TOOL_PERMISSION_MODE` 支持 `approve-all`（每次工具调用确认）、`approve-dangerous`（默认，高风险调用确认）和 `broad-access`（显式宽授权）。`bash` 一律视为高风险；文件编辑为中风险。命令行遇到需确认的操作会提示，非交互使用应传入 `Agent(confirm_tool=...)`，否则返回 `confirmation_required`。工具本身不能确认或升级权限。`agent.tool_runtime.policy.change_mode(...)` 可直接收紧，升级必须由宿主完成用户确认后传入 `confirmed=True`；`revoke()` 阻止新的副作用，变更与确认均写入会话审计。重启配置只能进一步收紧已保存的授权。
+
+每个工具版本保存不可变 schema、SHA-256 指纹、风险、资源、副作用、超时、输出上限与并发声明。同版本不能替换处理函数。参数按 JSON Schema 2020-12 校验，远程 schema 引用不受支持。`TOOL_MAX_TIMEOUT` 是会话超时上限，工具自身的上限仍生效；输出同时受工具和权限策略上限约束。内置 shell 的超时与取消会终止进程树，文件编辑在提交前检查取消与策略版本。Python 扩展处理函数应使用 `contextual=True` 和 `ExecutionContext` 合作取消；无法中止的扩展返回 `uncertain` 并保留资源占用，运行时不会自动重试可能产生副作用的调用。
+
+同批调用可在参数中使用 `_depends_on: ["call-id"]` 声明依赖，或使用 `{"$result":{"call_id":"call-id","path":["字段"]}}` 引用前置结果；引用会在参数校验前解析。前置失败会阻止依赖调用。`_version` 与 `_schema_fingerprint` 可显式校验搜索得到的版本；不存在的版本、环、冲突及取消均返回结构化错误。`read` 返回文件 `hash`，`edit(expected_hash=...)` 可拒绝过期写入；未指定时，同批编辑也会比较执行前快照，避免两个同文件写入静默覆盖。
+
+供应商模式由 `PROVIDER_TOOL_MODE` 显式选择，与模型容量配置无关。通用 Chat Completions 客户端使用 `emulated`。原生供应商由宿主传入 `Agent(native_loader=...)`，协议为 `(measured_client, messages, stable_tools, active_definitions, tool_choice) -> assistant_message`；适配器负责供应商专有的 deferred/tool-reference 请求。可重试的网络/能力错误连续失败三次后，本会话只回退一次并重新发出 emulated 请求；失败调用的局部引用不会写入历史。模式、回退次数、历史版本与权限随会话恢复。没有原生适配器时配置 `native` 会按相同规则回退。
+
+验收：`python -m pytest -q`。`tests/test_tool_runtime_acceptance.py` 从 Agent 循环验证发现、权限、依赖、并发、编辑冲突、原生回退、恢复和压缩；供应商专有协议通过可注入适配器测试，未调用真实付费模型服务。
 
 ## 模型容量与缓存
 

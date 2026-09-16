@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import uuid
+from threading import RLock
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -99,6 +100,8 @@ class SessionContents:
     compressed_call_ids: list[str] = field(default_factory=list)
     task_number: int = 0
     warnings: tuple[str, ...] = ()
+    runtime: dict[str, Any] = field(default_factory=dict)
+    audit: list[dict[str, Any]] = field(default_factory=list)
 
 
 class _SessionLock:
@@ -214,6 +217,7 @@ class SessionStore:
         self.path = self.directory / f"{session_id}.jsonl"
         self._file = None
         self._lock = _SessionLock(self.directory / f"{session_id}.lock")
+        self._write_lock = RLock()
 
     @classmethod
     def create(cls, config: Any) -> "SessionStore":
@@ -293,12 +297,22 @@ class SessionStore:
         self.close()
 
     def _append(self, record: Mapping[str, Any]) -> int:
+        with self._write_lock:
+            return self._append_locked(record)
+
+    def _append_locked(self, record: Mapping[str, Any]) -> int:
         if self._file is None:
             raise SessionError("会话记录已关闭。")
         payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
         self._file.write(payload + "\n")
         self._file.flush()
         return self._file.tell()
+
+    def record_runtime(self, state: Mapping[str, Any]) -> None:
+        self._append({"type": "runtime", "state": dict(state)})
+
+    def record_tool_audit(self, event: Mapping[str, Any]) -> None:
+        self._append({"type": "tool_audit", "event": dict(event)})
 
     def record_message(self, message: Mapping[str, Any]) -> None:
         self._append({"type": RECORD_MESSAGE, "message": dict(message)})
@@ -376,6 +390,10 @@ class SessionStore:
                 message = record.get("message")
                 if isinstance(message, Mapping):
                     contents.messages.append(dict(message))
+            elif kind == "runtime":
+                contents.runtime = dict(record.get("state") or {})
+            elif kind == "tool_audit":
+                contents.audit.append(dict(record.get("event") or {}))
             elif kind == RECORD_ARCHIVE:
                 entry = record.get("entry")
                 if isinstance(entry, Mapping):
