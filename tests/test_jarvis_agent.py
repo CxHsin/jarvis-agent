@@ -270,7 +270,7 @@ class AgentTests(unittest.TestCase):
             agent = make_agent(self, config, client)
             answer = agent.run_request("找找 agent")
             self.assertEqual(answer, "找到了 note.md。")
-            self.assertEqual(client.calls, [(2, 7, "auto"), (5, 0, "none")])
+            self.assertEqual(client.calls, [(2, 4, "auto"), (5, 0, "none")])
             self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant", "tool", "tool", "assistant"])
 
     def test_agent_wires_file_tools_through_runtime(self):
@@ -281,7 +281,7 @@ class AgentTests(unittest.TestCase):
             names = [item["function"]["name"] for item in agent.tool_runtime.schemas("0")]
             self.assertEqual(names, ["read", "edit", "bash", "tool_search"])
             agent.run_request("列出文件")
-            self.assertEqual(agent.tool_runtime.registry.active_keys("1"),
+            self.assertEqual(agent.tool_runtime.registry.active_keys(agent._runtime_task_id),
                              {(name, "1") for name in agent.tool_functions})
             result = agent._execute_tool("list_directory", {})
             self.assertTrue(result["ok"])
@@ -579,13 +579,8 @@ class AgentTests(unittest.TestCase):
                     }
                 ]
             )
-            agent = make_agent(self, config, client)
-            agent.workspace = CancellingWorkspace()
-            agent.tool_functions = {
-                "list_directory": agent.workspace.list_directory,
-                "search_file_content": agent.workspace.search_file_content,
-                "read_file": agent.workspace.read_file,
-            }
+            with patch.object(Workspace, "list_directory", CancellingWorkspace.list_directory):
+                agent = make_agent(self, config, client)
             self.assertIsNone(agent.run_request("取消测试"))
             tool_messages = [message for message in agent.messages if message["role"] == "tool"]
             self.assertEqual(len(tool_messages), 2)

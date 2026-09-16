@@ -1,160 +1,319 @@
-"""Immutable, versioned tool registry used by the agent runtime."""
+"""Versioned tools, task activation and provider-independent contracts."""
 from __future__ import annotations
-import hashlib, json
-from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Iterable
+
+import hashlib
+import json
+from copy import deepcopy
+from dataclasses import dataclass
 from enum import Enum
+from threading import RLock
 
-def _canonical(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+from jsonschema import Draft202012Validator
 
-@dataclass(frozen=True)
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def failure(code, message="", **details):
+    return {"ok": False, "error": {"code": code, "message": message, **details}}
+
+
+@dataclass(frozen=True, init=False)
 class ToolMetadata:
     tool_id: str
     version: str
-    schema: Mapping[str, Any]
-    risk: str = "low"
-    resources: tuple[str, ...] = ()
-    side_effects: tuple[str, ...] = ()
-    timeout: float | None = None
-    output_limit: int | None = None
-    concurrency: str = "serial"
-    schema_fingerprint: str = field(init=False)
-    def __post_init__(self):
-        if not self.tool_id or not self.version: raise ValueError("tool_id and version are required")
-        object.__setattr__(self, "schema", json.loads(_canonical(self.schema)))
-        fp = hashlib.sha256(_canonical(self.schema).encode()).hexdigest()
-        object.__setattr__(self, "schema_fingerprint", fp)
+    _schema_json: str
+    risk: str
+    resources: tuple
+    side_effects: tuple
+    timeout: float
+    output_limit: int
+    concurrency: str
+    schema_fingerprint: str
+
+    def __init__(self, tool_id, version, schema, risk="low", resources=(), side_effects=(),
+                 timeout=30.0, output_limit=32768, concurrency="serial"):
+        if not isinstance(tool_id, str) or not tool_id or not isinstance(version, str) or not version:
+            raise ValueError("tool_id and version must be non-empty strings")
+        if schema.get("name") != tool_id:
+            raise ValueError("schema.name must equal tool_id")
+        parameters = schema.get("parameters", {"type": "object"})
+        Draft202012Validator.check_schema(parameters)
+
+        def local_refs(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key in {"$ref", "$dynamicRef"} and not str(value).startswith("#"):
+                        raise ValueError("only local schema references are supported")
+                    local_refs(value)
+            elif isinstance(node, list):
+                for value in node:
+                    local_refs(value)
+
+        local_refs(parameters)
+        if parameters.get("type") != "object":
+            raise ValueError("tool parameters must be an object schema")
+        if risk not in {"low", "medium", "high"} or concurrency not in {"serial", "parallel"}:
+            raise ValueError("invalid risk or concurrency")
+        timeout = 30.0 if timeout is None else float(timeout)
+        output_limit = 32768 if output_limit is None else int(output_limit)
+        if not 0 < timeout <= 3600 or output_limit < 256:
+            raise ValueError("invalid runtime limits")
+        if any(not isinstance(x, str) or not x for x in (*resources, *side_effects)):
+            raise ValueError("resources and side effects must be named strings")
+        schema_json = canonical(schema)
+        values = dict(tool_id=tool_id, version=version, _schema_json=schema_json,
+                      risk=risk, resources=tuple(resources), side_effects=tuple(side_effects),
+                      timeout=timeout, output_limit=output_limit, concurrency=concurrency,
+                      schema_fingerprint=hashlib.sha256(schema_json.encode()).hexdigest())
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    @property
+    def schema(self):
+        """Return detached JSON, so a caller cannot mutate the registered version."""
+        return json.loads(self._schema_json)
+
+    def definition(self):
+        return {"tool_id": self.tool_id, "version": self.version, "schema": self.schema,
+                "schema_fingerprint": self.schema_fingerprint, "risk": self.risk,
+                "resources": list(self.resources), "side_effects": list(self.side_effects),
+                "timeout": self.timeout, "output_limit": self.output_limit,
+                "concurrency": self.concurrency}
+
 
 @dataclass(frozen=True)
 class RegisteredTool:
     metadata: ToolMetadata
-    handler: Callable[..., Any]
+    handler: object
+    contextual: bool = False
+
 
 class ToolRegistry:
     def __init__(self):
-        self._tools: dict[tuple[str,str], RegisteredTool] = {}
-        self._tasks: dict[str, set[tuple[str, str]]] = {}
-    def register(self, metadata: ToolMetadata, handler: Callable[..., Any]) -> RegisteredTool:
-        key=(metadata.tool_id, metadata.version)
-        if key in self._tools:
-            old=self._tools[key].metadata
-            if old.schema_fingerprint != metadata.schema_fingerprint or old != metadata: raise ValueError("inconsistent tool definition")
-            return self._tools[key]
-        if not callable(handler): raise TypeError("handler must be callable")
-        self._tools[key]=RegisteredTool(metadata,handler); return self._tools[key]
-    def get(self, tool_id: str, version: str) -> RegisteredTool: return self._tools[(tool_id,version)]
-    def versions(self, tool_id: str) -> tuple[str,...]: return tuple(sorted(v for (t,v) in self._tools if t==tool_id))
-    def list(self) -> tuple[RegisteredTool,...]: return tuple(self._tools[k] for k in sorted(self._tools))
+        self._tools, self._tasks = {}, {}
+        self._lock = RLock()
 
-    def activate(self, task_id: str, tool_id: str, version: str) -> None:
-        """Activate a registered version for one task; registrations are never removed."""
+    def register(self, metadata, handler, *, contextual=False):
+        if not callable(handler):
+            raise TypeError("handler must be callable")
+        key = (metadata.tool_id, metadata.version)
+        with self._lock:
+            previous = self._tools.get(key)
+            if previous:
+                if previous.metadata != metadata or previous.handler != handler or previous.contextual != contextual:
+                    raise ValueError("inconsistent tool definition; register a new version")
+                return previous
+            tool = RegisteredTool(metadata, handler, contextual)
+            self._tools[key] = tool
+            return tool
+
+    def get(self, tool_id, version):
+        return self._tools[(tool_id, version)]
+
+    def versions(self, tool_id):
+        return tuple(sorted(v for t, v in self._tools if t == tool_id))
+
+    def list(self):
+        return tuple(self._tools[key] for key in sorted(self._tools))
+
+    def activate(self, task_id, tool_id, version):
         self.get(tool_id, version)
-        self._tasks.setdefault(str(task_id), set()).add((tool_id, version))
+        keys = self._tasks.setdefault(str(task_id), set())
+        if any(t == tool_id and v != version for t, v in keys):
+            raise ValueError("another version is already active for this task")
+        keys.add((tool_id, version))
 
-    def deactivate(self, task_id: str, tool_id: str, version: str) -> None:
+    def deactivate(self, task_id, tool_id, version):
         self._tasks.get(str(task_id), set()).discard((tool_id, version))
 
-    def active(self, task_id: str) -> tuple[RegisteredTool, ...]:
-        keys = self._tasks.get(str(task_id), set())
-        return tuple(self._tools[key] for key in sorted(keys) if key in self._tools)
-
-    def active_keys(self, task_id: str) -> frozenset[tuple[str, str]]:
+    def active_keys(self, task_id):
         return frozenset(self._tasks.get(str(task_id), set()))
 
-    def search(self, query: str = "", *, task_id: str | None = None,
-               permission: Callable[[ToolMetadata], bool] | None = None,
-               limit: int = 8) -> tuple[ToolMetadata, ...]:
-        """Return deterministic, bounded metadata matches without changing activation."""
-        if limit < 0:
-            raise ValueError("limit must be non-negative")
-        needle = str(query).casefold().strip()
-        active = self.active_keys(task_id) if task_id is not None else None
+    def active(self, task_id):
+        return tuple(self._tools[key] for key in sorted(self.active_keys(task_id)) if key in self._tools)
+
+    def search(self, query="", *, task_id=None, permission=None, limit=8):
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 0 <= limit <= 20:
+            raise ValueError("limit must be between 0 and 20")
+        names = {t for t, _ in self.active_keys(task_id)} if task_id is not None else set()
         matches = []
-        for key in sorted(self._tools):
-            if active is not None and key in active:
+        for tool in reversed(self.list()):
+            metadata = tool.metadata
+            if metadata.tool_id in names or (permission and not permission(metadata)):
                 continue
-            metadata = self._tools[key].metadata
-            haystack = _canonical({"id": metadata.tool_id, "version": metadata.version,
-                                   "schema": metadata.schema, "risk": metadata.risk})
-            if needle and needle not in haystack.casefold():
-                continue
-            if permission is not None and not permission(metadata):
+            if str(query).strip().casefold() not in metadata._schema_json.casefold():
                 continue
             matches.append(metadata)
-        return tuple(matches[:limit])
+            names.add(metadata.tool_id)
+        return tuple(sorted(matches, key=lambda m: (m.tool_id, m.version))[:limit])
 
-    def search_tools(self, query: str = "", *, task_id: str | None = None,
-                     permission: Callable[[ToolMetadata], bool] | None = None,
-                     limit: int = 8) -> list[dict[str, Any]]:
-        """Structured discovery response suitable for an emulated provider adapter."""
-        return [
-            {"tool_id": item.tool_id, "version": item.version,
-             "schema": item.schema, "schema_fingerprint": item.schema_fingerprint,
-             "risk": item.risk, "active": task_id is not None and
-             (item.tool_id, item.version) in self.active_keys(task_id)}
-            for item in self.search(query, task_id=task_id, permission=permission, limit=limit)
-        ]
+    def search_tools(self, query="", **kwargs):
+        return [dict(m.definition(), active=False) for m in self.search(query, **kwargs)]
+
+
+class PermissionPolicy:
+    """A versioned user grant; a session cannot silently widen it."""
+    MODES = {"approve-all": 0, "approve-dangerous": 1, "broad-access": 2}
+
+    def __init__(self, mode="approve-dangerous", *, max_timeout=60.0, max_output=32768,
+                 denied_tools=(), on_event=None):
+        if mode not in self.MODES or not 0 < max_timeout <= 3600 or max_output < 256:
+            raise ValueError("invalid permission policy")
+        self._mode, self._revoked, self.version = mode, False, 1
+        self.max_timeout, self.max_output = max_timeout, max_output
+        self.denied_tools = frozenset(denied_tools)
+        self.audit, self.on_event, self._lock = [], on_event, RLock()
+
+    @property
+    def mode(self):
+        return self._mode
+
+    @property
+    def revoked(self):
+        return self._revoked
+
+    def _event(self, action, **values):
+        event = {"action": action, "policy_version": self.version, **values}
+        self.audit.append(event)
+        if self.on_event:
+            self.on_event(event)
+
+    def change_mode(self, mode, *, confirmed=False):
+        if mode not in self.MODES:
+            raise ValueError("invalid permission mode")
+        with self._lock:
+            if self.MODES[mode] > self.MODES[self.mode] and not confirmed:
+                self._event("upgrade_denied", requested_mode=mode)
+                return failure("confirmation_required", "permission upgrade requires confirmation")
+            previous = self.mode
+            self._mode = mode
+            self.version += 1
+            self._event("mode_changed", previous=previous, mode=mode, confirmed=bool(confirmed))
+            return {"ok": True}
+
+    def revoke(self):
+        with self._lock:
+            self._revoked = True
+            self.version += 1
+            self._event("revoked")
+
+    def visible(self, metadata):
+        return metadata.tool_id not in self.denied_tools and not (self.revoked and metadata.side_effects)
+
+    def check(self, metadata, confirmed=False):
+        if metadata.tool_id in self.denied_tools:
+            return False, "permission_denied"
+        if metadata.side_effects and self.revoked:
+            return False, "policy_revoked"
+        needs_confirmation = self.mode == "approve-all" or self.mode == "approve-dangerous" and metadata.risk == "high"
+        if needs_confirmation and not confirmed:
+            return False, "confirmation_required"
+        return True, None
+
+    def snapshot(self):
+        return {"mode": self.mode, "revoked": self.revoked, "version": self.version,
+                "max_timeout": self.max_timeout, "max_output": self.max_output,
+                "denied_tools": sorted(self.denied_tools)}
+
+    def restore(self, state):
+        self._mode = min((self.mode, state.get("mode", self.mode)), key=self.MODES.__getitem__)
+        self._revoked = self.revoked or bool(state.get("revoked"))
+        self.version = max(self.version, int(state.get("version", 1)))
+        self.max_timeout = min(self.max_timeout, state.get("max_timeout", self.max_timeout))
+        self.max_output = min(self.max_output, state.get("max_output", self.max_output))
+        self.denied_tools |= frozenset(state.get("denied_tools", ()))
 
 
 class ToolRuntime:
-    """Stable-prefix tool serialization with task-scoped emulated discovery."""
-    def __init__(self, registry: ToolRegistry, stable: Iterable[tuple[str, str]] = ()):
-        self.registry = registry
-        self._stable = tuple(stable)
+    def __init__(self, registry, stable=(), *, policy=None, confirm=None, recorder=None, resource_resolver=None):
+        self.registry, self._stable = registry, tuple(stable)
+        self.policy = policy or PermissionPolicy()
+        self.confirm, self.recorder, self.history = confirm, recorder, {}
+        from tool_execution import ToolDispatcher
+        self.dispatcher = ToolDispatcher(registry, policy=self.policy, confirm=confirm,
+                                         recorder=recorder, resource_resolver=resource_resolver)
 
     @property
-    def stable_tools(self) -> tuple[RegisteredTool, ...]:
+    def stable_tools(self):
         return tuple(self.registry.get(*key) for key in self._stable)
 
-    def activate(self, task_id: str, tool_id: str, version: str) -> None:
+    def begin_task(self, task_id, compatibility=()):
+        self.registry._tasks[str(task_id)] = set()
+        for key in (*self._stable, *compatibility):
+            self.activate(task_id, *key)
+
+    def activate(self, task_id, tool_id, version):
+        metadata = self.registry.get(tool_id, version).metadata
         self.registry.activate(task_id, tool_id, version)
+        self.history.setdefault((tool_id, version), metadata.definition())
 
-    def search(self, task_id: str, query: str = "", *, permission=None, limit: int = 8):
-        return self.registry.search(query, task_id=task_id, permission=permission, limit=limit)
+    def search(self, task_id, query="", *, permission=None, limit=8):
+        return self.registry.search(query, task_id=task_id,
+                                    permission=permission or self.policy.visible, limit=limit)
 
-    def schemas(self, task_id: str, *, native_deferred: bool = False,
-                query: str = "", permission=None, limit: int = 8) -> list[dict[str, Any]]:
-        """Stable definitions always lead; emulated dynamic definitions are appended."""
-        result = [{"type": "function", "function": dict(tool.metadata.schema)}
-                  for tool in self.stable_tools]
-        if native_deferred:
-            return result
-        stable_keys = set(self._stable)
-        dynamic = tuple(tool for tool in self.registry.active(task_id)
-                        if (tool.metadata.tool_id, tool.metadata.version) not in stable_keys)
-        if query:
-            needle = query.casefold().strip()
-            dynamic = tuple(tool for tool in dynamic if needle in _canonical(tool.metadata.schema).casefold())
-        if permission is not None:
-            dynamic = tuple(tool for tool in dynamic if permission(tool.metadata))
-        result.extend({"type": "function", "function": dict(tool.metadata.schema)} for tool in dynamic[:limit])
-        return result
+    def discover(self, task_id, query="", limit=8):
+        matches = self.search(task_id, query, limit=limit)
+        bounded = []
+        for item in matches:
+            trial = [dict(m.definition(), active=True) for m in (*bounded, item)]
+            if len(canonical({"ok": True, "tools": trial}).encode()) > self.policy.max_output - 256:
+                break
+            bounded.append(item)
+        for item in bounded:
+            self.activate(task_id, item.tool_id, item.version)
+        return {"ok": True, "tools": [dict(m.definition(), active=True) for m in bounded],
+                "truncated": len(bounded) < len(matches)}
 
-    def execute(self, task_id: str, tool_id: str, version: str,
-                arguments: Mapping[str, Any] | None = None):
-        if (tool_id, version) not in self.registry.active_keys(task_id):
-            return {"ok": False, "error": {"code": "inactive_tool", "message": "tool is not active for this task"}}
-        return ToolDispatcher(self.registry).execute(tool_id, version, arguments)
+    def schemas(self, task_id, *, native_deferred=False, query="", permission=None, limit=20):
+        # Emulated definitions are append-only search results, never prefix tools.
+        return [{"type": "function", "function": m.metadata.schema} for m in self.stable_tools]
 
-    def stable_fingerprint(self) -> str:
-        """Fingerprint only the stable prefix; dynamic task history cannot affect it."""
-        payload = [_canonical(tool.metadata.schema) for tool in self.stable_tools]
-        return hashlib.sha256(_canonical(payload).encode()).hexdigest()
+    def active_definitions(self, task_id):
+        return [t.metadata.definition() for t in self.registry.active(task_id)
+                if (t.metadata.tool_id, t.metadata.version) not in self._stable]
+
+    def binding(self, task_id, name, version=None, fingerprint=None):
+        keys = sorted(key for key in self.registry.active_keys(task_id) if key[0] == name)
+        if not keys:
+            return None, failure("inactive_tool", "tool is not active for this task", tool_id=name)
+        key = keys[0]
+        if version is not None and version != key[1]:
+            return None, failure("unavailable_version", "requested version is not active")
+        try:
+            metadata = self.registry.get(*key).metadata
+        except KeyError:
+            return None, failure("unavailable_version", "registered version is unavailable")
+        expected = self.history.get(key, {}).get("schema_fingerprint", metadata.schema_fingerprint)
+        if metadata.schema_fingerprint != expected or fingerprint is not None and fingerprint != expected:
+            return None, failure("schema_mismatch", "registered schema fingerprint differs")
+        return key, None
+
+    def execute(self, task_id, tool_id, version, arguments=None, **kwargs):
+        key, error = self.binding(task_id, tool_id, version, kwargs.get("fingerprint"))
+        return error or self.dispatcher.execute(*key, arguments, **kwargs)
+
+    def stable_fingerprint(self):
+        return hashlib.sha256(canonical(self.schemas("")).encode()).hexdigest()
 
     fingerprint_stable_prefix = stable_fingerprint
 
+    def snapshot(self):
+        return {"definitions": [self.history[key] for key in sorted(self.history)], "policy": self.policy.snapshot()}
+
+    def restore(self, state):
+        self.history = {(d["tool_id"], d["version"]): deepcopy(d) for d in state.get("definitions", [])}
+        self.policy.restore(state.get("policy", {}))
+
 
 class ProviderCapabilityMode(str, Enum):
-    """The provider loading contract selected for a session."""
     NATIVE = "native"
     EMULATED = "emulated"
 
 
 @dataclass
 class ProviderSession:
-    """Persistent provider state; reuse this object for every model call."""
     mode: ProviderCapabilityMode
     native_failures: int = 0
     fallback_count: int = 0
@@ -163,57 +322,47 @@ class ProviderSession:
         self.mode = ProviderCapabilityMode(self.mode)
 
     @classmethod
-    def from_capability(cls, *, native_deferred: bool) -> "ProviderSession":
-        """Create explicit session state from provider capability discovery."""
-        return cls(ProviderCapabilityMode.NATIVE if native_deferred
-                    else ProviderCapabilityMode.EMULATED)
+    def from_capability(cls, *, native_deferred):
+        return cls("native" if native_deferred else "emulated")
 
     @property
-    def native_deferred(self) -> bool:
+    def native_deferred(self):
         return self.mode is ProviderCapabilityMode.NATIVE
+
+    def snapshot(self):
+        return {"mode": self.mode.value, "native_failures": self.native_failures, "fallback_count": self.fallback_count}
 
 
 class ProviderLoadError(RuntimeError):
-    """An error carrying whether retrying native loading is meaningful."""
-    def __init__(self, message: str, *, eligible: bool = True):
+    def __init__(self, message, *, eligible=True):
         super().__init__(message)
         self.eligible = eligible
 
 
 class ToolProviderAdapter:
-    """Load native references when supported, with one safe emulated fallback.
-
-    ``native_loader`` may return a list of references or raise an exception.
-    The result is committed only after the call succeeds, so partial native
-    references can never leak into the emulated retry.
-    """
-    def __init__(self, runtime: ToolRuntime, session: ProviderSession):
+    def __init__(self, runtime, session):
         self.runtime, self.session = runtime, session
 
     @staticmethod
-    def _eligible(exc: BaseException) -> bool:
-        if isinstance(exc, ProviderLoadError):
-            return exc.eligible
-        value = str(exc).casefold()
+    def _eligible(exc):
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return True
         if getattr(exc, "eligible", None) is not None:
             return bool(exc.eligible)
-        code = str(getattr(exc, "code", "")).casefold()
-        return any(word in value or word in code for word in
-                   ("network", "timeout", "capability", "unsupported", "deferred", "tool reference"))
+        value = (str(exc) + " " + str(getattr(exc, "code", ""))).casefold()
+        return any(word in value for word in ("network", "timeout", "capability", "unsupported", "deferred", "tool reference"))
 
-    def load(self, task_id: str, native_loader: Callable[[], Any], *,
-             query: str = "", permission=None, limit: int = 8,
-             emulated_loader: Callable[[], Any] | None = None) -> Any:
-        """Return provider references and persist the selected loading mode."""
-        if self.session.mode is ProviderCapabilityMode.EMULATED:
-            return self._emulated(task_id, query, permission, limit, emulated_loader)
+    def load(self, task_id, native_loader, *, query="", permission=None, limit=8, emulated_loader=None):
+        def emulated():
+            return emulated_loader() if emulated_loader else self.runtime.schemas(task_id)
+        if not self.session.native_deferred:
+            return emulated()
         while True:
             try:
-                # Do not expose a mutable/partial native response until success.
                 result = native_loader()
                 self.session.native_failures = 0
                 return result
-            except BaseException as exc:
+            except Exception as exc:
                 if not self._eligible(exc):
                     raise
                 self.session.native_failures += 1
@@ -221,146 +370,11 @@ class ToolProviderAdapter:
                     continue
                 self.session.mode = ProviderCapabilityMode.EMULATED
                 self.session.fallback_count += 1
-                return self._emulated(task_id, query, permission, limit, emulated_loader)
-
-    def _emulated(self, task_id: str, query: str, permission, limit: int,
-                  loader: Callable[[], Any] | None) -> Any:
-        if loader is not None:
-            return loader()
-        return self.runtime.schemas(task_id, native_deferred=False,
-                                    query=query, permission=permission, limit=limit)
+                return emulated()
 
 
-# Descriptive alias for callers that model the native provider as an adapter.
 NativeProviderAdapter = ToolProviderAdapter
 
-class ToolDispatcher:
-    """Validated, audited execution seam for registered tools."""
-    def __init__(self, registry: ToolRegistry):
-        self.registry, self.audit = registry, []
-        self._busy: set[str] = set()
-    def execute(self, tool_id: str, version: str, arguments: Mapping[str, Any] | None = None, *, timeout: float | None = None):
-        import inspect
-        tool = self.registry.get(tool_id, version); args = dict(arguments or {})
-        event = {"tool_id": tool_id, "version": version, "schema_fingerprint": tool.metadata.schema_fingerprint}
-        resource = tuple(tool.metadata.resources)
-        if any(r in self._busy for r in resource):
-            return {"ok": False, "error": {"code": "resource_conflict", "message": "resource is busy"}, "audit": event}
-        self._busy.update(resource)
-        try:
-            result = tool.handler(**args)
-            if inspect.isawaitable(result): raise TypeError("async handlers are not supported by synchronous dispatcher")
-            event.update({"ok": True}); self.audit.append(event)
-            return {"ok": True, "result": result, "audit": event}
-        except TimeoutError as exc:
-            event.update({"ok": False, "error": "timeout"}); self.audit.append(event)
-            return {"ok": False, "error": {"code": "timeout", "message": str(exc)}, "audit": event}
-        except Exception as exc:
-            event.update({"ok": False, "error": type(exc).__name__}); self.audit.append(event)
-            return {"ok": False, "error": {"code": "execution_error", "message": str(exc)}, "audit": event}
-        finally: self._busy.difference_update(resource)
-
-
-@dataclass(frozen=True)
-class ToolCall:
-    """A scheduled invocation and its explicit result dependencies."""
-    call_id: str
-    tool_id: str
-    version: str
-    arguments: Mapping[str, Any] = field(default_factory=dict)
-    depends_on: tuple[str, ...] = ()
-
-    def __post_init__(self):
-        if not self.call_id:
-            raise ValueError("call_id is required")
-        object.__setattr__(self, "depends_on", tuple(self.depends_on))
-
-
-class ToolScheduler:
-    """Dependency and resource aware execution for a batch of tool calls."""
-    def __init__(self, registry: ToolRegistry, *, max_workers: int = 8):
-        self.registry = registry
-        self.max_workers = max(1, int(max_workers))
-        self.dispatcher = ToolDispatcher(registry)
-
-    def _validate(self, calls):
-        calls = tuple(calls)
-        by_id = {}
-        for call in calls:
-            if call.call_id in by_id:
-                return None, {"ok": False, "error": {"code": "duplicate_call_id", "call_id": call.call_id}}
-            by_id[call.call_id] = call
-            try:
-                self.registry.get(call.tool_id, call.version)
-            except KeyError:
-                return None, {"ok": False, "error": {"code": "unavailable_version", "call_id": call.call_id,
-                                                         "tool_id": call.tool_id, "version": call.version}}
-        for call in calls:
-            missing = [dep for dep in call.depends_on if dep not in by_id]
-            if missing:
-                return None, {"ok": False, "error": {"code": "missing_dependency", "call_id": call.call_id,
-                                                         "dependencies": missing}}
-        return by_id, None
-
-    def schedule(self, calls):
-        """Return deterministic execution waves, or a structured validation outcome."""
-        by_id, error = self._validate(calls)
-        if error:
-            return error
-        remaining = set(by_id)
-        waves = []
-        while remaining:
-            ready = [cid for cid in sorted(remaining)
-                     if all(dep not in remaining for dep in by_id[cid].depends_on)]
-            if not ready:
-                return {"ok": False, "error": {"code": "dependency_cycle",
-                                                 "calls": sorted(remaining)}}
-            wave = []
-            used = set()
-            for cid in ready:
-                resources = set(self.registry.get(by_id[cid].tool_id, by_id[cid].version).metadata.resources)
-                if resources & used:
-                    continue
-                wave.append(cid); used.update(resources)
-            if not wave:
-                return {"ok": False, "error": {"code": "resource_conflict", "calls": ready}}
-            waves.append(tuple(wave)); remaining.difference_update(wave)
-        return {"ok": True, "waves": tuple(waves)}
-
-    def execute(self, calls):
-        """Execute independent calls concurrently, preserving dependency waves."""
-        plan = self.schedule(calls)
-        if not plan.get("ok"):
-            return plan
-        by_id = {call.call_id: call for call in calls}
-        results = {}
-        for wave in plan["waves"]:
-            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(wave))) as pool:
-                futures = {pool.submit(self.dispatcher.execute, by_id[cid].tool_id,
-                                        by_id[cid].version, by_id[cid].arguments): cid for cid in wave}
-                wait(futures)
-                for future, cid in futures.items():
-                    try:
-                        results[cid] = future.result()
-                    except Exception as exc:
-                        results[cid] = {"ok": False, "error": {"code": "recovery_error", "message": str(exc)}}
-        return {"ok": True, "results": {cid: results[cid] for cid in sorted(results)}, "waves": plan["waves"]}
-
-
-# Short alias for integrations that call this a dependency scheduler.
-DependencyScheduler = ToolScheduler
-
-def schedule_tool_calls(registry: ToolRegistry, calls, *, max_workers: int = 8):
-    return ToolScheduler(registry, max_workers=max_workers).schedule(calls)
-
-def execute_tool_calls(registry: ToolRegistry, calls, *, max_workers: int = 8):
-    return ToolScheduler(registry, max_workers=max_workers).execute(calls)
-
-class PermissionPolicy:
-    MODES = {"approve-all", "approve-dangerous", "broad-access"}
-    def __init__(self, mode="approve-dangerous"): self.mode = mode; self.revoked = False
-    def check(self, metadata: ToolMetadata, confirmed=False):
-        if self.revoked: return False, "policy_revoked"
-        if self.mode == "broad-access" or (self.mode == "approve-all" and not metadata.side_effects): return True, None
-        if metadata.side_effects and not confirmed: return False, "confirmation_required"
-        return True, None
+# Preserve public imports while keeping execution separate from registration.
+from tool_execution import (ToolCall, ToolDispatcher, ToolScheduler, DependencyScheduler,
+                            schedule_tool_calls, execute_tool_calls)
