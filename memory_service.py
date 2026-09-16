@@ -8,10 +8,20 @@ from pathlib import Path
 import sqlite3
 from threading import RLock, Event, Thread
 import uuid
+from stable_memory import StableMemory, timestamp
 
 
 EXTRACTION_INSTRUCTIONS = """Extract Pending personal memory candidates from the supplied immutable task events.
-Return ONLY JSON: {"candidates": [{"candidate_text": "...", "source_event_ids": ["..."], "occurred_at": null}]}.
+Return ONLY JSON: {"candidates": [{"candidate_text": "...", "source_event_ids": ["..."], "occurred_at": null,
+"subject":"USER", "predicate":"communication_style", "object":"concise", "category":"communication",
+"confidence":0.95, "importance":0.5, "explicit":true, "stable":true, "sensitive":false,
+"remember_consent":false, "inference":false, "conflict":"none"}]}.
+Classify each assertion, do not invent missing consent or confidence. Categories: identity,
+work_preferences, communication, long_term_goals, constraints, current_state.
+Use canonical predicates; only preferred_name, primary_residence, current_employer,
+current_role, timezone, preferred_language are known single-valued predicates.
+Likes, interests and other preferences are multi-valued; do not infer exclusivity.
+Conflict is none, factual, inference, or uncertain. Uncertain/inferred statements stay Pending.
 Only extract user-explicit stable preferences, communication styles, background,
 long-term goals or enduring constraints. Exclude temporary plans, assistant claims,
 tool-derived inferences and sensitive facts unless the user explicitly requested remembering them.
@@ -25,7 +35,7 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-class MemoryService:
+class MemoryService(StableMemory):
     def __init__(self, directory: Path):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -35,6 +45,7 @@ class MemoryService:
         self._wake = Event()
         self._stop = Event()
         self._worker = None
+        self.extraction_enabled = False
         self._claims = set()
         with self._connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS pending_batches (
@@ -52,6 +63,7 @@ class MemoryService:
                 source_task_id TEXT NOT NULL, source_event_id TEXT NOT NULL,
                 trajectory_path TEXT NOT NULL, recorded_at TEXT NOT NULL, occurred_at TEXT,
                 PRIMARY KEY (candidate_id, source_task_id, source_event_id))""")
+            self._init_facts(db)
         self._project()
 
     @contextmanager
@@ -128,22 +140,38 @@ class MemoryService:
                                       (batch["source_task_id"], token)).fetchone():
                         continue
                     for candidate, sources in prepared:
-                        candidate_id = hashlib.sha256(candidate["candidate_text"].strip().casefold().encode()).hexdigest()
+                        identity = [candidate['candidate_text'].strip().casefold(), candidate.get('occurred_at')]
+                        if 'subject' in candidate:
+                            semantic = self._fact_values(candidate)
+                            identity.extend([semantic['subject'], semantic['predicate'], semantic['object_normalized']])
+                        candidate_id = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
                         recorded_at = min(source["recorded_at"] for source in sources)
                         last_evidence_at = max(source["recorded_at"] for source in sources)
                         db.execute("""INSERT INTO pending_candidates
                             (candidate_id, candidate_text, recorded_at, occurred_at, last_evidence_at)
                             VALUES (?, ?, ?, ?, ?) ON CONFLICT(candidate_id) DO UPDATE SET
+                            recorded_at=MIN(recorded_at, excluded.recorded_at),
                             last_evidence_at=MAX(last_evidence_at, excluded.last_evidence_at),
-                            status=CASE WHEN excluded.last_evidence_at > last_evidence_at AND status='expired'
+                            status=CASE WHEN excluded.last_evidence_at > last_evidence_at AND status IN ('expired', 'promoted', 'suppressed')
                                 THEN 'pending' ELSE status END,
-                            reason=CASE WHEN excluded.last_evidence_at > last_evidence_at AND status='expired'
+                            reason=CASE WHEN excluded.last_evidence_at > last_evidence_at AND status IN ('expired', 'promoted', 'suppressed')
                                 THEN NULL ELSE reason END""", (candidate_id, candidate["candidate_text"].strip(),
                                 recorded_at, candidate.get("occurred_at"), last_evidence_at))
+                        new_sources = 0
                         for source in sources:
-                            db.execute("""INSERT OR IGNORE INTO pending_sources VALUES (?, ?, ?, ?, ?, ?)""",
+                            new_sources += db.execute("""INSERT OR IGNORE INTO pending_sources
+                                (candidate_id, source_task_id, source_event_id, trajectory_path, recorded_at, occurred_at, quote)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)""",
                                        (candidate_id, batch["source_task_id"], source["event_id"],
-                                        batch["trajectory_path"], source["recorded_at"], source.get("occurred_at")))
+                                        batch["trajectory_path"], source["recorded_at"], source.get("occurred_at"),
+                                        source.get("goal") or source.get("message", {}).get("content", ""))).rowcount
+                        if new_sources:
+                            db.execute("UPDATE pending_candidates SET status='pending', reason=NULL WHERE candidate_id=? AND status IN ('promoted', 'suppressed')",
+                                       (candidate_id,))
+                        if "subject" in candidate:
+                            self._fact_values(candidate)
+                            db.execute('UPDATE pending_candidates SET classification=? WHERE candidate_id=?',
+                                       (json.dumps(candidate, ensure_ascii=False), candidate_id))
                     db.execute("""UPDATE pending_batches SET status='extracted', error=NULL,
                         lease_until=NULL, claim_token=NULL WHERE source_task_id=? AND claim_token=?""",
                                (batch["source_task_id"], token))
@@ -159,6 +187,7 @@ class MemoryService:
                     self._claims.discard(token)
             self._project()
         self.expire_candidates()
+        self._promote_classified()
 
     def expire_candidates(self, now=None):
         moment = now or datetime.now(timezone.utc)
@@ -173,12 +202,18 @@ class MemoryService:
         """Run extraction independently from foreground model requests."""
         if self._worker is not None:
             return
+        self.extraction_enabled = True
 
         def run():
+            recovered = False
             while not self._stop.is_set():
                 self._wake.clear()
                 try:
+                    if not recovered:
+                        self._recover_completed()
+                        recovered = True
                     self.process_pending(client)
+                    self.consolidate_due(client)
                 except (OSError, sqlite3.Error):
                     # Trajectories and batches remain durable for the next attempt.
                     pass
@@ -186,6 +221,28 @@ class MemoryService:
 
         self._worker = Thread(target=run, name="jarvis-memory-extraction", daemon=True)
         self._worker.start()
+
+    def _recover_completed(self):
+        # Recover completed Recent tasks even when the previous process stopped
+        # before the extraction worker observed task_end.
+        for path in (self.directory / 'trajectories').glob('*.jsonl'):
+            tasks = {}
+            for index, line in enumerate(path.read_text(encoding='utf-8').splitlines()):
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event.setdefault('event_id', uuid.uuid5(uuid.NAMESPACE_URL, f'{path.stem}:{index}:{line}').hex)
+                task_id = event.get('task_id')
+                if event['type'] == 'task':
+                    tasks[task_id] = dict(event, events=[], status='active')
+                if task_id in tasks:
+                    tasks[task_id]['events'].append(event)
+                    if event['type'] == 'task_end':
+                        tasks[task_id]['status'] = event['status']
+            for task in tasks.values():
+                if task['status'] == 'completed':
+                    self.enqueue(task, path)
 
     def close(self):
         with self._lock:
@@ -210,6 +267,8 @@ class MemoryService:
                 f'{Path(batch["trajectory_path"]).stem}:{index}:{line}').hex)
             if event.get("task_id") == batch["source_task_id"] and event["event_id"] in batch["source_event_ids"]:
                 event["recorded_at"] = datetime.fromisoformat(event["recorded_at"]).astimezone(timezone.utc).isoformat(timespec="microseconds")
+                if event.get('occurred_at'):
+                    event['occurred_at'] = timestamp(event['occurred_at'])
                 events.append(event)
         if {event["event_id"] for event in events} != set(batch["source_event_ids"]):
             raise ValueError("Incomplete trajectory")
@@ -251,6 +310,7 @@ class MemoryService:
             for candidate in self.pending_candidates():
                 text += (f'### {candidate["candidate_id"]} ({candidate["status"]})\n\n'
                          f'{candidate["candidate_text"]}\n\n'
+                         f'Reason: {candidate["reason"] or "Awaiting consolidation"}\n\n'
                          f'Sources: {json.dumps(candidate["sources"], ensure_ascii=False)}\n\n')
             temporary = self.pending_path.with_suffix(".tmp")
             temporary.write_text(text, encoding="utf-8")

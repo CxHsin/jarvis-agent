@@ -85,7 +85,7 @@ class TaskHistory:
         if self.memory is not None:
             retained = {task["task_id"] for task in self.recent_tasks()}
             for task in self.tasks:
-                if task["status"] == "completed" and task["task_id"] not in retained:
+                if task["status"] == "completed" and (task["task_id"] not in retained or self.memory.extraction_enabled):
                     self.memory.enqueue(task, self.path)
         self.recent_path.parent.mkdir(parents=True, exist_ok=True)
         content = "# Recent\n\n"
