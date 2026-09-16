@@ -88,8 +88,10 @@ DeepSeek 缓存默认开启。Jarvis 读取 `prompt_cache_hit_tokens`、`prompt_
 
 ## 结构
 
-个人历史位于 `STATE_DIR/memory/<工作区标识>/`：`history/YYYY-MM-DD.md` 只追加用户输入、事件时间、记录时间和任务来源；`trajectories/<会话标识>.jsonl` 保存完整消息、工具结果和状态事件，模型失败回滚及上下文压缩不会删除这些原始证据。`recent/<会话标识>/recent.md` 每条消息后更新，保存在途任务和最近 `RECENT_TASK_COUNT` 个已结束任务（默认 5）。失败且没有工具执行的请求保留审计记录，但不占 Recent 窗口。恢复使用同一会话的窗口；新会话独立开始。
+个人历史位于跨工作区共享的 `STATE_DIR/memory/`：`history/YYYY-MM-DD.md` 只追加用户输入、事件时间、UTC 记录时间和任务/事件来源标识；未知事件时间为空，不以接收时间代替。`trajectories/<会话标识>.jsonl` 保存完整消息、工具结果和状态事件，模型失败回滚及上下文压缩不会删除这些原始证据。`recent/<会话标识>/recent.md` 每条消息后更新，保存在途任务和最近 `RECENT_TASK_COUNT` 个已结束任务（默认 5）。失败且没有工具执行的请求保留审计记录，但不占 Recent 窗口。恢复使用同一会话的窗口；新会话独立开始。
 
 下一任务从 Recent 的完整消息建立上下文，并经过既有压缩与 token 硬上限检查；可读 Recent 文件和原始轨迹保持完整，即使模型请求需要压缩。Recent 是可重建视图，不能通过编辑它改变原始记录。
+
+完成任务移出 Recent 时，会立即在 `memory.db` 创建幂等 Pending 批次；`pending.md` 是批次和候选的可读视图，不进入模型上下文，也不复制原始对话。后台提取使用主模型的接口与模型配置，通过独立客户端读取完整任务轨迹，提取带任务、事件来源引用的候选。失败每 60 秒重试，重启后继续；中断的提取租约最多 10 分钟后可重新领取。候选在原始证据接收时间之后 30 天没有新证据或晋级则过期，保留来源和原因。提取失败不阻塞前台请求或 Recent 淘汰。
 
 `Workspace` 负责文件访问边界和读写工具，`ToolRuntime` 负责稳定工具注册、动态搜索、权限与执行审计，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、截断、加锁和加载，`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。

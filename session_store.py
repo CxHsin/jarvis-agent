@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from task_history import TaskHistory
+from memory_service import MemoryService
 
 
 SESSION_FORMAT_VERSION = 1
@@ -219,7 +220,7 @@ class SessionStore:
         self._file = None
         self._lock = _SessionLock(self.directory / f"{session_id}.lock")
         self._write_lock = RLock()
-        self.memory_directory = self.state_dir / "memory" / workspace_key(self.root_dir)
+        self.memory_directory = self.state_dir / "memory"
         self._recent_task_count = getattr(config, "recent_task_count", 5)
         self.history = None
 
@@ -288,12 +289,15 @@ class SessionStore:
         self._lock.acquire()
         try:
             self._file = open(self.path, "a+", encoding="utf-8")
-            self.history = TaskHistory(self.memory_directory, self.session_id, self._recent_task_count)
+            self.memory = MemoryService(self.memory_directory)
+            self.history = TaskHistory(self.memory_directory, self.session_id, self._recent_task_count, self.memory)
         except OSError:
             self._lock.release()
             raise
 
     def close(self) -> None:
+        if hasattr(self, "memory"):
+            self.memory.close()
         if self._file is not None:
             self._file.close()
             self._file = None

@@ -727,6 +727,7 @@ class Agent:
         permission_policy: PermissionPolicy | None = None,
         confirm_tool: Callable | None = None,
         native_loader: Callable | None = None,
+        extraction_client: ChatCompletionsClient | Any | None = None,
     ):
         supplied_runtime = tool_runtime is not None
         self.client = client or ChatCompletionsClient(config)
@@ -811,6 +812,7 @@ class Agent:
             self.tool_functions.setdefault(name, registered.handler)
         self._runtime_task_id = "0"
         self._restore_session()
+        self.store.memory.start_worker(extraction_client or ChatCompletionsClient(self.config))
 
     def _save_runtime(self):
         if self.store:
