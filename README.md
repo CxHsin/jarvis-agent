@@ -92,6 +92,10 @@ DeepSeek 缓存默认开启。Jarvis 读取 `prompt_cache_hit_tokens`、`prompt_
 
 下一任务从 Recent 的完整消息建立上下文，并经过既有压缩与 token 硬上限检查；可读 Recent 文件和原始轨迹保持完整，即使模型请求需要压缩。Recent 是可重建视图，不能通过编辑它改变原始记录。
 
+`STATE_DIR/memory/self.md` 是用户维护的 Agent 身份、原则、能力和工具约束；只在初次创建时提供默认内容，不从经历自动生成。`memory.md` 是有效用户事实的画像投影，六个固定栏目为 `identity`、`work_preferences`、`communication`、`long_term_goals`、`constraints` 和 `current_state`，空栏目省略。画像按 UTF-8 字节数除以 4 的估算限制在 1,500 token 内；超额事实仍在数据库保留，不截断事实行。自动提取批次完成、夜间 consolidation 完成或用户修正后更新画像；夜间调度为本地凌晨 03:00，错过会补跑。相同内容不新增版本，SQLite 的 `profile_versions` 保留内容、来源事实 ID、token 估算及创建/激活时间。每个任务开始时一次性读取 self 和画像，任务内所有模型轮次使用相同前缀，新版本下个任务生效。召回只查数据库，不使用 Markdown。
+
+人工修改 `memory.md` 时保留标题及栏目，每行采用 `- {"fact_id":"原 ID","predicate":"原属性","object":"新值"}`。现有行只修改 `object`；删除整行表示忘记该事实。新增行使用 `"fact_id":null`，填写明确的属性及值。下一任务前整份校验并作为高置信度用户修正导入，旧事实失效但不删除，完整编辑原文保存在数据库来源记录。格式错误、未知 ID 或修改既有属性/栏目会明确报错，保留文件且不部分导入；后台更新不会覆盖尚未导入的人工修改。此结构化格式避免用字符串猜测用户修正的语义。
+
 完成任务移出 Recent 时，会立即在 `memory.db` 创建幂等 Pending 批次；`pending.md` 是批次和候选的可读视图，不进入模型上下文，也不复制原始对话。后台提取使用主模型的接口与模型配置，通过独立客户端读取完整任务轨迹，提取带任务、事件来源引用的候选。失败每 60 秒重试，重启后继续；中断的提取租约最多 10 分钟后可重新领取。候选在原始证据接收时间之后 30 天没有新证据或晋级则过期，保留来源和原因。提取失败不阻塞前台请求或 Recent 淘汰。
 
 `Workspace` 负责文件访问边界和读写工具，`ToolRuntime` 负责稳定工具注册、动态搜索、权限与执行审计，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、截断、加锁和加载，`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。

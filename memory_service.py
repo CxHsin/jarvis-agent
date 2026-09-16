@@ -9,6 +9,7 @@ import sqlite3
 from threading import RLock, Event, Thread
 import uuid
 from stable_memory import StableMemory, timestamp
+from memory_profile import ProfileMemory, ProfileEditError
 
 
 EXTRACTION_INSTRUCTIONS = """Extract Pending personal memory candidates from the supplied immutable task events.
@@ -35,7 +36,7 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-class MemoryService(StableMemory):
+class MemoryService(ProfileMemory, StableMemory):
     def __init__(self, directory: Path):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -64,6 +65,7 @@ class MemoryService(StableMemory):
                 trajectory_path TEXT NOT NULL, recorded_at TEXT NOT NULL, occurred_at TEXT,
                 PRIMARY KEY (candidate_id, source_task_id, source_event_id))""")
             self._init_facts(db)
+            self._init_profile(db)
         self._project()
 
     @contextmanager
@@ -107,6 +109,7 @@ class MemoryService(StableMemory):
 
     def process_pending(self, client):
         """Try each recoverable batch once; model failures never escape to a task."""
+        completed = False
         for batch in self.pending_batches():
             now = utc_now()
             token = uuid.uuid4().hex
@@ -175,6 +178,7 @@ class MemoryService(StableMemory):
                     db.execute("""UPDATE pending_batches SET status='extracted', error=NULL,
                         lease_until=NULL, claim_token=NULL WHERE source_task_id=? AND claim_token=?""",
                                (batch["source_task_id"], token))
+                completed = True
             except Exception as exc:
                 with self._lock, self._connect() as db:
                     if self._stop.is_set():
@@ -188,6 +192,12 @@ class MemoryService(StableMemory):
             self._project()
         self.expire_candidates()
         self._promote_classified()
+        if completed:
+            try:
+                self.refresh_profile()
+            except ProfileEditError:
+                # Leave human changes intact for foreground validation/import.
+                pass
 
     def expire_candidates(self, now=None):
         moment = now or datetime.now(timezone.utc)
@@ -214,7 +224,7 @@ class MemoryService(StableMemory):
                         recovered = True
                     self.process_pending(client)
                     self.consolidate_due(client)
-                except (OSError, sqlite3.Error):
+                except (OSError, sqlite3.Error, ProfileEditError):
                     # Trajectories and batches remain durable for the next attempt.
                     pass
                 self._wake.wait(retry_seconds)

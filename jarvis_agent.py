@@ -26,6 +26,7 @@ from cache_metrics import MeasuredClient, UsageLedger
 from compaction import CompactionResult, MANUAL, OVERFLOW, is_overflow_error
 from context_budget import ContextBudget
 from model_capabilities import load_capability
+from memory_profile import ProfileEditError
 from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
 from tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolCall, ToolScheduler,
                           PermissionPolicy, ProviderSession, ToolProviderAdapter, ProviderLoadError, failure)
@@ -769,7 +770,8 @@ class Agent:
         if self.store is None:
             self.store = SessionStore.create(self.config)
         self._audit_events = []
-        self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
+        self.messages: list[dict[str, Any]] = [{"role": "system", "content":
+            self.store.memory.prefix_snapshot() + "\n\n" + self._system_prompt()}]
         self.context = ContextManager(self.config, recorder=self.store)
         self.tool_functions: dict[str, ToolFunction] = {
             "read": self.workspace.read, "edit": self.workspace.edit, "bash": self.workspace.bash,
@@ -1109,6 +1111,8 @@ class Agent:
         return result
 
     def run_request(self, user_text: str) -> str | None:
+        prefix = self.store.memory.task_prefix()
+        self.messages[0] = {"role": "system", "content": prefix + "\n\n" + self._system_prompt()}
         request_offset = self.store.mark() if self.store is not None else None
         message_snapshot = deepcopy(self.messages)
         context_snapshot = self.context.snapshot()
@@ -1345,7 +1349,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
                 agent.compact_now(keep)
                 continue
-            agent.run_request(user_text)
+            try:
+                agent.run_request(user_text)
+            except ProfileEditError as exc:
+                print(f"[记忆编辑未导入] {exc}；请修正 memory.md 后重试。原文件已保留。")
     finally:
         agent.close()
 
