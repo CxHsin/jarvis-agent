@@ -1,1 +1,2 @@
 jsonschema>=4.18,<5
+sqlite-vec==0.1.9

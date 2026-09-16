@@ -14,6 +14,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from copy import deepcopy
 from urllib.parse import quote
 from dataclasses import dataclass, field, replace
@@ -122,6 +123,10 @@ class Config:
     tool_permission_mode: str = "approve-dangerous"
     provider_tool_mode: str = "emulated"
     tool_max_timeout: float = 60.0
+    embedding_base_url: str | None = None
+    embedding_api_key: str = ""
+    embedding_model: str | None = None
+    embedding_dimensions: int = 1536
 
     def __post_init__(self) -> None:
         if self.recent_task_count < 1:
@@ -132,6 +137,8 @@ class Config:
             raise ConfigurationError("PROVIDER_TOOL_MODE 必须是 native 或 emulated。")
         if not 0 < self.tool_max_timeout <= 3600:
             raise ConfigurationError("TOOL_MAX_TIMEOUT 必须大于 0 且不超过 3600 秒。")
+        if self.embedding_dimensions < 1:
+            raise ConfigurationError("EMBEDDING_DIMENSIONS 必须是正整数。")
         if self.context_window_tokens is not None and self.context_window_source == "unknown":
             object.__setattr__(self, "context_window_source", "configured")
 
@@ -213,6 +220,10 @@ class Config:
             tool_permission_mode=_setting(values, "TOOL_PERMISSION_MODE", "approve-dangerous"),
             provider_tool_mode=_setting(values, "PROVIDER_TOOL_MODE", "emulated"),
             tool_max_timeout=positive_int("TOOL_MAX_TIMEOUT", 60),
+            embedding_base_url=_setting(values, "EMBEDDING_BASE_URL") or None,
+            embedding_api_key=_setting(values, "EMBEDDING_API_KEY", "") or "",
+            embedding_model=_setting(values, "EMBEDDING_MODEL") or None,
+            embedding_dimensions=positive_int("EMBEDDING_DIMENSIONS", 1536),
             text_extensions=extensions,
             request_timeout=timeout,
             max_read_chars=positive_int("MAX_READ_CHARS", 12_000),
@@ -461,6 +472,13 @@ class Workspace:
     def edit(self, path: str, content: str, *, start_line: int | None = None, end_line: int | None = None,
              expected_hash: str | None = None, execution_context=None) -> dict[str, Any]:
         target = self._resolve(path)
+        memory_root = getattr(self.config, "state_dir", None)
+        if memory_root is not None:
+            try:
+                target.relative_to((Path(memory_root) / "memory").resolve())
+                raise WorkspaceError("Memory DB 只能通过 memory_manage 修改。")
+            except ValueError:
+                pass
         current_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
         if expected_hash is not None and expected_hash != current_hash:
             return failure("edit_conflict", "文件已改变，请重新读取后再编辑。", current_hash=current_hash)
@@ -537,6 +555,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
  {"type":"function","function":{"name":"edit","description":"编辑工作区文本文件。","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path","content"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"bash","description":"在工作区执行 shell 命令。","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":0.1,"maximum":60}},"required":["command"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"tool_search","description":"搜索可用工具。","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"additionalProperties":False}}},
+]
+TOOL_DEFINITIONS += [
+ {"type":"function","function":{"name":"memory_search","description":"Search personal memory facts.","parameters":{"type":"object","properties":{"query":{"type":"string"},"include_history":{"type":"boolean"}},"required":["query"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"memory_manage","description":"Remember, correct, or forget a personal fact.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["remember","correct","forget"]},"fact_id":{"type":"string"},"fact":{"type":"object"}},"required":["action"],"additionalProperties":False}}}
 ]
 
 TOOL_DEFINITIONS[1]["function"]["parameters"]["properties"]["expected_hash"] = {
@@ -729,6 +751,8 @@ class Agent:
         confirm_tool: Callable | None = None,
         native_loader: Callable | None = None,
         extraction_client: ChatCompletionsClient | Any | None = None,
+        embedding_client: Any | None = None,
+        rewrite_client: Any | None = None,
     ):
         supplied_runtime = tool_runtime is not None
         self.client = client or ChatCompletionsClient(config)
@@ -769,6 +793,11 @@ class Agent:
         self.client = MeasuredClient(self.client, self.usage_ledger, "主模型", config.model)
         if self.store is None:
             self.store = SessionStore.create(self.config)
+        self.store.memory.configure_retrieval(
+            embedding_client=embedding_client,
+            rewrite_client=rewrite_client or self.client,
+            embedding_model=getattr(self.config, "embedding_model", None),
+        )
         self._audit_events = []
         self.messages: list[dict[str, Any]] = [{"role": "system", "content":
             self.store.memory.prefix_snapshot() + "\n\n" + self._system_prompt()}]
@@ -786,7 +815,9 @@ class Agent:
                                  risk="high" if schema["name"] == "bash" else "medium" if schema["name"] == "edit" else "low",
                                  side_effects=("filesystem",) if schema["name"] in {"edit", "bash"} else (),
                                  concurrency="parallel" if schema["name"] in {"read", "edit"} else "serial"),
-                    self._contextual_edit if schema["name"] == "edit" else self._contextual_bash if schema["name"] == "bash" else self.tool_functions[str(schema["name"])],
+                    self._contextual_edit if schema["name"] == "edit" else self._contextual_bash if schema["name"] == "bash" else
+                    (lambda query, include_history=False: self.store.memory.search(query, include_history=include_history)) if schema["name"] == "memory_search" else
+                    self._memory_manage if schema["name"] == "memory_manage" else self.tool_functions[str(schema["name"])],
                     contextual=schema["name"] in {"edit", "bash"},
                 )
             for alias in ("list_directory", "search_file_content", "read_file"):
@@ -797,6 +828,16 @@ class Agent:
                 stable=tuple((name, "1") for name in ("read", "edit", "bash", "tool_search")),
             )
         self.tool_runtime = tool_runtime
+        if not self.tool_registry.versions("memory_search"):
+            self.tool_registry.register(
+                ToolMetadata("memory_search", "1", TOOL_DEFINITIONS[-2]["function"]),
+                lambda query, include_history=False: self.store.memory.search(query, include_history=include_history),
+            )
+        if not self.tool_registry.versions("memory_manage"):
+            self.tool_registry.register(
+                ToolMetadata("memory_manage", "1", TOOL_DEFINITIONS[-1]["function"]),
+                self._memory_manage,
+            )
         self.tool_runtime.policy = permission_policy or self.tool_runtime.policy
         if permission_policy is None and not supplied_runtime:
             self.tool_runtime.policy = PermissionPolicy(self.config.tool_permission_mode,
@@ -816,6 +857,23 @@ class Agent:
         self._restore_session()
         self.store.memory.start_worker(extraction_client or ChatCompletionsClient(self.config))
 
+    def _memory_manage(self, action, fact=None, fact_id=None):
+        user = next((m for m in reversed(self.messages) if m.get('role') == 'user'), None)
+        if not user:
+            raise ValueError('memory management requires a current user event')
+        quote = user.get('content', '')
+        task = self.store.history.tasks[-1] if self.store.history.tasks else {}
+        event = next((e for e in reversed(task.get('events', []))
+                      if e.get('type') == 'message' and e.get('message', {}).get('role') == 'user'), None)
+        if event is None:
+            raise ValueError('memory management requires a recorded current user event')
+        source = {'quote': quote, 'recorded_at': event['recorded_at'], 'source_task_id': event['task_id'],
+                  'source_event_id': event['event_id'], 'trajectory_path': str(self.store.history.path)}
+        if action == 'remember': return self.store.memory.remember(fact or {}, source=source)
+        if action == 'correct': return self.store.memory.correct(fact_id, fact or {}, source=source)
+        if action == 'forget': return self.store.memory.forget(fact_id, source=source)
+        raise ValueError('unknown memory action')
+
     def _save_runtime(self):
         if self.store:
             self.store.record_runtime(dict(self.tool_runtime.snapshot(), provider=self.provider_session.snapshot()))
@@ -830,6 +888,9 @@ class Agent:
 
     def _search_tools(self, query="", limit=8):
         result = self.tool_runtime.discover(self._runtime_task_id, query, limit)
+        if "memory" not in str(query).casefold():
+            result["tools"] = [item for item in result.get("tools", [])
+                               if item.get("tool_id") not in {"memory_search", "memory_manage"}]
         self._save_runtime()
         return result
 

@@ -177,6 +177,7 @@ class StableMemory:
             db.execute('INSERT OR IGNORE INTO fact_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                        (fact_id, source['source_task_id'], source['source_event_id'], source['trajectory_path'],
                         source['quote'], source['recorded_at'], source.get('occurred_at'), kind))
+        self._index_fact(db, fact_id)
         if not duplicate and value['predicate'] in EXCLUSIVE_PREDICATES:
             # Insert into the effective-time timeline, including late historical evidence.
             # Do not invalidate a newer state merely because its source arrived earlier.

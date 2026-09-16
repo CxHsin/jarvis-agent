@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from task_history import TaskHistory
-from memory_service import MemoryService
+from memory_service import MemoryService, OpenAIEmbeddingClient
 
 
 SESSION_FORMAT_VERSION = 1
@@ -211,6 +211,7 @@ class SessionStore:
     """Append-only durable log for one Jarvis session."""
 
     def __init__(self, config: Any, session_id: str, started_at: str):
+        self.config = config
         self.root_dir = Path(getattr(config, "root_dir"))
         self.state_dir = resolve_state_dir(config)
         self.directory = session_directory(config)
@@ -289,7 +290,14 @@ class SessionStore:
         self._lock.acquire()
         try:
             self._file = open(self.path, "a+", encoding="utf-8")
-            self.memory = MemoryService(self.memory_directory)
+            embedding = None
+            endpoint = getattr(self.config, 'embedding_base_url', None)
+            model = getattr(self.config, 'embedding_model', None)
+            if endpoint and model:
+                embedding = OpenAIEmbeddingClient(endpoint, getattr(self.config, 'embedding_api_key', ''), model,
+                                                  getattr(self.config, 'request_timeout', 60.0))
+            self.memory = MemoryService(self.memory_directory, embedding_client=embedding, embedding_model=model,
+                                        embedding_dimensions=getattr(self.config, 'embedding_dimensions', 1536))
             self.history = TaskHistory(self.memory_directory, self.session_id, self._recent_task_count, self.memory)
         except OSError:
             self._lock.release()
