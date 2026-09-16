@@ -472,13 +472,11 @@ class Workspace:
     def edit(self, path: str, content: str, *, start_line: int | None = None, end_line: int | None = None,
              expected_hash: str | None = None, execution_context=None) -> dict[str, Any]:
         target = self._resolve(path)
-        memory_root = getattr(self.config, "state_dir", None)
-        if memory_root is not None:
-            try:
-                target.relative_to((Path(memory_root) / "memory").resolve())
-                raise WorkspaceError("Memory DB 只能通过 memory_manage 修改。")
-            except ValueError:
-                pass
+        from session_store import resolve_state_dir
+        protected_roots = (resolve_state_dir(self.config).resolve(), Path(__file__).resolve().parent,
+                           Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve())
+        if any(target == root or target.is_relative_to(root) for root in protected_roots):
+            raise WorkspaceError("Agent 状态和运行时代码不可由文件工具修改；记忆只能通过 memory_manage 修改。")
         current_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
         if expected_hash is not None and expected_hash != current_hash:
             return failure("edit_conflict", "文件已改变，请重新读取后再编辑。", current_hash=current_hash)
@@ -515,18 +513,22 @@ class Workspace:
             raise WorkspaceError(f"写入文件失败: {exc}") from exc
 
     def bash(self, command: str, timeout: float = 10.0, execution_context=None) -> dict[str, Any]:
-        import subprocess
+        from shell_sandbox import start_shell
+        from session_store import resolve_state_dir
         import tempfile
         import time
         if not command or not command.strip(): raise WorkspaceError("command 不能为空。")
-        deadline = time.monotonic() + min(float(timeout), 60.0)
         with tempfile.TemporaryFile() as output_file:
             def start():
-                return subprocess.Popen(command, cwd=self.root, shell=True, stdout=output_file, stderr=output_file,
-                                        start_new_session=os.name != "nt",
-                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-            process = execution_context.commit(start) if execution_context else start()
+                return start_shell(command, self.root, resolve_state_dir(self.config), output_file,
+                                   execution_context.check if execution_context else lambda: None)
+            process = start()
             try:
+                deadline = time.monotonic() + min(float(timeout), 60.0)
+                if execution_context:
+                    execution_context.commit(process.start)
+                else:
+                    process.start()
                 while process.poll() is None:
                     if execution_context:
                         execution_context.check()
@@ -534,15 +536,7 @@ class Workspace:
                         raise TimeoutError("命令执行超时。")
                     time.sleep(0.01)
             finally:
-                if process.poll() is None:
-                    if os.name == "nt":
-                        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       creationflags=subprocess.CREATE_NO_WINDOW)
-                    else:
-                        import signal
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                process.close()
             output_file.seek(0)
             limit = max(1000, self.config.max_read_chars)
             data = output_file.read(limit + 1)
@@ -816,6 +810,7 @@ class Agent:
                     ToolMetadata(tool_id=str(schema["name"]), version="1", schema=schema,
                                  risk="high" if schema["name"] == "bash" else "medium" if schema["name"] == "edit" else "low",
                                  side_effects=("memory",) if schema["name"] == "memory_manage" else ("filesystem",) if schema["name"] in {"edit", "bash"} else (),
+                                 timeout=60 if schema["name"] == "bash" else 30,
                                  concurrency="parallel" if schema["name"] in {"read", "edit"} else "serial"),
                     self._contextual_edit if schema["name"] == "edit" else self._contextual_bash if schema["name"] == "bash" else
                     (lambda query, include_history=False: self.store.memory.search(query, include_history=include_history)) if schema["name"] == "memory_search" else
