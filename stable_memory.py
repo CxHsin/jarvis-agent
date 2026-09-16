@@ -60,9 +60,10 @@ class StableMemory:
     def facts(self, include_inactive=False):
         """Read facts with immutable sources; history is opt-in."""
         with self._lock, self._connect() as db:
+            now = timestamp()
             rows = [dict(row) for row in db.execute('SELECT * FROM memory_facts ' +
-                    ('' if include_inactive else "WHERE status='active' ") +
-                    'ORDER BY valid_from, fact_id')]
+                    ('' if include_inactive else "WHERE status!='forgotten' AND valid_from<=? AND (valid_to IS NULL OR valid_to>?) ") +
+                    'ORDER BY valid_from, fact_id', () if include_inactive else (now, now))]
             for row in rows:
                 row['sources'] = [dict(source) for source in db.execute(
                     'SELECT * FROM fact_sources WHERE fact_id=? ORDER BY recorded_at, source_event_id',

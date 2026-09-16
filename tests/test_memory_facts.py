@@ -205,3 +205,10 @@ class MemoryFactsTests(SessionTestBase):
             self.assertEqual(len(store.memory.facts()[0]['sources']), 1)
             store.memory.process_pending(StableModel())
             self.assertEqual(len(store.memory.facts()[0]['sources']), 2)
+
+    def test_future_effective_state_does_not_hide_current_fact_early(self):
+        with SessionStore.create(self.config()) as store:
+            current = store.memory.remember(self.fact('Paris'), source=self.source('Paris'))
+            store.memory.remember(self.fact('London', occurred_at='2099-01-01T00:00:00Z'),
+                                  source=self.source('Future confirmed residence', event='future'))
+            self.assertEqual([f['fact_id'] for f in store.memory.facts()], [current])
