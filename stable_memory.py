@@ -150,12 +150,15 @@ class StableMemory:
         now = timestamp()
         matches = list(db.execute('SELECT * FROM memory_facts WHERE subject=? AND predicate=?',
                                  (value['subject'], value['predicate'])))
-        # A forget decision is a tombstone for this assertion and its old evidence.
+        # Explicit corrections and forgetting retire the assertion's old evidence,
+        # including multi-valued predicates. New user evidence can establish it again.
         if kind == 'user_statement':
             for old in matches:
-                if old['status'] == 'forgotten' and old['object_normalized'] == value['object_normalized']:
+                retired = old['status'] == 'forgotten' or (
+                    old['status'] == 'invalidated' and 'correction' in (old['invalidation_reason'] or '').lower())
+                if retired and old['object_normalized'] == value['object_normalized']:
                     if max(source['recorded_at'] for source in sources) <= old['updated_at']:
-                        self._decision(db, candidate_id, old['fact_id'], None, 'suppressed', 'Forgotten source cannot resurrect a fact')
+                        self._decision(db, candidate_id, old['fact_id'], None, 'suppressed', 'Retired evidence cannot resurrect a fact')
                         return None
         duplicate = next((old for old in matches if old['status'] == 'active' and
                           old['object_normalized'] == value['object_normalized'] and

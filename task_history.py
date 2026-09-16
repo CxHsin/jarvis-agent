@@ -49,6 +49,7 @@ class TaskHistory:
         event.setdefault("occurred_at", None)
         if event["type"] == "task":
             event["task_id"] = f"{self.session_id}:{uuid.uuid4().hex}"
+            event["recent_task_count"] = self.count
         elif self.tasks:
             event["task_id"] = self.tasks[-1]["task_id"]
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +86,7 @@ class TaskHistory:
         if self.memory is not None:
             retained = {task["task_id"] for task in self.recent_tasks()}
             for task in self.tasks:
-                if task["status"] == "completed" and (task["task_id"] not in retained or self.memory.extraction_enabled):
+                if task["status"] == "completed" and task["task_id"] not in retained:
                     self.memory.enqueue(task, self.path)
         self.recent_path.parent.mkdir(parents=True, exist_ok=True)
         content = "# Recent\n\n"

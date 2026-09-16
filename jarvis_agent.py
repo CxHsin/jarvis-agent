@@ -753,6 +753,7 @@ class Agent:
         extraction_client: ChatCompletionsClient | Any | None = None,
         embedding_client: Any | None = None,
         rewrite_client: Any | None = None,
+        memory_authorization_client: Any | None = None,
     ):
         supplied_runtime = tool_runtime is not None
         self.client = client or ChatCompletionsClient(config)
@@ -767,6 +768,7 @@ class Agent:
                   f"能力来源={self.config.capability_source} "
                   f"核对日期={self.config.capability_checked_at}")
         self.workspace = Workspace(self.config)
+        self.memory_authorization_client = memory_authorization_client or ChatCompletionsClient(self.config)
         self.tool_registry = tool_runtime.registry if tool_runtime is not None else ToolRegistry()
         if compression_client is not None:
             self.compression_client = compression_client
@@ -794,7 +796,7 @@ class Agent:
         if self.store is None:
             self.store = SessionStore.create(self.config)
         self.store.memory.configure_retrieval(
-            embedding_client=embedding_client,
+            embedding_client=embedding_client if embedding_client is not None else self.store.memory.embedding_client,
             rewrite_client=rewrite_client or self.client,
             embedding_model=getattr(self.config, "embedding_model", None),
         )
@@ -813,12 +815,12 @@ class Agent:
                 self.tool_registry.register(
                     ToolMetadata(tool_id=str(schema["name"]), version="1", schema=schema,
                                  risk="high" if schema["name"] == "bash" else "medium" if schema["name"] == "edit" else "low",
-                                 side_effects=("filesystem",) if schema["name"] in {"edit", "bash"} else (),
+                                 side_effects=("memory",) if schema["name"] == "memory_manage" else ("filesystem",) if schema["name"] in {"edit", "bash"} else (),
                                  concurrency="parallel" if schema["name"] in {"read", "edit"} else "serial"),
                     self._contextual_edit if schema["name"] == "edit" else self._contextual_bash if schema["name"] == "bash" else
                     (lambda query, include_history=False: self.store.memory.search(query, include_history=include_history)) if schema["name"] == "memory_search" else
-                    self._memory_manage if schema["name"] == "memory_manage" else self.tool_functions[str(schema["name"])],
-                    contextual=schema["name"] in {"edit", "bash"},
+                    self._contextual_memory_manage if schema["name"] == "memory_manage" else self.tool_functions[str(schema["name"])],
+                    contextual=schema["name"] in {"edit", "bash", "memory_manage"},
                 )
             for alias in ("list_directory", "search_file_content", "read_file"):
                 if (alias, "1") not in self.tool_registry._tools:
@@ -835,8 +837,8 @@ class Agent:
             )
         if not self.tool_registry.versions("memory_manage"):
             self.tool_registry.register(
-                ToolMetadata("memory_manage", "1", TOOL_DEFINITIONS[-1]["function"]),
-                self._memory_manage,
+                ToolMetadata("memory_manage", "1", TOOL_DEFINITIONS[-1]["function"], side_effects=("memory",)),
+                self._contextual_memory_manage, contextual=True,
             )
         self.tool_runtime.policy = permission_policy or self.tool_runtime.policy
         if permission_policy is None and not supplied_runtime:
@@ -857,7 +859,9 @@ class Agent:
         self._restore_session()
         self.store.memory.start_worker(extraction_client or ChatCompletionsClient(self.config))
 
-    def _memory_manage(self, action, fact=None, fact_id=None):
+    def _contextual_memory_manage(self, context, action, fact=None, fact_id=None):
+        from memory_authorization import authorize
+        context.check()
         user = next((m for m in reversed(self.messages) if m.get('role') == 'user'), None)
         if not user:
             raise ValueError('memory management requires a current user event')
@@ -867,11 +871,15 @@ class Agent:
                       if e.get('type') == 'message' and e.get('message', {}).get('role') == 'user'), None)
         if event is None:
             raise ValueError('memory management requires a recorded current user event')
+        quote = event['message']['content']
+        target = next((item for item in self.store.memory.facts(include_inactive=True)
+                       if item['fact_id'] == fact_id), None) if fact_id else None
+        authorize(self.memory_authorization_client, quote, action, fact, target)
         source = {'quote': quote, 'recorded_at': event['recorded_at'], 'source_task_id': event['task_id'],
                   'source_event_id': event['event_id'], 'trajectory_path': str(self.store.history.path)}
-        if action == 'remember': return self.store.memory.remember(fact or {}, source=source)
-        if action == 'correct': return self.store.memory.correct(fact_id, fact or {}, source=source)
-        if action == 'forget': return self.store.memory.forget(fact_id, source=source)
+        if action == 'remember': return context.commit(lambda: self.store.memory.remember(fact or {}, source=source))
+        if action == 'correct': return context.commit(lambda: self.store.memory.correct(fact_id, fact or {}, source=source))
+        if action == 'forget': return context.commit(lambda: self.store.memory.forget(fact_id, source=source))
         raise ValueError('unknown memory action')
 
     def _save_runtime(self):

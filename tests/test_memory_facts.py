@@ -27,6 +27,23 @@ class StableModel:
 
 
 class MemoryFactsTests(SessionTestBase):
+    def test_corrected_nonexclusive_assertion_cannot_return_from_old_evidence(self):
+        with SessionStore.create(self.config(recent_task_count=1)) as store:
+            store.record_task(1, 'I prefer concise responses')
+            store.end_task()
+            store.record_task(2, 'next')
+            store.end_task()
+            store.memory.process_pending(StableModel())
+            original = store.memory.facts()[0]
+            from stable_memory import timestamp
+            corrected = store.memory.correct(original['fact_id'], dict(subject='USER',
+                predicate='communication_style', object='detailed', category='communication'),
+                source=self.source('Correction: detailed', timestamp(), 'correction'))
+            store.record_task(3, 'next')
+            store.end_task()
+            store.memory.process_pending(StableModel(candidate_text='Enjoys concise replies'))
+            self.assertEqual([fact['fact_id'] for fact in store.memory.facts()], [corrected])
+
     def fact(self, object, **updates):
         return dict(subject='USER', predicate='primary_residence', object=object,
                     category='current_state', **updates)
@@ -123,12 +140,16 @@ class MemoryFactsTests(SessionTestBase):
             self.assertEqual(store.memory.facts(include_inactive=True)[0]['status'], 'forgotten')
             self.assertTrue(any(d['decision'] == 'suppressed' for d in store.memory.conflicts()))
 
-    def test_agent_promotes_eligible_fact_on_task_end_without_waiting_for_eviction(self):
+    def test_agent_extracts_only_after_recent_eviction(self):
         with redirect_stdout(StringIO()):
-            agent = Agent(self.config(recent_task_count=10), FakeClient([{'role': 'assistant', 'content': 'ok'}]),
+            agent = Agent(self.config(recent_task_count=1), FakeClient([{'role': 'assistant', 'content': 'ok'}] * 2),
                           extraction_client=StableModel())
             self.agents.append(agent)
             agent.run_request('I prefer concise responses')
+            agent.store.memory._recover_completed()
+            self.assertEqual(agent.store.memory.pending_batches(), [])
+            self.assertEqual(agent.store.memory.facts(), [])
+            agent.run_request('Next task')
             deadline = time.monotonic() + 3
             while not agent.store.memory.facts() and time.monotonic() < deadline:
                 time.sleep(0.01)

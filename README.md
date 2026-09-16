@@ -4,6 +4,10 @@
 
 Memory tools are discovered with `tool_search`: `memory_search` and `memory_manage` (`remember`, `correct`, `forget`). Retrieval reads `STATE_DIR/memory/memory.db` through SQLite FTS5 and sqlite-vec; it never reads `memory.md`. Configure an OpenAI-compatible embedding endpoint with `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, and `EMBEDDING_DIMENSIONS`. Without these settings, FTS5 results remain available and the response reports vector retrieval as unavailable. Direct `edit` calls are blocked for a configured in-workspace memory directory; a generic shell remains able to mutate files, so this is a runtime guard rather than a filesystem sandbox. Query rewrites and HyDE passages are ephemeral and are never stored as Memory facts.
 
+`memory_manage` separately verifies the proposed change against the current original user message using the configured chat model; mentioning information alone is not an explicit remember request. Ambiguous, unavailable or malformed authorization results reject the write. This semantic check is model-dependent. Memory writes also honor runtime cancellation and permission revocation. Retrieval returns at most eight whole facts with provenance, bounded to an estimated 1,000 tokens (UTF-8 bytes / 4); oversized facts are omitted rather than truncated. Embedding failures preserve facts and fall back to keyword retrieval; missing embeddings are retried on later searches.
+
+Profile publication uses a durable SQLite outbox: fact IDs and profile versions commit before `memory.md` is replaced. Interrupted writes recover at startup or the next task. If a newer human edit conflicts with an interrupted publication, it is preserved and reported: save that edit separately, restore the committed content returned by `MemoryService.profile_snapshot()`, then reapply the edit against those committed IDs.
+
 ## 启动
 
 1. 复制 `.env.example` 为 `.env`，填写 `MODEL` 和 `API_KEY`；`BASE_URL` 可以指向任何兼容 Chat Completions 的服务。可选的 `COMPRESSION_MODEL` 用于上下文摘要，未填写时使用主模型。

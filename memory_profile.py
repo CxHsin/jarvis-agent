@@ -3,6 +3,7 @@
 import json
 import math
 import uuid
+from contextlib import contextmanager
 
 from stable_memory import timestamp
 
@@ -44,12 +45,17 @@ class ProfileMemory:
             version INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL,
             source_fact_ids TEXT NOT NULL, token_count INTEGER NOT NULL,
             created_at TEXT NOT NULL, activated_at TEXT NOT NULL)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS profile_publication (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            observed TEXT NOT NULL, content TEXT NOT NULL)''')
         if not db.execute('SELECT 1 FROM profile_versions').fetchone():
             now = timestamp()
             db.execute('INSERT INTO profile_versions(content,source_fact_ids,token_count,created_at,activated_at) VALUES (?,?,?,?,?)',
                        (PROFILE_HEADER, '[]', profile_tokens(PROFILE_HEADER), now, now))
         if not self.profile_path.exists():
             self.profile_path.write_text(self._latest_profile(db)['content'], encoding='utf-8')
+        # A row seen during startup came from a previously committed transaction.
+        self._recover_profile_publication(db)
         try:
             with self.self_path.open('x', encoding='utf-8') as stream:
                 stream.write(DEFAULT_SELF)
@@ -60,6 +66,41 @@ class ProfileMemory:
         row = dict(db.execute('SELECT * FROM profile_versions ORDER BY version DESC LIMIT 1').fetchone())
         row['source_fact_ids'] = json.loads(row['source_fact_ids'])
         return row
+
+    def _recover_profile_publication(self, db):
+        pending = db.execute('SELECT * FROM profile_publication WHERE singleton=1').fetchone()
+        if pending is None:
+            return True
+        observed = self.profile_path.read_text(encoding='utf-8')
+        if observed not in (pending['observed'], pending['content']):
+            # A newer human edit wins over a delayed projection. Never overwrite it.
+            return False
+        if observed != pending['content']:
+            temporary = self.profile_path.with_name(f'.memory-{uuid.uuid4().hex}.tmp')
+            try:
+                temporary.write_text(pending['content'], encoding='utf-8')
+                if self.profile_path.read_text(encoding='utf-8') != observed:
+                    return False
+                temporary.replace(self.profile_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        db.execute('DELETE FROM profile_publication WHERE singleton=1')
+        return True
+
+    @contextmanager
+    def _profile_transaction(self):
+        """Commit fact IDs and the publication intent before exposing either on disk."""
+        with self._lock:
+            with self._connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                if not self._recover_profile_publication(db):
+                    raise ProfileEditError('memory.md changed after an interrupted publication; preserve your edit and restore the committed profile before retrying')
+                yield db
+            # A crash here leaves the durable outbox for the next task or startup.
+            with self._connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                if not self._recover_profile_publication(db):
+                    raise ProfileEditError('memory.md changed after profile commit; your newer edit was preserved')
 
     def profile_snapshot(self):
         """Read the activated DB projection; never use Markdown for recall."""
@@ -107,8 +148,7 @@ class ProfileMemory:
 
     def import_profile_edits(self):
         """Validate the entire edit before atomically applying user corrections."""
-        with self._lock, self._connect() as db:
-            db.execute('BEGIN IMMEDIATE')
+        with self._profile_transaction() as db:
             previous = self._latest_profile(db)
             observed = self.profile_path.read_text(encoding='utf-8')
             if observed == previous['content']:
@@ -172,8 +212,7 @@ class ProfileMemory:
 
     def refresh_profile(self):
         """Publish active facts at a consolidation boundary without version churn."""
-        with self._lock, self._connect() as db:
-            db.execute('BEGIN IMMEDIATE')
+        with self._profile_transaction() as db:
             previous = self._latest_profile(db)
             observed = self.profile_path.read_text(encoding='utf-8')
             if observed != previous['content']:
@@ -204,7 +243,6 @@ class ProfileMemory:
             db.execute('INSERT INTO profile_versions(content,source_fact_ids,token_count,created_at,activated_at) VALUES (?,?,?,?,?)',
                        (content, json.dumps(ids), profile_tokens(content), now, now))
         if observed != content:
-            temporary = self.profile_path.with_suffix('.tmp')
-            temporary.write_text(content, encoding='utf-8')
-            temporary.replace(self.profile_path)
+            db.execute('INSERT OR REPLACE INTO profile_publication(singleton,observed,content) VALUES (1,?,?)',
+                       (observed, content))
         return self._latest_profile(db)
