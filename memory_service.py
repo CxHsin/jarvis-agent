@@ -288,7 +288,7 @@ class MemoryService(MemoryRetrieval, ProfileMemory, StableMemory):
                 if task['status'] == 'completed' and task['task_id'] not in retained:
                     self.enqueue(task, path)
 
-    def close(self):
+    def close(self, *, wait=False):
         with self._lock:
             self._stop.set()
             self._wake.set()
@@ -298,7 +298,7 @@ class MemoryService(MemoryRetrieval, ProfileMemory, StableMemory):
                         lease_until=NULL, claim_token=NULL WHERE claim_token=?""",
                                    [(token,) for token in self._claims])
         if self._worker is not None:
-            self._worker.join(timeout=0.1)
+            self._worker.join(timeout=None if wait else 0.1)
 
     def _read_sources(self, batch):
         events = []

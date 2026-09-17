@@ -141,7 +141,11 @@ class PendingTests(SessionTestBase):
                 self.assertGreater(updated["last_evidence_at"], original["last_evidence_at"])
 
     def test_shutdown_during_extraction_leaves_batch_recoverable(self):
-        entered, release = Event(), Event()
+        from application import Application
+        from threading import Thread
+
+        entered, release, shutdown_finished = Event(), Event(), Event()
+        observations = []
 
         class SlowExternalModel:
             def complete(self, messages, tools, tool_choice):
@@ -149,20 +153,39 @@ class PendingTests(SessionTestBase):
                 release.wait(5)
                 return {"content": '{"candidates": []}'}
 
-        store = SessionStore.create(self.config(recent_task_count=1))
+            def close(self):
+                observations.append(release.is_set())
+
+        app = Application(self.config(recent_task_count=1),
+                          client=FakeClient([{"content": "ok"}] * 2),
+                          extraction_client=SlowExternalModel())
+        agent = app.create_session()
+        memory = agent.store.memory
+        session_id = agent.store.session_id
+        agent.run_request("preference")
+        agent.run_request("next")
+        self.assertTrue(entered.wait(2))
+
+        def shutdown():
+            app.close()
+            shutdown_finished.set()
+
+        worker = Thread(target=shutdown)
+        worker.start()
         try:
-            store.record_task(1, "preference")
-            store.end_task()
-            store.record_task(2, "next")
-            store.end_task()
-            store.memory.start_worker(SlowExternalModel())
-            self.assertTrue(entered.wait(2))
-            session_id = store.session_id
-            store.close()
+            deadline = time.monotonic() + 2
+            while memory.pending_batches()[0]['status'] != 'failed' and time.monotonic() < deadline:
+                shutdown_finished.wait(0.01)
+            self.assertEqual(memory.pending_batches()[0]['status'], 'failed')
+            self.assertFalse(shutdown_finished.wait(0.3))
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(observations, [True])
             with SessionStore.resume(self.config(recent_task_count=1), session_id) as resumed:
-                self.assertEqual(resumed.memory.pending_batches()[0]["status"], "failed")
                 resumed.memory.process_pending(FakeClient([{"content": '{"candidates": []}'}]))
                 self.assertEqual(resumed.memory.pending_batches()[0]["status"], "extracted")
         finally:
             release.set()
-            store.close()
+            worker.join(5)
+            app.close()

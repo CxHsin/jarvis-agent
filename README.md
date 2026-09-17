@@ -111,4 +111,22 @@ DeepSeek 缓存默认开启。Jarvis 读取 `prompt_cache_hit_tokens`、`prompt_
 
 完成任务移出 Recent 时，会立即在 `memory.db` 创建幂等 Pending 批次；`pending.md` 是批次和候选的可读视图，不进入模型上下文，也不复制原始对话。后台提取使用主模型的接口与模型配置，通过独立客户端读取完整任务轨迹，提取带任务、事件来源引用的候选。失败每 60 秒重试，重启后继续；中断的提取租约最多 10 分钟后可重新领取。候选在原始证据接收时间之后 30 天没有新证据或晋级则过期，保留来源和原因。提取失败不阻塞前台请求或 Recent 淘汰。
 
+`configuration.py` 负责环境配置和全局权限默认值，`model_client.py` 负责模型通信与容量解析；原来的 `jarvis_agent.Config`、`ChatCompletionsClient`、异常类型和 CLI 入口继续可用。`Application` 装配客户端与一个共享个人记忆服务，后台提取随应用启动首个会话而运行，关闭单个会话只释放该会话记录与锁。应用退出先关闭全部会话，再停止并等待记忆后台调用返回，把未完成批次留作可恢复状态，最后关闭各客户端；同一注入客户端只关闭一次。内置网络客户端受请求超时限制，宿主注入客户端也须保证调用最终返回。
+
+多会话宿主使用同一个应用：
+
+```python
+from jarvis_agent import Config
+from application import Application
+
+with Application(Config.from_env(), client=model_client) as app:
+    first = app.create_session()
+    second = app.create_session()
+    first.run_request("第一段对话")
+    first.close()
+    second.run_request("第二段对话仍可访问共享记忆")
+```
+
+`Application` 接受主模型、压缩、提取、embedding、查询改写及记忆授权客户端；`create_session` 接受既有工具运行时、权限策略、确认回调与原生供应商宿主注入。消息、Recent、上下文、权限与请求计量属于会话，不能通过共享模型客户端把其他会话消息混入请求。`Agent(config, ...)` 仍可直接使用，它为兼容调用创建独立应用并在 `Agent.close()` 时关闭。`SessionStore.create/resume` 的独立调用保留 `store.memory` 访问，由装配层提供无后台线程的记忆服务；`SessionStore.close()` 不负责关闭记忆。手动启动记忆 worker 的旧宿主须显式关闭它，或改用 `Application` 管理。现有磁盘格式、会话跨进程锁与数据库并发保护保持不变。
+
 `Workspace` 负责文件访问边界和读写工具，`ToolRuntime` 负责稳定工具注册、动态搜索、权限与执行审计，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、截断、加锁和加载，`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。

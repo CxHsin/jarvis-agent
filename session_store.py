@@ -18,7 +18,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from task_history import TaskHistory
-from memory_service import MemoryService, OpenAIEmbeddingClient
 
 
 SESSION_FORMAT_VERSION = 1
@@ -230,9 +229,14 @@ class SessionStore:
         return self.history.recent_path
 
     @classmethod
-    def create(cls, config: Any) -> "SessionStore":
+    def create(cls, config: Any, *, memory=None) -> "SessionStore":
+        if memory is None:
+            from application import standalone_store
+            return standalone_store(config)
         moment = datetime.now()
         store = cls(config, new_session_id(moment), moment.isoformat(timespec="milliseconds"))
+        if memory is not None:
+            store.memory = memory
         store._open()
         store._append(
             {
@@ -246,7 +250,10 @@ class SessionStore:
         return store
 
     @classmethod
-    def resume(cls, config: Any, session_id: str | None = None) -> "SessionStore":
+    def resume(cls, config: Any, session_id: str | None = None, *, memory=None) -> "SessionStore":
+        if memory is None:
+            from application import standalone_store
+            return standalone_store(config, session_id=session_id, resume=True)
         directory = session_directory(config)
         candidates: list[tuple[str, float, str, Path]] = []
         if directory.is_dir():
@@ -271,6 +278,8 @@ class SessionStore:
         else:
             raise SessionNotFoundError("当前工作区没有可恢复的会话记录。")
         store = cls(config, chosen[2], chosen[0])
+        if memory is not None:
+            store.memory = memory
         store._open(existing=True)
         return store
 
@@ -290,22 +299,15 @@ class SessionStore:
         self._lock.acquire()
         try:
             self._file = open(self.path, "a+", encoding="utf-8")
-            embedding = None
-            endpoint = getattr(self.config, 'embedding_base_url', None)
-            model = getattr(self.config, 'embedding_model', None)
-            if endpoint and model:
-                embedding = OpenAIEmbeddingClient(endpoint, getattr(self.config, 'embedding_api_key', ''), model,
-                                                  getattr(self.config, 'request_timeout', 60.0))
-            self.memory = MemoryService(self.memory_directory, embedding_client=embedding, embedding_model=model,
-                                        embedding_dimensions=getattr(self.config, 'embedding_dimensions', 1536))
             self.history = TaskHistory(self.memory_directory, self.session_id, self._recent_task_count, self.memory)
-        except OSError:
+        except BaseException:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
             self._lock.release()
             raise
 
     def close(self) -> None:
-        if hasattr(self, "memory"):
-            self.memory.close()
         if self._file is not None:
             self._file.close()
             self._file = None
