@@ -38,12 +38,22 @@ def start_shell(command, workspace, protected, output, check=lambda: None):
 
 class WindowsShell:
     """A suspended launch assigned to a kill-on-close job before any user code runs."""
+    PREPARE_TIMEOUT = 30.0
+
     def __init__(self, command, workspace, protected, output, check):
         import ctypes as c
         from ctypes import wintypes as w
         import msvcrt
         self.c = c
         self.check = check
+        setup_deadline = time.monotonic() + self.PREPARE_TIMEOUT
+
+        def setup_check():
+            check()
+            if time.monotonic() >= setup_deadline:
+                raise SandboxUnavailable('Timed out preparing shell isolation')
+
+        self.check = setup_check
         self.kernel = c.WinDLL('kernel32', use_last_error=True)
         self.userenv = c.WinDLL('userenv', use_last_error=True)
         self.advapi = c.WinDLL('advapi32', use_last_error=True)
@@ -105,15 +115,15 @@ class WindowsShell:
             self._check(self.mutex)
             waiting_since = time.monotonic()
             while self.wait_for(self.mutex, 100) not in (0, 0x80):
-                check()
-                if time.monotonic() - waiting_since >= 30:
+                self.check()
+                if time.monotonic() - waiting_since >= self.PREPARE_TIMEOUT:
                     raise SandboxUnavailable('Timed out waiting for shell isolation setup')
             self.mutex_owned = True
             if workspace == protected or workspace.is_relative_to(protected):
                 raise SandboxUnavailable('Workspace must not be inside the protected state directory')
             protected.mkdir(parents=True, exist_ok=True)
             for path in {workspace, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve()}:
-                _verify_tree(path, protected, check)
+                _verify_tree(path, protected, self.check)
             create_profile = api(self.userenv, 'CreateAppContainerProfile',
                 [w.LPCWSTR, w.LPCWSTR, w.LPCWSTR, c.c_void_p, w.DWORD, c.POINTER(c.c_void_p)], c.c_long)
             hr = create_profile(self.name, self.name, 'Isolated Jarvis shell', None, 0, c.byref(self.sid))
@@ -202,8 +212,12 @@ class WindowsShell:
 
     def _acl(self, path, operation, access):
         self.check()
-        self._set_acl(path, {'grant': 1, 'deny': 3}[operation],
-                      {'F': 0x1f01ff, 'M': 0x1301bf, 'RX': 0x1200a9}[access])
+        mask = {'F': 0x1f01ff, 'M': 0x1301bf, 'RX': 0x1200a9}[access]
+        # DELETE on an existing file is not enough to remove it. Windows
+        # checks DELETE_CHILD on its parent directory as well.
+        if operation == 'grant' and access == 'M' and path.is_dir():
+            mask |= 0x40  # FILE_DELETE_CHILD
+        self._set_acl(path, {'grant': 1, 'deny': 3}[operation], mask)
         self.granted.append((path, operation))
 
     def _allow_tree(self, path, access):
