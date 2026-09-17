@@ -121,12 +121,12 @@ class CompactionService:
             f"{CONTEXT_COMPRESSED_MARKER}\n<context_summary>{summary}</context_summary>"
         )
         kept_suffix = [dict(message) for message in messages[cut_index:]]
+        self._record(reason, cut_index, checkpoint_content, method, compressed_call_ids)
         messages[:] = (
             [dict(messages[0])]
             + [{"role": "user", "content": checkpoint_content}]
             + kept_suffix
         )
-        self._record(reason, cut_index, checkpoint_content, method, compressed_call_ids)
         self._mark_compressed(archive, evidence, compressed_call_ids)
 
         return CompactionResult(

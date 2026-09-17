@@ -439,6 +439,7 @@ def test_cancelled_batch_keeps_tool_pairing_and_audits(tmp_path):
         raise KeyboardInterrupt
     register(agent, "cancel_first", stop)
     register(agent, "cancel_next", lambda: pytest.fail("cancelled tool executed"))
+    session_id = agent.store.session_id
     try:
         assert agent.run_request("cancel") is None
         assert cancelled.is_set()
@@ -450,6 +451,14 @@ def test_cancelled_batch_keeps_tool_pairing_and_audits(tmp_path):
                    if isinstance(e.get("error"), dict))
     finally:
         agent.close()
+    resumed = Agent(config(tmp_path), Client(), resume=session_id)
+    try:
+        restored_calls = {c["id"] for m in resumed.messages for c in m.get("tool_calls", [])}
+        restored_replies = {m["tool_call_id"] for m in resumed.messages if m["role"] == "tool"}
+        assert restored_calls == restored_replies == calls
+        assert all(result["cancelled"] for result in tool_results(resumed)[1:])
+    finally:
+        resumed.close()
 
 
 def test_session_policy_cannot_be_widened_by_restart_config(tmp_path):

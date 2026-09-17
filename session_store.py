@@ -103,6 +103,7 @@ class SessionContents:
     warnings: tuple[str, ...] = ()
     runtime: dict[str, Any] = field(default_factory=dict)
     audit: list[dict[str, Any]] = field(default_factory=list)
+    has_checkpoint: bool = False
 
 
 class _SessionLock:
@@ -223,12 +224,15 @@ def _read_records(text: str) -> tuple[list[dict[str, Any]], list[str]]:
 
 
 def _visible_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Compatibility projection for the existing request rollback boundary."""
+    """Project context validity without rolling back independent durable facts."""
     visible = []
     for record in records:
-        if record.get("type") == "context_reset":
+        if record.get("type") in {"context_reset", "context_rollback"}:
             through = record["through_sequence"]
-            visible = [event for event in visible if event.get("sequence", 0) <= through]
+            visible = [event for event in visible if event.get("sequence", 0) <= through
+                       or event.get("type") in {"runtime", "tool_audit"}]
+            if "runtime" in record:
+                visible.append(dict(record, type="runtime", state=record["runtime"]))
         else:
             visible.append(record)
     return visible
@@ -255,6 +259,7 @@ class SessionStore:
         self._sequence = 0
         self._task_id = None
         self._needs_separator = False
+        self._history_dirty = False
 
     @property
     def recent_path(self) -> Path:
@@ -343,10 +348,7 @@ class SessionStore:
                     if record.get("type") == RECORD_TASK:
                         self._task_id = record.get("task_id")
             self._file = open(self.path, "a+", encoding="utf-8")
-            self.history = TaskHistory(
-                self.memory_directory, self.session_id, self._recent_task_count, self.memory,
-                event_path=self.path if self._format_version == SESSION_FORMAT_VERSION else None,
-            )
+            self._refresh_history()
         except BaseException:
             if self._file is not None:
                 self._file.close()
@@ -359,6 +361,13 @@ class SessionStore:
             self._file.close()
             self._file = None
         self._lock.release()
+
+    def _refresh_history(self) -> None:
+        self.history = TaskHistory(
+            self.memory_directory, self.session_id, self._recent_task_count, self.memory,
+            event_path=self.path if self._format_version == SESSION_FORMAT_VERSION else None,
+        )
+        self._history_dirty = False
 
     def __enter__(self) -> "SessionStore":
         return self
@@ -390,23 +399,47 @@ class SessionStore:
         self._file.flush()
         os.fsync(self._file.fileno())
         self._sequence = int(record.get("sequence", self._sequence))
-        self.history.record(record)
+        if self._format_version == SESSION_FORMAT_VERSION:
+            try:
+                if self._history_dirty:
+                    self._refresh_history()
+                else:
+                    self.history.record(record)
+            except Exception as exc:
+                # The canonical commit succeeded. A derived-view error must not
+                # make callers leave live state behind the recoverable state.
+                self._history_dirty = True
+                print(f"[会话投影] 原始事件已保存，派生视图等待重建: {exc}", file=sys.stderr)
+        else:
+            self.history.record(record)
         return self._file.tell()
 
-    def end_task(self, status: str = "completed") -> None:
+    def end_task(self, status: str = "completed", *, context_valid: bool | None = None) -> None:
+        record = {"type": "task_end", "status": status,
+                  "context_valid": status != "failed" if context_valid is None else context_valid}
         if status == "failed" and self._format_version == 1:
-            self.history.record({"type": "task_end", "status": status})
+            self.history.record(record)
         else:
-            self._append({"type": "task_end", "status": status})
+            self._append(record)
 
     def recent_messages(self) -> list[dict[str, Any]]:
+        if self._history_dirty:
+            self._refresh_history()
         return self.history.messages()
+
+    def context_messages(self) -> list[dict[str, Any]]:
+        """Keep committed compaction authoritative over the raw Recent view."""
+        contents = self.load()
+        return contents.messages if contents.has_checkpoint else self.recent_messages()
 
     def record_recent_context(self, messages: Sequence[Mapping[str, Any]]) -> None:
         self._append({"type": "recent_context", "messages": list(messages)})
 
-    def record_runtime(self, state: Mapping[str, Any]) -> None:
-        self._append({"type": "runtime", "state": dict(state)})
+    def record_runtime(self, state: Mapping[str, Any], audit: Mapping[str, Any] | None = None) -> None:
+        record = {"type": "runtime", "state": dict(state)}
+        if audit is not None:
+            record["audit"] = dict(audit)
+        self._append(record)
 
     def record_tool_audit(self, event: Mapping[str, Any]) -> None:
         self._append({"type": "tool_audit", "event": dict(event)})
@@ -461,6 +494,18 @@ class SessionStore:
         self._file.truncate()
         self._file.flush()
 
+    def rollback_context(self, boundary: int, runtime: Mapping[str, Any],
+                         audit: Sequence[Mapping[str, Any]] = ()) -> None:
+        """Commit context exclusion and retained runtime as a single transition."""
+        if self._format_version == 1:
+            self.truncate_to(boundary)
+            self.record_runtime(runtime)
+            for event in audit:
+                self.record_tool_audit(event)
+            return
+        self._append({"type": "context_rollback", "through_sequence": int(boundary),
+                      "reason": "model_failure", "runtime": dict(runtime)})
+
     def load(self) -> SessionContents:
         contents = SessionContents(self.session_id, str(self.root_dir), self.started_at)
         if not self.path.is_file():
@@ -479,8 +524,11 @@ class SessionStore:
                     contents.messages.append(dict(message))
             elif kind == "recent_context":
                 contents.messages = [dict(message) for message in record.get("messages", [])]
+                contents.has_checkpoint = False
             elif kind == "runtime":
                 contents.runtime = dict(record.get("state") or {})
+                if record.get("audit"):
+                    contents.audit.append(dict(record["audit"]))
             elif kind == "tool_audit":
                 contents.audit.append(dict(record.get("event") or {}))
             elif kind == RECORD_ARCHIVE:
@@ -492,6 +540,7 @@ class SessionStore:
                 if isinstance(call_id, str):
                     contents.replacements[call_id] = str(record.get("content", ""))
             elif kind == RECORD_COMPACT:
+                contents.has_checkpoint = True
                 kept_from = int(record.get("kept_from") or 1)
                 kept_log_index = max(0, kept_from - 1)
                 checkpoint = {"role": "user", "content": str(record.get("content", ""))}

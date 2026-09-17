@@ -5,13 +5,240 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 from session_store import SessionStore, session_directory
-from tests.test_jarvis_agent import FakeClient, FailingClient
+from tests.test_jarvis_agent import FakeClient, FailingClient, ScriptedClient
+from model_client import ModelRequestError
 from tests.test_session_persistence import SessionTestBase
 
 
 class UnifiedSessionEventsTests(SessionTestBase):
+    def test_committed_message_and_rollback_survive_derived_projection_failure(self):
+        for failure_kind in ("message", "context_rollback"):
+            with self.subTest(failure_kind=failure_kind):
+                client = FailingClient() if failure_kind == "context_rollback" else FakeClient([
+                    {"role": "assistant", "content": "committed answer"}])
+                agent = self.agent(client)
+                original_record = agent.store.history.record
+                def fail_projection(record):
+                    if record["type"] == failure_kind:
+                        raise OSError("projection unavailable")
+                    return original_record(record)
+                with patch.object(agent.store.history, "record", side_effect=fail_projection):
+                    with redirect_stdout(StringIO()):
+                        answer = agent.run_request("recorded input")
+                self.assertEqual(answer, None if failure_kind == "context_rollback" else "committed answer")
+                self.assertEqual(agent.messages[1:], agent.store.load().messages)
+                expected = deepcopy(agent.messages)
+                session_id = agent.store.session_id
+                agent.close()
+                resumed = self.agent(FakeClient([]), resume=session_id)
+                self.assertEqual(resumed.messages, expected)
+
+    def test_committed_compaction_survives_derived_projection_failure(self):
+        agent = self.agent(FakeClient([{"role": "assistant", "content": "old answer"},
+                                       {"role": "assistant", "content": "new answer"}]))
+        with redirect_stdout(StringIO()):
+            agent.run_request("old question")
+            agent.run_request("new question")
+        session_id = agent.store.session_id
+        # Inject after the canonical event commit, at the derived-view boundary.
+        with patch.object(agent.store.history, "record", side_effect=OSError("projection unavailable")):
+            with redirect_stdout(StringIO()):
+                self.assertTrue(agent.compact_now().compacted)
+        expected = deepcopy(agent.messages)
+        agent.close()
+        resumed = self.agent(FakeClient([]), resume=session_id)
+        self.assertEqual(resumed.messages, expected)
+
+    def test_exit_at_compaction_commit_restores_checkpoint_before_next_request(self):
+        script = '''
+import json, os, sys
+from pathlib import Path
+from jarvis_agent import Agent, Config
+class Client:
+    def complete(self, *args, **kwargs):
+        return {"role": "assistant", "content": "<context_summary>durable checkpoint</context_summary>"}
+agent = Agent(Config(base_url="http://example.test", api_key="", model="test",
+    root_dir=Path(sys.argv[1]), state_dir=Path(sys.argv[2])), Client())
+agent.run_request("retired raw input")
+agent.run_request("kept raw input")
+original_sync = os.fsync
+def interrupt_after_commit(fd):
+    original_sync(fd)
+    events = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
+    if events[-1]["type"] == "compact":
+        os._exit(26)
+os.fsync = interrupt_after_commit
+agent.compact_now()
+'''
+        process = subprocess.run([sys.executable, "-c", script, str(self.root), str(self.state)],
+                                 cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=30)
+        self.assertEqual(process.returncode, 26, process.stderr.decode(errors="replace"))
+        info = SessionStore.list_sessions(self.config())[0]
+        original = info.path.read_bytes()
+        self.assertIn(b"retired raw input", original)
+        client = FakeClient([{"role": "assistant", "content": "next answer"}])
+        resumed = self.agent(client, resume=info.id)
+        self.assertIn("[CONTEXT_COMPRESSED]", resumed.messages[1]["content"])
+        with redirect_stdout(StringIO()):
+            resumed.run_request("next input")
+        self.assertNotIn("retired raw input", str(client.requests))
+        self.assertIn("kept raw input", str(client.requests))
+        self.assertTrue(info.path.read_bytes().startswith(original))
+
+    def test_tool_started_failure_records_failed_status_but_keeps_context_after_resume(self):
+        client = ScriptedClient([
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "write", "function": {"name": "edit", "arguments":
+                    '{"path":"result.txt","content":"written once"}'}}]},
+            ModelRequestError("answer failed"),
+        ])
+        agent = self.agent(client, tool_permission_mode="broad-access")
+        with redirect_stdout(StringIO()):
+            self.assertIsNone(agent.run_request("write result"))
+        expected = deepcopy(agent.messages)
+        records = self.records(agent.store.path)
+        self.assertEqual(records[-1]["status"], "failed")
+        self.assertTrue(records[-1]["context_valid"])
+        session_id = agent.store.session_id
+        agent.close()
+        target = self.root / "result.txt"
+        target.write_text("changed externally", encoding="utf-8")
+        next_client = FakeClient([{"role": "assistant", "content": "acknowledged"}])
+        resumed = self.agent(next_client, resume=session_id)
+        self.assertEqual(resumed.messages, expected)
+        with redirect_stdout(StringIO()):
+            resumed.run_request("continue")
+        self.assertIn("written once", str(next_client.requests))
+        self.assertEqual(target.read_text(encoding="utf-8"), "changed externally")
+
+    def test_exit_at_rollback_commit_excludes_input_without_losing_runtime_decisions(self):
+        script = '''
+import json, os, sys
+from pathlib import Path
+from jarvis_agent import Agent, Config, ModelRequestError
+from tool_runtime import ProviderLoadError
+class Client:
+    def complete(self, *args, **kwargs):
+        agent.tool_runtime.policy.change_mode("approve-all")
+        agent.tool_runtime.policy.revoke()
+        raise ModelRequestError("model unavailable")
+def native(*args):
+    raise ProviderLoadError("unsupported")
+agent = Agent(Config(base_url="http://example.test", api_key="", model="test",
+    root_dir=Path(sys.argv[1]), state_dir=Path(sys.argv[2]),
+    tool_permission_mode="broad-access", provider_tool_mode="native"), Client(), native_loader=native)
+original_sync = os.fsync
+def interrupt_after_commit(fd):
+    original_sync(fd)
+    events = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
+    if events[-1]["type"] == "context_rollback":
+        os._exit(25)
+os.fsync = interrupt_after_commit
+agent.run_request("failed raw input")
+'''
+        process = subprocess.run([sys.executable, "-c", script, str(self.root), str(self.state)],
+                                 cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=30)
+        self.assertEqual(process.returncode, 25, process.stderr.decode(errors="replace"))
+        info = SessionStore.list_sessions(self.config())[0]
+        original = info.path.read_bytes()
+        self.assertIn(b"failed raw input", original)
+        client = FakeClient([{"role": "assistant", "content": "next answer"}])
+        resumed = self.agent(client, resume=info.id, tool_permission_mode="broad-access")
+        self.assertEqual(resumed.tool_runtime.policy.mode, "approve-all")
+        self.assertTrue(resumed.tool_runtime.policy.revoked)
+        self.assertEqual(resumed.provider_session.fallback_count, 1)
+        self.assertEqual(resumed.provider_session.mode, "emulated")
+        with redirect_stdout(StringIO()):
+            resumed.run_request("next input")
+        self.assertNotIn("failed raw input", str(client.requests))
+        self.assertTrue(info.path.read_bytes().startswith(original))
+
+    def test_exit_at_permission_commit_keeps_revocation_and_tightening(self):
+        script = '''
+import json, os, sys
+from pathlib import Path
+from jarvis_agent import Agent, Config
+agent = Agent(Config(base_url="http://example.test", api_key="", model="test",
+    root_dir=Path(sys.argv[1]), state_dir=Path(sys.argv[2]),
+    tool_permission_mode="broad-access"), object())
+agent.tool_runtime.policy.change_mode("approve-all")
+original_sync = os.fsync
+def interrupt_after_commit(fd):
+    original_sync(fd)
+    events = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
+    if any(e.get("event", e.get("audit", {})).get("action") == "revoked" for e in events):
+        os._exit(24)
+os.fsync = interrupt_after_commit
+agent.tool_runtime.policy.revoke()
+'''
+        process = subprocess.run([sys.executable, "-c", script, str(self.root), str(self.state)],
+                                 cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=30)
+        self.assertEqual(process.returncode, 24, process.stderr.decode(errors="replace"))
+        info = SessionStore.list_sessions(self.config())[0]
+        resumed = self.agent(FakeClient([]), resume=info.id, tool_permission_mode="broad-access")
+        self.assertEqual(resumed.tool_runtime.policy.mode, "approve-all")
+        self.assertTrue(resumed.tool_runtime.policy.revoked)
+        self.assertEqual(sum(event.get("action") == "revoked" for event in resumed.store.load().audit), 1)
+
+    def test_next_request_keeps_committed_checkpoint_live_and_after_restart(self):
+        client = FakeClient([{"role": "assistant", "content": "old answer"},
+                             {"role": "assistant", "content": "new answer"},
+                             {"role": "assistant", "content": "<context_summary>checkpoint</context_summary>"},
+                             {"role": "assistant", "content": "continued"}])
+        agent = self.agent(client)
+        with redirect_stdout(StringIO()):
+            agent.run_request("old raw question")
+            agent.run_request("new question")
+            agent.compact_now()
+        expected = deepcopy(agent.messages[1:])
+        session_id = agent.store.session_id
+        with redirect_stdout(StringIO()):
+            agent.run_request("continue live")
+        self.assertEqual(client.requests[-1][0][1:1 + len(expected)], expected)
+        agent.close()
+        resumed_client = FakeClient([{"role": "assistant", "content": "continued again"}])
+        resumed = self.agent(resumed_client, resume=session_id)
+        with redirect_stdout(StringIO()):
+            resumed.run_request("continue resumed")
+        self.assertEqual(resumed_client.requests[0][0][1:1 + len(expected)], expected)
+
+    def test_compaction_write_failure_does_not_change_live_or_restarted_context(self):
+        agent = self.agent(FakeClient([{"role": "assistant", "content": "old answer"},
+                                       {"role": "assistant", "content": "new answer"}]))
+        with redirect_stdout(StringIO()):
+            agent.run_request("old question " * 100)
+            agent.run_request("new question")
+        before = deepcopy(agent.messages)
+        session_id = agent.store.session_id
+        with patch.object(agent.store, "record_compact", side_effect=OSError("disk unavailable")):
+            with self.assertRaises(OSError):
+                agent.compact_now()
+        self.assertEqual(agent.messages, before)
+        agent.close()
+        resumed = self.agent(FakeClient([]), resume=session_id)
+        self.assertEqual(resumed.messages, before)
+
+    def test_context_rollback_preserves_security_and_audit_without_followup_writes(self):
+        with SessionStore.create(self.config()) as store:
+            store.record_runtime({"policy": {"mode": "broad-access"}})
+            boundary = store.mark()
+            store.record_task(1, "failed request")
+            store.record_message({"role": "user", "content": "failed request"})
+            store.record_runtime({"policy": {"mode": "approve-all", "revoked": True},
+                                  "provider": {"mode": "emulated", "fallback_count": 1}})
+            store.record_tool_audit({"action": "revoked"})
+            original = store.path.read_bytes()
+            store.truncate_to(boundary)
+            contents = store.load()
+            self.assertEqual(contents.messages, [])
+            self.assertTrue(contents.runtime["policy"]["revoked"])
+            self.assertEqual(contents.runtime["provider"]["fallback_count"], 1)
+            self.assertEqual(contents.audit, [{"action": "revoked"}])
+            self.assertTrue(store.path.read_bytes().startswith(original))
+
     def test_exit_after_context_reset_does_not_reintroduce_failed_input(self):
         agent = self.agent(FailingClient())
         with redirect_stdout(StringIO()):

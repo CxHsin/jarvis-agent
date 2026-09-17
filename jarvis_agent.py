@@ -531,17 +531,18 @@ class Agent:
         if action == 'forget': return context.commit(lambda: self.store.memory.forget(fact_id, source=source))
         raise ValueError('unknown memory action')
 
-    def _save_runtime(self):
+    def _save_runtime(self, audit=None):
         if self.store:
-            self.store.record_runtime(dict(self.tool_runtime.snapshot(), provider=self.provider_session.snapshot()))
+            self.store.record_runtime(dict(self.tool_runtime.snapshot(), provider=self.provider_session.snapshot()),
+                                      audit=audit)
 
     def _record_audit(self, event):
         self._audit_events.append(deepcopy(event))
         self.store.record_tool_audit(event)
 
     def _policy_event(self, event):
-        self._record_audit(event)
-        self._save_runtime()
+        self._save_runtime(audit=event)
+        self._audit_events.append(deepcopy(event))
 
     def _search_tools(self, query="", limit=8):
         result = self.tool_runtime.discover(self._runtime_task_id, query, limit)
@@ -643,9 +644,9 @@ class Agent:
             print(f"[会话恢复] 工具调用 {name or '?'} ({call_id}) 缺少结果，已补写中断占位。")
 
     def _append_message(self, message: dict[str, Any]) -> None:
-        self.messages.append(message)
         if self.store is not None:
             self.store.record_message(message)
+        self.messages.append(message)
 
     def close(self) -> None:
         if self.store is not None:
@@ -842,14 +843,14 @@ class Agent:
         message_snapshot = deepcopy(self.messages)
         context_snapshot = self.context.snapshot()
         runtime_snapshot = self.tool_runtime.snapshot()
-        provider_snapshot = self.provider_session.snapshot()
         audit_start = len(self.tool_runtime.dispatcher.audit)
         audit_event_start = len(self._audit_events)
         self.context.begin_task(user_text)
-        recent = self.store.recent_messages()
+        recent = self.store.context_messages()
         if recent:
-            self.messages[1:] = recent
-            self.store.record_recent_context(recent)
+            if recent != self.messages[1:]:
+                self.store.record_recent_context(recent)
+                self.messages[1:] = recent
         self._runtime_task_id = f"{self.store.session_id}:{self.context.task_number}"
         compatibility = tuple((name, "1") for name in ("list_directory", "search_file_content", "read_file")
                               if self.tool_registry.versions(name))
@@ -860,6 +861,7 @@ class Agent:
         active_calls: list[Mapping[str, Any]] = []
         handled_call_indexes: set[int] = set()
         task_status = "interrupted"
+        context_valid = True
         try:
             for round_number in range(1, self.config.max_rounds + 1):
                 final_round = round_number == self.config.max_rounds
@@ -945,6 +947,7 @@ class Agent:
                     handled_call_indexes.update(i for i, c in enumerate(calls) if c.get("id") == item.call_id)
                 cancelled = self._execute_batch(calls, record_result)
                 if cancelled:
+                    task_status = "cancelled"
                     active_calls = []
                     print("已取消当前请求。工具结果已保留。")
                     return None
@@ -952,6 +955,7 @@ class Agent:
             print("已达到轮次上限，本次请求未完成。")
             return None
         except KeyboardInterrupt:
+            task_status = "cancelled"
             for call_index, call in enumerate(active_calls):
                 if call_index in handled_call_indexes:
                     continue
@@ -976,26 +980,26 @@ class Agent:
             print("\n已取消当前请求。已完成的工具结果已保留，未完成的调用不会被视为成功。")
             return None
         except ModelRequestError as exc:
+            task_status = "failed"
             executed = any(e.get("phase") == "started" for e in self.tool_runtime.dispatcher.audit[audit_start:])
             if not executed:
-                task_status = "failed"
-                self.messages[:] = message_snapshot
-                self.context.restore(context_snapshot)
+                context_valid = False
                 # Policy/fallback decisions survive a failed request; activation does not.
                 policy = self.tool_runtime.policy.snapshot()
+                retained_runtime = dict(runtime_snapshot, policy=policy,
+                                        provider=self.provider_session.snapshot())
+                if self.store is not None and request_offset is not None:
+                    self.store.rollback_context(request_offset, retained_runtime,
+                                                self._audit_events[audit_event_start:])
+                self.messages[:] = message_snapshot
+                self.context.restore(context_snapshot)
                 self.tool_runtime.restore(dict(runtime_snapshot, policy=policy))
                 self.tool_registry._tasks.pop(self._runtime_task_id, None)
-                if self.store is not None and request_offset is not None:
-                    self.store.truncate_to(request_offset)
-                    for event in self._audit_events[audit_event_start:]:
-                        self.store.record_tool_audit(event)
-                if self.provider_session.snapshot() != provider_snapshot or self.tool_runtime.policy.snapshot() != runtime_snapshot["policy"]:
-                    self._save_runtime()
             print(f"模型请求失败: {exc}")
             return None
         finally:
             self.messages[0] = task_system_message
-            self.store.end_task(task_status)
+            self.store.end_task(task_status, context_valid=context_valid)
             self.usage_ledger.summary()
 
     def compact_now(self, keep_tokens: int | None = None, reason: str = MANUAL) -> CompactionResult:

@@ -41,10 +41,12 @@ class TaskHistory:
             self.tasks[-1]["messages"].append(event["message"])
         elif self.tasks and kind == "task_end":
             self.tasks[-1]["status"] = event["status"]
-        elif kind == "context_reset":
+            self.tasks[-1]["context_valid"] = event.get("context_valid", event["status"] != "failed")
+        elif kind in {"context_reset", "context_rollback"}:
             for task in self.tasks:
                 if task.get("sequence", 0) > event["through_sequence"]:
                     task["status"] = "failed"
+                    task["context_valid"] = False
         if self.tasks and event.get("task_id") == self.tasks[-1]["task_id"]:
             self.tasks[-1]["events"].append(event)
 
@@ -66,7 +68,7 @@ class TaskHistory:
                              f'task={event["task_id"]} event={event["event_id"]} source={self.path.name}: {query}\n')
                 handle.flush()
                 os.fsync(handle.fileno())
-        if event["type"] in {"task", "message", "task_end", "context_reset"}:
+        if event["type"] in {"task", "message", "task_end", "context_reset", "context_rollback"}:
             self._project()
 
     def _record_legacy(self, record):
@@ -89,9 +91,10 @@ class TaskHistory:
         return event
 
     def recent_tasks(self):
-        completed = [task for task in self.tasks if task["status"] not in {"active", "failed"}]
+        retained_finished = [task for task in self.tasks if task["status"] != "active"
+                             and task.get("context_valid", task["status"] != "failed")]
         active = [task for task in self.tasks if task["status"] == "active"]
-        return completed[-self.count:] + active
+        return retained_finished[-self.count:] + active
 
     def messages(self):
         return deepcopy([message for task in self.recent_tasks() for message in task["messages"]])

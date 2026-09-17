@@ -71,6 +71,8 @@ def test_read_evidence_survives_compaction_and_resume(tmp_path, tool, truncated)
             assert resumed.context.session_archive[0]["result"] == results[0]
             assert resumed.run_request("Recall the source") == "Sources: E1"
             restored_results = [json.loads(m["content"]) for m in resumed_client.requests[0][0] if m["role"] == "tool"]
-            assert results[0] in restored_results
+            assert results[0] not in restored_results
+            assert "Sources: E1" in str(resumed_client.requests[0][0])
+            assert resumed.context.session_evidence[0]["refs"] == [expected_ref]
         finally:
             resumed.close()
