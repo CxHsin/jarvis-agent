@@ -557,6 +557,7 @@ class AgentTests(unittest.TestCase):
             with redirect_stdout(StringIO()):
                 self.assertEqual(agent.run_request("读文件"), "读完了")
 
+            expected_messages = [dict(message) for message in agent.messages[1:]]
             with redirect_stdout(StringIO()) as output:
                 answer = agent.run_request("继续")
 
@@ -568,7 +569,13 @@ class AgentTests(unittest.TestCase):
                 [message.get("content") for message in agent.messages if message["role"] == "user"],
             )
             records = [json.loads(line) for line in agent.store.path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([record["type"] for record in records].count("compact"), 0)
+            self.assertEqual([record["type"] for record in records].count("compact"), 1)
+            self.assertEqual(agent.messages[1:], expected_messages)
+            session_id = agent.store.session_id
+            agent.close()
+            resumed = make_agent(self, config, FakeClient([]), resume=session_id)
+            self.assertEqual(resumed.messages[1:], expected_messages)
+            self.assertEqual(resumed.context.task_number, 1)
 
     def test_cancelled_tool_calls_are_marked(self):
         with tempfile.TemporaryDirectory() as directory:

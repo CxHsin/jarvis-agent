@@ -9,12 +9,13 @@ import uuid
 
 
 class TaskHistory:
-    def __init__(self, directory: Path, session_id: str, count: int, memory=None):
+    def __init__(self, directory: Path, session_id: str, count: int, memory=None, *, event_path=None):
         self.directory = directory
         self.session_id = session_id
         self.count = count
         self.memory = memory
-        self.path = directory / "trajectories" / f"{session_id}.jsonl"
+        self.path = event_path or directory / "trajectories" / f"{session_id}.jsonl"
+        self._shared_events = event_path is not None
         self.recent_path = directory / "recent" / session_id / "recent.md"
         self.tasks = []
         self._needs_separator = False
@@ -40,10 +41,35 @@ class TaskHistory:
             self.tasks[-1]["messages"].append(event["message"])
         elif self.tasks and kind == "task_end":
             self.tasks[-1]["status"] = event["status"]
+        elif kind == "context_reset":
+            for task in self.tasks:
+                if task.get("sequence", 0) > event["through_sequence"]:
+                    task["status"] = "failed"
         if self.tasks and event.get("task_id") == self.tasks[-1]["task_id"]:
             self.tasks[-1]["events"].append(event)
 
     def record(self, record):
+        if self._shared_events:
+            event = dict(record)
+            now = event["recorded_at"]
+        else:
+            event = self._record_legacy(record)
+            now = event["recorded_at"]
+        self._apply(event)
+        if event["type"] == "task":
+            history = self.directory / "history" / f"{now[:10]}.md"
+            history.parent.mkdir(parents=True, exist_ok=True)
+            # JSON quoting keeps each query on one auditable Markdown line.
+            query = json.dumps(event["goal"], ensure_ascii=False)
+            with history.open("a", encoding="utf-8") as handle:
+                handle.write(f'- occurred_at={event["occurred_at"]} recorded_at={now} '
+                             f'task={event["task_id"]} event={event["event_id"]} source={self.path.name}: {query}\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+        if event["type"] in {"task", "message", "task_end", "context_reset"}:
+            self._project()
+
+    def _record_legacy(self, record):
         now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         event = dict(record, recorded_at=now, event_id=uuid.uuid4().hex)
         event.setdefault("occurred_at", None)
@@ -60,19 +86,7 @@ class TaskHistory:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        self._apply(event)
-        if event["type"] == "task":
-            history = self.directory / "history" / f"{now[:10]}.md"
-            history.parent.mkdir(parents=True, exist_ok=True)
-            # JSON quoting keeps each query on one auditable Markdown line.
-            query = json.dumps(event["goal"], ensure_ascii=False)
-            with history.open("a", encoding="utf-8") as handle:
-                handle.write(f'- occurred_at={event["occurred_at"]} recorded_at={now} '
-                             f'task={event["task_id"]} event={event["event_id"]} source={self.path.name}: {query}\n')
-                handle.flush()
-                os.fsync(handle.fileno())
-        if event["type"] in {"task", "message", "task_end"}:
-            self._project()
+        return event
 
     def recent_tasks(self):
         completed = [task for task in self.tasks if task["status"] not in {"active", "failed"}]

@@ -14,13 +14,13 @@ import sys
 import uuid
 from threading import RLock
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from task_history import TaskHistory
 
 
-SESSION_FORMAT_VERSION = 1
+SESSION_FORMAT_VERSION = 2
 RECORD_SESSION = "session"
 RECORD_MESSAGE = "message"
 RECORD_TASK = "task"
@@ -181,14 +181,9 @@ def _read_info(path: Path) -> SessionInfo | None:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, Mapping) or record.get("type") != RECORD_MESSAGE:
+    records, _ = _read_records(text)
+    for record in _visible_records(records):
+        if record.get("type") != RECORD_MESSAGE:
             continue
         message = record.get("message")
         if not isinstance(message, Mapping):
@@ -204,6 +199,39 @@ def _read_info(path: Path) -> SessionInfo | None:
         message_count=message_count,
         last_user_text=last_user_text,
     )
+
+
+def _read_records(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    records, warnings = [], []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1 and not text.endswith("\n"):
+                warnings.append("已忽略进程中断时写了一半的最后一条记录；原始字节保留。")
+            else:
+                warnings.append(f"第 {index + 1} 行无法解析，已跳过。")
+            continue
+        if not isinstance(record, dict):
+            warnings.append(f"第 {index + 1} 行不是记录对象，已跳过。")
+            continue
+        records.append(record)
+    return records, warnings
+
+
+def _visible_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compatibility projection for the existing request rollback boundary."""
+    visible = []
+    for record in records:
+        if record.get("type") == "context_reset":
+            through = record["through_sequence"]
+            visible = [event for event in visible if event.get("sequence", 0) <= through]
+        else:
+            visible.append(record)
+    return visible
 
 
 class SessionStore:
@@ -223,6 +251,10 @@ class SessionStore:
         self.memory_directory = self.state_dir / "memory"
         self._recent_task_count = getattr(config, "recent_task_count", 5)
         self.history = None
+        self._format_version = SESSION_FORMAT_VERSION
+        self._sequence = 0
+        self._task_id = None
+        self._needs_separator = False
 
     @property
     def recent_path(self) -> Path:
@@ -298,8 +330,23 @@ class SessionStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         self._lock.acquire()
         try:
+            if existing:
+                header = _first_record(self.path) or {}
+                self._format_version = int(header.get("version", 1))
+                if self._format_version not in {1, SESSION_FORMAT_VERSION}:
+                    raise SessionError(f"不支持的会话版本: {self._format_version}")
+                text = self.path.read_text(encoding="utf-8", errors="replace")
+                self._needs_separator = bool(text and not text.endswith("\n"))
+                records, _ = _read_records(text)
+                for record in records:
+                    self._sequence = max(self._sequence, int(record.get("sequence", 0)))
+                    if record.get("type") == RECORD_TASK:
+                        self._task_id = record.get("task_id")
             self._file = open(self.path, "a+", encoding="utf-8")
-            self.history = TaskHistory(self.memory_directory, self.session_id, self._recent_task_count, self.memory)
+            self.history = TaskHistory(
+                self.memory_directory, self.session_id, self._recent_task_count, self.memory,
+                event_path=self.path if self._format_version == SESSION_FORMAT_VERSION else None,
+            )
         except BaseException:
             if self._file is not None:
                 self._file.close()
@@ -326,14 +373,28 @@ class SessionStore:
     def _append_locked(self, record: Mapping[str, Any]) -> int:
         if self._file is None:
             raise SessionError("会话记录已关闭。")
+        if self._format_version == SESSION_FORMAT_VERSION:
+            now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            if record["type"] == RECORD_TASK:
+                self._task_id = f"{self.session_id}:{uuid.uuid4().hex}"
+            record = dict(record, event_version=1, event_id=uuid.uuid4().hex,
+                          session_id=self.session_id, task_id=self._task_id,
+                          sequence=self._sequence + 1, recorded_at=now, occurred_at=None)
+            if record["type"] == RECORD_TASK:
+                record["recent_task_count"] = self._recent_task_count
         payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
+        if self._needs_separator:
+            self._file.write("\n")
+            self._needs_separator = False
         self._file.write(payload + "\n")
         self._file.flush()
+        os.fsync(self._file.fileno())
+        self._sequence = int(record.get("sequence", self._sequence))
         self.history.record(record)
         return self._file.tell()
 
     def end_task(self, status: str = "completed") -> None:
-        if status == "failed":
+        if status == "failed" and self._format_version == 1:
             self.history.record({"type": "task_end", "status": status})
         else:
             self._append({"type": "task_end", "status": status})
@@ -385,11 +446,16 @@ class SessionStore:
         if self._file is None:
             raise SessionError("会话记录已关闭。")
         self._file.flush()
+        if self._format_version == SESSION_FORMAT_VERSION:
+            return self._sequence
         return self._file.seek(0, os.SEEK_END)
 
     def truncate_to(self, offset: int) -> None:
         if self._file is None:
             raise SessionError("会话记录已关闭。")
+        if self._format_version == SESSION_FORMAT_VERSION:
+            self._append({"type": "context_reset", "through_sequence": int(offset)})
+            return
         self._file.flush()
         self._file.seek(max(0, int(offset)))
         self._file.truncate()
@@ -400,24 +466,9 @@ class SessionStore:
         if not self.path.is_file():
             return contents
         text = self.path.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
-        warnings: list[str] = []
+        records, warnings = _read_records(text)
         compact_compressed_ids: list[str] = []
-        complete = text.endswith("\n") or text == ""
-        for index, line in enumerate(lines):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                if index == len(lines) - 1 and not complete:
-                    warnings.append("已丢弃进程中断时写了一半的最后一条记录。")
-                else:
-                    warnings.append(f"第 {index + 1} 行无法解析，已跳过。")
-                continue
-            if not isinstance(record, Mapping):
-                warnings.append(f"第 {index + 1} 行不是记录对象，已跳过。")
-                continue
+        for record in _visible_records(records):
             kind = record.get("type")
             if kind == RECORD_SESSION:
                 contents.workspace = str(record.get("workspace", contents.workspace))

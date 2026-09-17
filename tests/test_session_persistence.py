@@ -301,7 +301,7 @@ class SessionRecoveryTests(SessionTestBase):
 
 
 class SessionWriteThroughTests(SessionTestBase):
-    def test_model_failure_rolls_back_memory_and_file(self):
+    def test_model_failure_rolls_back_visible_context_and_preserves_events(self):
         agent = self.agent(FakeClient([]))
         path = agent.store.path
         with redirect_stdout(StringIO()):
@@ -310,7 +310,8 @@ class SessionWriteThroughTests(SessionTestBase):
 
         self.assertEqual([message["role"] for message in agent.messages], ["system"])
         self.assertEqual(agent.context.task_number, 0)
-        self.assertEqual([record["type"] for record in self.records(path)], ["session"])
+        self.assertEqual(agent.store.load().messages, [])
+        self.assertIn("失败请求", path.read_text(encoding="utf-8"))
 
         # 回滚后的会话必须还能继续写入，且重载内容与内存一致。
         with redirect_stdout(StringIO()):
