@@ -176,7 +176,7 @@ class ContextManager:
     def _source_refs(name: str, result: Mapping[str, Any]) -> list[str]:
         if not result.get("ok"):
             return []
-        if name == "read_file" and result.get("path"):
+        if name in {"read", "read_file"} and result.get("path"):
             start = result.get("start_line", "?")
             end = result.get("end_line", start)
             return [f"{result['path']}:{start}-{end}"]
