@@ -277,7 +277,7 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn("最后一轮", client.requests[0][0][0]["content"])
             self.assertEqual(agent.messages[0], client.requests[0][0][0])
             self.assertEqual(final_messages[1:], client.requests[0][0][1:] + agent.messages[2:5])
-            self.assertEqual(client.calls, [(2, 4, "auto"), (5, 0, "none")])
+            self.assertEqual(client.calls, [(2, 5, "auto"), (5, 0, "none")])
             self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant", "tool", "tool", "assistant"])
 
     def test_agent_wires_file_tools_through_runtime(self):
@@ -286,7 +286,7 @@ class AgentTests(unittest.TestCase):
                             root_dir=Path(directory), state_dir=_STATE_ROOT)
             agent = make_agent(self, config, FakeClient([{"role": "assistant", "content": "ok"}]))
             names = [item["function"]["name"] for item in agent.tool_runtime.schemas("0")]
-            self.assertEqual(names, ["read", "edit", "bash", "tool_search"])
+            self.assertEqual(names, ["read", "edit", "bash", "tool_search", "list_directory"])
             agent.run_request("列出文件")
             self.assertEqual(agent.tool_runtime.registry.active_keys(agent._runtime_task_id),
                              {(name, "1") for name in agent.tool_functions})

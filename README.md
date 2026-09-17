@@ -2,7 +2,9 @@
 
 在 `.env` 中设置 `SYSTEM_PROMPT="你是 Jarvis，请用中文简洁回答。"` 可替换内置角色与回答风格提示。使用单行文本，留空沿用默认提示词，修改后重启生效；同名进程环境变量优先。工作区信息、工具协议及 self.md / memory.md 记忆前缀仍由程序附加。
 
-这是一个可观察的命令行个人 Agent 基线。它支持 OpenAI 兼容的 Chat Completions 接口，并提供四个稳定工具：`read`、`edit`、`bash`、`tool_search`，同时保留旧文件工具名称作为兼容别名。对话历史写入状态目录下的会话记录，每次启动默认新建会话，用 `--resume` 显式接上上一段。
+这是一个可观察的命令行个人 Agent 基线。它支持 OpenAI 兼容的 Chat Completions 接口，并提供五个稳定工具：`read`、`edit`、`bash`、`tool_search`、`list_directory`，同时保留旧文件工具名称作为兼容别名。对话历史写入状态目录下的会话记录，每次启动默认新建会话，用 `--resume` 显式接上上一段。
+
+`bash` 实际使用 Windows AppContainer 中的 `cmd.exe`，不提供 Bash 语法。列目录使用 `list_directory`（可逐层查看子目录），读取文件使用 `read`，避免依赖沙箱内可能拒绝访问的 `dir`。Shell 输出优先按 UTF-8 解码，无法解码时使用 Windows OEM 编码；失败预览包含工具名、退出码和命令输出。
 
 Memory tools are discovered with `tool_search`: `memory_search` and `memory_manage` (`remember`, `correct`, `forget`). Retrieval reads `STATE_DIR/memory/memory.db` through SQLite FTS5 and sqlite-vec; it never reads `memory.md`. Configure an OpenAI-compatible embedding endpoint with `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, and `EMBEDDING_DIMENSIONS`. Without these settings, FTS5 results remain available and the response reports vector retrieval as unavailable. Direct `edit` calls are blocked for a configured in-workspace memory directory; a generic shell remains able to mutate files, so this is a runtime guard rather than a filesystem sandbox. Query rewrites and HyDE passages are ephemeral and are never stored as Memory facts.
 

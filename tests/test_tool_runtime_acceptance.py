@@ -470,7 +470,9 @@ def test_builtin_shell_timeout_stops_process_before_delayed_write(tmp_path):
     script = tmp_path / "delayed.py"
     marker = tmp_path / "late.txt"
     script.write_text("import time\nfrom pathlib import Path\ntime.sleep(0.5)\nPath('late.txt').write_text('late')\n", encoding="utf-8")
-    command = subprocess.list2cmdline([sys.executable, str(script)])
+    # cmd.exe in AppContainer needs an explicitly quoted executable path,
+    # even without spaces; list2cmdline would leave that path unquoted.
+    command = f'"{sys.executable}" ' + subprocess.list2cmdline([str(script)])
     agent = Agent(config(tmp_path, tool_permission_mode="broad-access"),
                   Client(answer(call("bash", {"command": command, "timeout": 0.1})), {"content": "done"}))
     try:

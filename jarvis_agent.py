@@ -35,6 +35,16 @@ from tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolCall, Too
 
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
+
+
+def decode_shell_output(data: bytes) -> str:
+    """Accept UTF-8 programs and the Windows shell's native OEM output."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("oem" if os.name == "nt" else "utf-8", errors="replace")
+
+
 DEFAULT_SYSTEM_PROMPT = (
     "你是 Jarvis，一个通用的个人助理。当前阶段可以使用文件工具完成用户请求。\n"
     "需要文件信息时先使用工具，不要凭空猜测。工具返回的失败不能证明内容不存在。"
@@ -599,16 +609,17 @@ class Workspace:
             limit = max(1000, self.config.max_read_chars)
             data = output_file.read(limit + 1)
         return {"ok": process.returncode == 0, "exit_code": process.returncode,
-                "output": data[:limit].decode("utf-8", errors="replace"), "truncated": len(data) > limit}
+                "output": decode_shell_output(data[:limit]), "truncated": len(data) > limit}
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
  {"type":"function","function":{"name":"read","description":"读取文本文件；支持工作区外的绝对路径，相对路径以工作区为基准。","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"edit","description":"编辑工作区文本文件。","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path","content"],"additionalProperties":False}}},
- {"type":"function","function":{"name":"bash","description":"在工作区执行 shell 命令。","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":0.1,"maximum":60}},"required":["command"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"bash","description":"在 Windows AppContainer 沙箱中通过 cmd.exe 执行命令，并非 Bash 或 PowerShell。不要使用 ls/head 等 Unix 命令。列目录使用 list_directory；cmd 的 dir 在沙箱中可能拒绝访问。读取文件使用 read。","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":0.1,"maximum":60}},"required":["command"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"tool_search","description":"搜索可用工具。","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"additionalProperties":False}}},
 ]
 TOOL_DEFINITIONS += [
+ {"type":"function","function":{"name":"list_directory","description":"列出工作区目录的直接子项，返回文件和子目录路径及截断标记。查看子目录时再次调用；列目录优先使用本工具，无需 shell。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"工作区内的目录路径，默认当前工作区。"}},"additionalProperties":False}}},
  {"type":"function","function":{"name":"memory_search","description":"Search personal memory facts.","parameters":{"type":"object","properties":{"query":{"type":"string"},"include_history":{"type":"boolean"}},"required":["query"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"memory_manage","description":"Remember, correct, or forget a personal fact.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["remember","correct","forget"]},"fact_id":{"type":"string"},"fact":{"type":"object"}},"required":["action"],"additionalProperties":False}}}
 ]
@@ -880,7 +891,7 @@ class Agent:
                     self.tool_registry.register(ToolMetadata(alias, "1", {"name": alias, "description": "Legacy alias", "parameters": {"type": "object", "additionalProperties": True}}), self.tool_functions[alias])
             tool_runtime = ToolRuntime(
                 self.tool_registry,
-                stable=tuple((name, "1") for name in ("read", "edit", "bash", "tool_search")),
+                stable=tuple((name, "1") for name in ("read", "edit", "bash", "tool_search", "list_directory")),
             )
         self.tool_runtime = tool_runtime
         if not self.tool_registry.versions("memory_search"):
@@ -1184,7 +1195,12 @@ class Agent:
             return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
         if not result.get("ok"):
-            preview = f"ok=false error={result.get('error', '工具调用失败')}"
+            preview = f"tool={name} ok=false"
+            if "exit_code" in result:
+                preview += f" exit_code={result['exit_code']}"
+            if result.get("output"):
+                preview += f" output={str(result['output']).strip()}"
+            preview += f" error={result.get('error', '工具调用失败')}"
         elif name == "list_directory":
             entries = result.get("entries", [])
             names = [str(entry.get("name", "?")) for entry in entries[:5] if isinstance(entry, Mapping)]
