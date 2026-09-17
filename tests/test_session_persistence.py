@@ -6,14 +6,16 @@ from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from io import StringIO
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from context_manager import (
     CONTEXT_COMPRESSED_MARKER,
     CONTEXT_RECOVERED_MARKER,
     ContextManager,
 )
-from jarvis_agent import Agent, Config, TOOL_DEFINITIONS, main
+from jarvis_agent import Agent, Config, TOOL_DEFINITIONS, main, save_global_tool_permission_mode
 from session_store import SessionLockedError, SessionNotFoundError, SessionStore
+from tool_runtime import PermissionPolicy
 from tests.test_jarvis_agent import FakeClient, FailingClient
 
 
@@ -56,6 +58,56 @@ class SessionTestBase(unittest.TestCase):
 
 
 class SessionLifecycleTests(SessionTestBase):
+    def test_global_permission_mode_survives_restart_and_overrides_dotenv(self):
+        env_file = Path(self.temporary.name) / "permissions.env"
+        env_file.write_text(
+            "BASE_URL=http://example.test/v1\n"
+            "MODEL=test\n"
+            f"ROOT_DIR={self.root}\n"
+            f"STATE_DIR={self.state}\n"
+            "TOOL_PERMISSION_MODE=approve-dangerous\n",
+            encoding="utf-8",
+        )
+        save_global_tool_permission_mode(self.state, "broad-access")
+        with patch.dict("os.environ", {}, clear=True):
+            restarted = Config.from_env(env_file)
+        self.assertEqual(restarted.tool_permission_mode, "broad-access")
+
+    def test_environment_permission_mode_overrides_global_default(self):
+        env_file = Path(self.temporary.name) / "permissions.env"
+        env_file.write_text(
+            "BASE_URL=http://example.test/v1\n"
+            "MODEL=test\n"
+            f"ROOT_DIR={self.root}\n"
+            f"STATE_DIR={self.state}\n",
+            encoding="utf-8",
+        )
+        save_global_tool_permission_mode(self.state, "broad-access")
+        with patch.dict("os.environ", {"TOOL_PERMISSION_MODE": "approve-all"}, clear=False):
+            restarted = Config.from_env(env_file)
+        self.assertEqual(restarted.tool_permission_mode, "approve-all")
+
+    def test_cli_permission_command_persists_confirmed_upgrade(self):
+        env_file = Path(self.temporary.name) / "permissions.env"
+        env_file.write_text(
+            "BASE_URL=http://example.test/v1\n"
+            "MODEL=test\n"
+            f"ROOT_DIR={self.root}\n"
+            f"STATE_DIR={self.state}\n",
+            encoding="utf-8",
+        )
+        agent = MagicMock()
+        agent.tool_runtime.policy = PermissionPolicy()
+        output = StringIO()
+        with patch.dict("os.environ", {}, clear=True), \
+             patch("jarvis_agent.Agent", return_value=agent), \
+             patch("builtins.input", side_effect=["/wide", "y", "exit"]), \
+             redirect_stdout(output):
+            self.assertEqual(main(["--env-file", str(env_file)]), 0)
+            self.assertEqual(Config.from_env(env_file).tool_permission_mode, "broad-access")
+        self.assertEqual(agent.tool_runtime.policy.mode, "broad-access")
+        self.assertIn("已设为 broad-access", output.getvalue())
+
     def test_default_start_creates_new_session_and_keeps_previous(self):
         first = self.agent(FakeClient([{"role": "assistant", "content": "第一次"}]))
         with redirect_stdout(StringIO()):

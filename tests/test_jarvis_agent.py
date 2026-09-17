@@ -270,6 +270,13 @@ class AgentTests(unittest.TestCase):
             agent = make_agent(self, config, client)
             answer = agent.run_request("找找 agent")
             self.assertEqual(answer, "找到了 note.md。")
+            final_messages = client.requests[-1][0]
+            self.assertIn("最后一轮", final_messages[0]["content"])
+            self.assertIn("已有上下文和工具结果", final_messages[0]["content"])
+            self.assertIn("不要输出工具调用", final_messages[0]["content"])
+            self.assertNotIn("最后一轮", client.requests[0][0][0]["content"])
+            self.assertEqual(agent.messages[0], client.requests[0][0][0])
+            self.assertEqual(final_messages[1:], client.requests[0][0][1:] + agent.messages[2:5])
             self.assertEqual(client.calls, [(2, 4, "auto"), (5, 0, "none")])
             self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant", "tool", "tool", "assistant"])
 

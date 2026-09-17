@@ -1,5 +1,7 @@
 # Jarvis 第一阶段
 
+在 `.env` 中设置 `SYSTEM_PROMPT="你是 Jarvis，请用中文简洁回答。"` 可替换内置角色与回答风格提示。使用单行文本，留空沿用默认提示词，修改后重启生效；同名进程环境变量优先。工作区信息、工具协议及 self.md / memory.md 记忆前缀仍由程序附加。
+
 这是一个可观察的命令行个人 Agent 基线。它支持 OpenAI 兼容的 Chat Completions 接口，并提供四个稳定工具：`read`、`edit`、`bash`、`tool_search`，同时保留旧文件工具名称作为兼容别名。对话历史写入状态目录下的会话记录，每次启动默认新建会话，用 `--resume` 显式接上上一段。
 
 Memory tools are discovered with `tool_search`: `memory_search` and `memory_manage` (`remember`, `correct`, `forget`). Retrieval reads `STATE_DIR/memory/memory.db` through SQLite FTS5 and sqlite-vec; it never reads `memory.md`. Configure an OpenAI-compatible embedding endpoint with `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, and `EMBEDDING_DIMENSIONS`. Without these settings, FTS5 results remain available and the response reports vector retrieval as unavailable. Direct `edit` calls are blocked for a configured in-workspace memory directory; a generic shell remains able to mutate files, so this is a runtime guard rather than a filesystem sandbox. Query rewrites and HyDE passages are ephemeral and are never stored as Memory facts.
@@ -38,7 +40,7 @@ Profile publication uses a durable SQLite outbox: fact IDs and profile versions 
 - 同一轮的独立工具可并行；依赖调用、同文件操作和声明串行的工具顺序执行，结果按调度顺序记录。
 - 同一次运行可以追问；退出默认开启新会话，`--resume` 才会接上上一段。
 - 工具失败会作为结果交回模型；模型请求失败会结束当前请求并回到输入状态。
-- 达到 `MAX_ROUNDS` 时最后一轮只生成回答，不再执行工具。
+- 达到 `MAX_ROUNDS` 时，最后一轮结合已有上下文和工具结果直接回答，说明未完成或无法确认的部分，不再调用工具。
 - 模型请求不再注入框架生成的状态栏；工作目录等静态信息保留在系统提示中，证据索引和上下文预算由代码在进程内维护。
 - Jarvis 按接口地址和模型精确匹配容量。`CONTEXT_WINDOW_TOKENS` 显式覆盖优先，其次是自定义/内置模型目录，目录未命中时尝试上游模型元数据；仍未知时要求补充配置后启动，不套用其他模型的容量。
 - `估计输入 > 窗口 − CONTEXT_RESERVE_TOKENS` 时触发压缩：从切点开始把更旧的完整 turns（含助手正文）压成一条累积 checkpoint，切点之后的近期原文保留。切点优先落在任务边界（user），任务内部退到轮边界（assistant），tool 结果不单独切断。压缩写进会话记录，原始结果保留在会话归档中，摘要保留来源引用。
@@ -52,7 +54,9 @@ Profile publication uses a durable SQLite outbox: fact IDs and profile versions 
 
 固定工具为 `read`、`edit`、`bash`、`tool_search`。动态工具通过 `tool_search` 搜索并激活，定义追加在搜索结果中，固定 `tools` 列表不改变；下一任务必须重新搜索，历史定义保留但不授予执行权限。压缩退休搜索结果时，仅补回当前任务已激活的定义，不插入空标记或任务边界标记。这里保证确定性序列化，不承诺供应商一定命中缓存。
 
-`TOOL_PERMISSION_MODE` 支持 `approve-all`（每次工具调用确认）、`approve-dangerous`（默认，高风险调用确认）和 `broad-access`（显式宽授权）。`bash` 一律视为高风险；文件编辑为中风险。命令行遇到需确认的操作会提示，非交互使用应传入 `Agent(confirm_tool=...)`，否则返回 `confirmation_required`。工具本身不能确认或升级权限。`agent.tool_runtime.policy.change_mode(...)` 可直接收紧，升级必须由宿主完成用户确认后传入 `confirmed=True`；`revoke()` 阻止新的副作用，变更与确认均写入会话审计。重启配置只能进一步收紧已保存的授权。
+`TOOL_PERMISSION_MODE` 支持 `approve-all`（每次工具调用确认）、`approve-dangerous`（默认，高风险调用确认）和 `broad-access`（显式宽授权）。`bash` 一律视为高风险；文件编辑为中风险。命令行遇到需确认的操作会提示，非交互使用应传入 `Agent(confirm_tool=...)`，否则返回 `confirmation_required`。工具本身不能确认或升级权限。`agent.tool_runtime.policy.change_mode(...)` 可直接收紧，升级必须由宿主完成用户确认后传入 `confirmed=True`；`revoke()` 阻止新的副作用，变更与确认均写入会话审计。恢复已有会话时，启动配置只能进一步收紧已保存的授权。
+
+命令行使用 `/permissions` 查看当前全局默认值；`/all`、`/safe` 和 `/wide` 分别保存 `approve-all`、`approve-dangerous` 和 `broad-access`，后续重启及其他工作区都会读取。升级权限会再次确认。设置保存在 `STATE_DIR/settings.json`；进程环境变量 `TOOL_PERMISSION_MODE` 存在时优先，用于部署时强制指定模式。
 
 每个工具版本保存不可变 schema、SHA-256 指纹、风险、资源、副作用、超时、输出上限与并发声明。同版本不能替换处理函数。参数按 JSON Schema 2020-12 校验，远程 schema 引用不受支持。`TOOL_MAX_TIMEOUT` 是会话超时上限，工具自身的上限仍生效；输出同时受工具和权限策略上限约束。内置 shell 的超时与取消会终止进程树，文件编辑在提交前检查取消与策略版本。Python 扩展处理函数应使用 `contextual=True` 和 `ExecutionContext` 合作取消；无法中止的扩展返回 `uncertain` 并保留资源占用，运行时不会自动重试可能产生副作用的调用。
 

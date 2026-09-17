@@ -28,12 +28,18 @@ from compaction import CompactionResult, MANUAL, OVERFLOW, is_overflow_error
 from context_budget import ContextBudget
 from model_capabilities import load_capability
 from memory_profile import ProfileEditError
-from session_store import SessionContents, SessionLockedError, SessionNotFoundError, SessionStore
+from session_store import (SessionContents, SessionLockedError, SessionNotFoundError, SessionStore,
+                           resolve_state_dir)
 from tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolCall, ToolScheduler,
                           PermissionPolicy, ProviderSession, ToolProviderAdapter, ProviderLoadError, failure)
 
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
+DEFAULT_SYSTEM_PROMPT = (
+    "你是 Jarvis，一个通用的个人助理。当前阶段可以使用文件工具完成用户请求。\n"
+    "需要文件信息时先使用工具，不要凭空猜测。工具返回的失败不能证明内容不存在。"
+    "回答时区分已确认的事实和不确定性，并使用用户的语言。"
+)
 
 
 class ConfigurationError(ValueError):
@@ -77,6 +83,44 @@ def _setting(values: Mapping[str, str], key: str, default: str | None = None) ->
     return values.get(key, default)
 
 
+GLOBAL_SETTINGS_FILE = "settings.json"
+
+
+def _global_settings_path(state_dir: Path) -> Path:
+    return state_dir / GLOBAL_SETTINGS_FILE
+
+
+def load_global_tool_permission_mode(state_dir: Path) -> str | None:
+    """Read the user-wide permission default, if one was explicitly saved."""
+
+    path = _global_settings_path(state_dir)
+    if not path.exists():
+        return None
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"无法读取全局设置: {path}") from exc
+    if not isinstance(values, dict):
+        raise ConfigurationError("全局设置必须是 JSON 对象。")
+    mode = values.get("tool_permission_mode")
+    if mode is not None and mode not in PermissionPolicy.MODES:
+        raise ConfigurationError("全局设置中的 TOOL_PERMISSION_MODE 无效。")
+    return mode
+
+
+def save_global_tool_permission_mode(state_dir: Path, mode: str) -> None:
+    """Atomically save the user-wide tool permission default."""
+
+    if mode not in PermissionPolicy.MODES:
+        raise ValueError("invalid permission mode")
+    path = _global_settings_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"tool_permission_mode": mode}, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+    temporary.replace(path)
+
+
 def parse_compact_argument(argument: str) -> int | None:
     """Return the optional keep target for the /compact command."""
 
@@ -86,6 +130,13 @@ def parse_compact_argument(argument: str) -> int | None:
     if not text.isdigit() or int(text) < 1:
         raise ValueError("用法：/compact [保留的 token 数]，例如 /compact 2000；不带参数时保留当前任务的原文。")
     return int(text)
+
+
+PERMISSION_COMMANDS = {
+    "/all": "approve-all",
+    "/safe": "approve-dangerous",
+    "/wide": "broad-access",
+}
 
 
 @dataclass(frozen=True)
@@ -121,6 +172,7 @@ class Config:
     tool_output_preview_chars: int = 500
     verbose_tool_output: bool = False
     tool_permission_mode: str = "approve-dangerous"
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
     provider_tool_mode: str = "emulated"
     tool_max_timeout: float = 60.0
     embedding_base_url: str | None = None
@@ -210,14 +262,16 @@ class Config:
             raise ConfigurationError("REQUEST_TIMEOUT 必须大于 0。")
 
         context_window = optional_positive_int("CONTEXT_WINDOW_TOKENS")
-        return cls(
+        configured_permission_mode = _setting(values, "TOOL_PERMISSION_MODE")
+        state_config = cls(
             base_url=base_url.rstrip("/"),
             api_key=_setting(values, "API_KEY", "") or "",
             model=model,
             max_rounds=positive_int("MAX_ROUNDS", 5),
             root_dir=root_dir,
             state_dir=state_dir,
-            tool_permission_mode=_setting(values, "TOOL_PERMISSION_MODE", "approve-dangerous"),
+            tool_permission_mode=configured_permission_mode or "approve-dangerous",
+            system_prompt=(_setting(values, "SYSTEM_PROMPT") or "").strip() or DEFAULT_SYSTEM_PROMPT,
             provider_tool_mode=_setting(values, "PROVIDER_TOOL_MODE", "emulated"),
             tool_max_timeout=positive_int("TOOL_MAX_TIMEOUT", 60),
             embedding_base_url=_setting(values, "EMBEDDING_BASE_URL") or None,
@@ -246,6 +300,10 @@ class Config:
             tool_output_preview_chars=positive_int("TOOL_OUTPUT_PREVIEW_CHARS", 500),
             verbose_tool_output=boolean("VERBOSE_TOOL_OUTPUT"),
         )
+        if os.environ.get("TOOL_PERMISSION_MODE") is not None:
+            return state_config
+        global_permission_mode = load_global_tool_permission_mode(resolve_state_dir(state_config))
+        return replace(state_config, tool_permission_mode=global_permission_mode or state_config.tool_permission_mode)
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -1002,10 +1060,8 @@ class Agent:
     def _system_prompt(self) -> str:
         extensions = ", ".join(self.config.text_extensions)
         return (
-            "你是 Jarvis，一个通用的个人助理。当前阶段可以使用文件工具完成用户请求。\n"
+            self.config.system_prompt + "\n" +
             f"默认工作区是 {self.config.root_dir}；read/read_file 可读取工作区外的文本文件，相对路径以工作区为基准；文本扩展名包括 {extensions}。\n"
-            "需要文件信息时先使用工具，不要凭空猜测。工具返回的失败不能证明内容不存在。"
-            "回答时区分已确认的事实和不确定性，并使用用户的语言。"
             "tool_search 返回并激活工具定义，可在本次任务后续轮次调用；旧任务的定义不代表当前可调用。"
             "同批调用可用 _depends_on 指定前置调用 ID；参数值可用 "
             '{"$result":{"call_id":"前置ID","path":["字段"]}} 引用前置结果。'
@@ -1177,6 +1233,7 @@ class Agent:
     def run_request(self, user_text: str) -> str | None:
         prefix = self.store.memory.task_prefix()
         self.messages[0] = {"role": "system", "content": prefix + "\n\n" + self._system_prompt()}
+        task_system_message = dict(self.messages[0])
         request_offset = self.store.mark() if self.store is not None else None
         message_snapshot = deepcopy(self.messages)
         context_snapshot = self.context.snapshot()
@@ -1202,6 +1259,16 @@ class Agent:
         try:
             for round_number in range(1, self.config.max_rounds + 1):
                 final_round = round_number == self.config.max_rounds
+                if final_round:
+                    self.messages[0] = {
+                        **task_system_message,
+                        "content": task_system_message["content"] + (
+                            "\n\n当前是本次任务的最后一轮。请结合已有上下文和工具结果，直接回答用户原始请求。"
+                            "本轮不能再使用工具；不要输出工具调用、调用标记（如 DSML）或继续执行的计划。"
+                            "给出已有证据支持的答案，区分已确认的结果、尚未完成的部分和无法确认的信息；"
+                            "信息不足时明确说明，不要编造结果或把失败的操作说成成功。"
+                        ),
+                    }
                 self.context.set_round(round_number)
                 print(f"\n[第 {round_number}/{self.config.max_rounds} 轮] 请求模型" + ("（收尾）" if final_round else ""))
                 tools = [] if final_round else self.tool_runtime.schemas(self._runtime_task_id)
@@ -1323,6 +1390,7 @@ class Agent:
             print(f"模型请求失败: {exc}")
             return None
         finally:
+            self.messages[0] = task_system_message
             self.store.end_task(task_status)
             self.usage_ledger.summary()
 
@@ -1391,7 +1459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"会话错误: {exc}", file=sys.stderr)
         return 2
 
-    print("Jarvis 已启动。输入 exit 退出，/compact [保留token] 主动压缩上下文，Ctrl+C 取消当前请求。")
+    print("Jarvis 已启动。输入 exit 退出，/compact [保留token] 主动压缩上下文，/all、/safe、/wide 设置全局工具权限，Ctrl+C 取消当前请求。")
     try:
         while True:
             try:
@@ -1412,6 +1480,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(str(exc))
                     continue
                 agent.compact_now(keep)
+                continue
+            if command.casefold() == "/permissions":
+                print(f"全局工具权限：{agent.tool_runtime.policy.mode}")
+                continue
+            mode = PERMISSION_COMMANDS.get(command.casefold())
+            if mode:
+                policy = agent.tool_runtime.policy
+                widening = PermissionPolicy.MODES[mode] > PermissionPolicy.MODES[policy.mode]
+                if widening:
+                    try:
+                        confirmed = input(f"将全局工具权限升级为 {mode}，后续启动均会使用此设置。确认? [y/N] ").strip().casefold() == "y"
+                    except (EOFError, KeyboardInterrupt):
+                        confirmed = False
+                    if not confirmed:
+                        print("未更改全局工具权限。")
+                        continue
+                try:
+                    save_global_tool_permission_mode(resolve_state_dir(config), mode)
+                except OSError as exc:
+                    print(f"无法保存全局工具权限：{exc}")
+                    continue
+                outcome = policy.change_mode(mode, confirmed=widening)
+                if not outcome["ok"]:
+                    print(f"未更改全局工具权限：{outcome['error']['message']}")
+                    continue
+                print(f"全局工具权限已设为 {mode}。")
                 continue
             try:
                 agent.run_request(user_text)
