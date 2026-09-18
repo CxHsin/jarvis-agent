@@ -137,6 +137,8 @@ with Application(Config.from_env(), client=model_client) as app:
 
 `Workspace` 负责文件访问边界和读写工具，`ToolRuntime` 负责稳定工具注册、动态搜索、权限与执行审计，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、加锁和加载（旧格式保留兼容截断路径），`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。
 
+最终的生命周期、职责、兼容和中断语义见 [ADR 0013](docs/adr/0013-final-runtime-boundaries.md)。其中记录了 Windows shell provider 的已知限制及 .NET 文件 API 契约；不要据此推断未经测试的真实模型服务或任意 provider 命令已经验证。
+
 
 ### 旧数据自动迁移与失败恢复
 
