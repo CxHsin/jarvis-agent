@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import stat
 import sys
 import tempfile
@@ -184,7 +185,7 @@ class WindowsShell:
             env = dict(SystemRoot=os.environ['SystemRoot'], WINDIR=os.environ['SystemRoot'],
                 COMSPEC=executable, PATH=os.pathsep.join([str(system), str(Path(sys.executable).parent)]),
                 PYTHON_RUNTIME=str(Path(sys.executable).resolve()),
-                JARVIS_LAUNCHER=str(launcher_path),
+                JARVIS_LAUNCH_ARGUMENTS=subprocess.list2cmdline(['-I', str(launcher_path)]),
                 TEMP=self.temp.name, TMP=self.temp.name, USERPROFILE=self.temp.name, HOME=self.temp.name)
             for key in ('SystemDrive', 'ALLUSERSPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ProgramData',
                         'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'USERNAME', 'USERDOMAIN'):
@@ -196,24 +197,27 @@ class WindowsShell:
             # PowerShell's native command resolver probes the AppContainer provider and
             # rejects otherwise valid absolute paths.  Keep the original paths and use
             # Process.Start for Python, while retaining the shell process as the Job root.
-            bridge = r'''function ConvertTo-WinArg([string] $value) {
-    if ($value.Length -eq 0) { return '""' }
-    $escaped = $value -replace '(\\*)"', '$1$1\"'
-    $escaped = $escaped -replace '(\\+)$', '$1$1'
-    return '"' + $escaped + '"'
-}
-function python {
-    $manifest = Join-Path $env:TEMP 'jarvis-python-argv.json'
-    $argv = @($env:PYTHON_RUNTIME) + @($args)
-    [IO.File]::WriteAllText($manifest, ($argv | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
+            bridge = r'''function python {
+    $ErrorActionPreference = 'Stop'
+    $manifest = [IO.Path]::Combine($env:TEMP, ([Guid]::NewGuid().ToString() + '.json'))
+    try {
+    $argv = @($env:PYTHON_RUNTIME) + @($args | ForEach-Object { [string]$_ })
+    [IO.File]::WriteAllText($manifest, (ConvertTo-Json -InputObject $argv -Compress), [Text.Encoding]::UTF8)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $env:PYTHON_RUNTIME
     $psi.UseShellExecute = $false
     $psi.EnvironmentVariables['JARVIS_PYTHON_MANIFEST'] = $manifest
-    $psi.Arguments = '-I ' + (ConvertTo-WinArg $env:JARVIS_LAUNCHER)
+    $psi.Arguments = $env:JARVIS_LAUNCH_ARGUMENTS
     $child = [System.Diagnostics.Process]::Start($psi)
     $child.WaitForExit()
     if ($child.ExitCode -ne 0) { exit $child.ExitCode }
+    } catch {
+        [Console]::Error.WriteLine($_.ToString())
+        exit 1
+    } finally {
+        if ($null -ne $child) { $child.Dispose() }
+        [IO.File]::Delete($manifest)
+    }
 }
 '''
             encoded = __import__('base64').b64encode((bridge + '\n' + command).encode('utf-16le')).decode('ascii')

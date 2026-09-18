@@ -76,12 +76,12 @@ def test_python_bridge_preserves_windows_arguments(tmp_path):
         encoding='utf-8')
     args = ['space value', 'ümlaut', 'quote"value', r'C:\\', '']
     rendered = ' '.join("'" + value.replace("'", "''") + "'" for value in args)
-    command = f"python -I '{script}' {rendered}"
+    command = f"python -I '{script}' {rendered} 123"
     agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(
         answer(call('bash', {'command': command})), {'content': 'done'}))
     try:
         agent.run_request('Run argv check')
-        assert json.loads((tmp_path / 'argv.json').read_text()) == args
+        assert json.loads((tmp_path / 'argv.json').read_text()) == args + ['123']
         assert tool_results(agent)[0]['ok'] is True
     finally:
         agent.close()
