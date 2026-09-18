@@ -17,7 +17,7 @@ def test_shell_can_write_workspace_but_cannot_overwrite_memory(tmp_path):
     memory.mkdir(parents=True, exist_ok=True)
     sentinel = memory / 'sentinel.md'
     sentinel.write_text('original', encoding='utf-8')
-    command = f'echo allowed>allowed.txt & echo compromised>"{sentinel}"'
+    command = f"[IO.File]::WriteAllText('{tmp_path / 'allowed.txt'}','allowed'); [IO.File]::WriteAllText('{sentinel}','compromised')"
     agent = Agent(settings, Client(answer(call('bash', {'command': command})), {'content': 'done'}))
     try:
         agent.run_request('Run the workspace command')
@@ -53,7 +53,7 @@ for name, action in [
         results[name] = 'denied'
 Path('probe-result.json').write_text(json.dumps(results))
 ''', encoding='utf-8')
-    command = f'"{sys._base_executable}" -I "{script}"'
+    command = f"python -I '{script}'"
     agent = Agent(settings, Client(answer(call('bash', {'command': command, 'timeout': 30})), {'content': 'done'}))
     try:
         agent.run_request('Run the isolation check')
@@ -70,8 +70,8 @@ Path('probe-result.json').write_text(json.dumps(results))
 def test_deleting_granted_file_does_not_break_next_shell(tmp_path):
     (tmp_path / 'delete-me.txt').write_text('temporary')
     agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(
-        answer(call('bash', {'command': "Remove-Item -LiteralPath 'delete-me.txt'"})),
-        answer(call('bash', {'command': "Set-Content -LiteralPath 'next.txt' -Value next"}, call_id='second')), {'content': 'done'}))
+        answer(call('bash', {'command': f"[IO.File]::Delete('{tmp_path / 'delete-me.txt'}')"})),
+        answer(call('bash', {'command': f"[IO.File]::WriteAllText('{tmp_path / 'next.txt'}','next')"}, call_id='second')), {'content': 'done'}))
     try:
         agent.run_request('Delete the temporary file and write the next file')
         assert not (tmp_path / 'delete-me.txt').exists()
@@ -101,7 +101,7 @@ while not Path('child-ready').exists() and time.monotonic() < until:
 Path('spawn-result.json').write_text(json.dumps({'escaped': escaped, 'ready': Path('child-ready').exists(), 'pid': child.pid}))
 ''', encoding='utf-8')
     agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(
-        answer(call('bash', {'command': f'"{sys._base_executable}" -I "{script}"', 'timeout': 30})), {'content': 'done'}))
+        answer(call('bash', {'command': f"python -I '{script}'", 'timeout': 30})), {'content': 'done'}))
     try:
         agent.run_request('Run the child-process check')
         result = json.loads((tmp_path / 'spawn-result.json').read_text())

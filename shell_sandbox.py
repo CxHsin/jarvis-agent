@@ -180,6 +180,7 @@ class WindowsShell:
             executable = str(system / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe')
             env = dict(SystemRoot=os.environ['SystemRoot'], WINDIR=os.environ['SystemRoot'],
                 COMSPEC=executable, PATH=os.pathsep.join([str(system), str(Path(sys.executable).parent)]),
+                PYTHON_RUNTIME=str(Path(sys.executable).resolve()),
                 TEMP=self.temp.name, TMP=self.temp.name, USERPROFILE=self.temp.name, HOME=self.temp.name)
             for key in ('SystemDrive', 'ALLUSERSPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ProgramData',
                         'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'USERNAME', 'USERDOMAIN'):
@@ -188,7 +189,20 @@ class WindowsShell:
             environment = c.create_unicode_buffer('\0'.join(f'{key}={value}' for key, value in sorted(env.items())) + '\0\0')
             create_process = api(self.kernel, 'CreateProcessW', [w.LPCWSTR, w.LPWSTR, c.c_void_p,
                 c.c_void_p, w.BOOL, w.DWORD, c.c_void_p, w.LPCWSTR, c.POINTER(StartupEx), c.POINTER(ProcessInfo)])
-            encoded = __import__('base64').b64encode(command.encode('utf-16le')).decode('ascii')
+            # PowerShell's native command resolver probes the AppContainer provider and
+            # rejects otherwise valid absolute paths.  Keep the original paths and use
+            # Process.Start for Python, while retaining the shell process as the Job root.
+            bridge = r'''function python {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $env:PYTHON_RUNTIME
+    $psi.UseShellExecute = $false
+    $psi.Arguments = (($args | ForEach-Object { '"' + ($_.ToString().Replace('"', '\"')) + '"' }) -join ' ')
+    $child = [System.Diagnostics.Process]::Start($psi)
+    $child.WaitForExit()
+    if ($child.ExitCode -ne 0) { exit $child.ExitCode }
+}
+'''
+            encoded = __import__('base64').b64encode((bridge + '\n' + command).encode('utf-16le')).decode('ascii')
             command_line = f'"{executable}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}'
             self._check(create_process(executable, c.create_unicode_buffer(command_line),
                 None, None, True, 0x80000 | 0x400 | 0x4 | 0x08000000, environment,
