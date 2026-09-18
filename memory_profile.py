@@ -5,7 +5,8 @@ import math
 import uuid
 from contextlib import contextmanager
 
-from stable_memory import timestamp
+from stable_memory import StableMemory, timestamp
+from memory_store import MemoryStore
 
 
 PROFILE_CATEGORIES = ('identity', 'work_preferences', 'communication',
@@ -38,9 +39,13 @@ def profile_tokens(content):
 
 
 class ProfileMemory:
-    def _init_profile(self, db):
-        self.profile_path = self.directory / 'memory.md'
-        self.self_path = self.directory / 'self.md'
+    def __init__(self, store: MemoryStore, facts: StableMemory):
+        self.store = store
+        self.facts = facts
+        self.profile_path = store.directory / 'memory.md'
+        self.self_path = store.directory / 'self.md'
+
+    def initialize(self, db):
         db.execute('''CREATE TABLE IF NOT EXISTS profile_versions (
             version INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL,
             source_fact_ids TEXT NOT NULL, token_count INTEGER NOT NULL,
@@ -55,7 +60,7 @@ class ProfileMemory:
         if not self.profile_path.exists():
             self.profile_path.write_text(self._latest_profile(db)['content'], encoding='utf-8')
         # A row seen during startup came from a previously committed transaction.
-        self._recover_profile_publication(db)
+        self.recover_publication(db)
         try:
             with self.self_path.open('x', encoding='utf-8') as stream:
                 stream.write(DEFAULT_SELF)
@@ -67,7 +72,7 @@ class ProfileMemory:
         row['source_fact_ids'] = json.loads(row['source_fact_ids'])
         return row
 
-    def _recover_profile_publication(self, db):
+    def recover_publication(self, db):
         pending = db.execute('SELECT * FROM profile_publication WHERE singleton=1').fetchone()
         if pending is None:
             return True
@@ -90,32 +95,48 @@ class ProfileMemory:
     @contextmanager
     def _profile_transaction(self):
         """Commit fact IDs and the publication intent before exposing either on disk."""
-        with self._lock:
-            with self._connect() as db:
-                db.execute('BEGIN IMMEDIATE')
-                if not self._recover_profile_publication(db):
+        with self.store.locked():
+            with self.store.transaction() as db:
+                if not self.recover_publication(db):
                     raise ProfileEditError('memory.md changed after an interrupted publication; preserve your edit and restore the committed profile before retrying')
                 yield db
             # A crash here leaves the durable outbox for the next task or startup.
-            with self._connect() as db:
-                db.execute('BEGIN IMMEDIATE')
-                if not self._recover_profile_publication(db):
+            with self.store.transaction() as db:
+                if not self.recover_publication(db):
                     raise ProfileEditError('memory.md changed after profile commit; your newer edit was preserved')
+
+    @contextmanager
+    def fact_transaction(self):
+        """Commit fact changes with their profile intent, preserving manual edits.
+
+        An unresolved newer edit defers publication, never the user's correction
+        or forgetting decision. Import at the next task remains the edit gate.
+        """
+        with self.store.locked():
+            with self.store.transaction() as db:
+                recovered = self.recover_publication(db)
+            with self.store.transaction() as db:
+                yield db
+                if recovered:
+                    self.stage_refresh(db, preserve_edits=True)
+            if recovered:
+                with self.store.transaction() as db:
+                    self.recover_publication(db)
 
     def profile_snapshot(self):
         """Read the activated DB projection; never use Markdown for recall."""
-        with self._lock, self._connect() as db:
+        with self.store.read() as db:
             return self._latest_profile(db)
 
     def task_prefix(self):
         """Take one immutable prefix snapshot at the start of a task."""
-        with self._lock:
+        with self.store.locked():
             self.import_profile_edits()
             return self.prefix_snapshot()
 
     def prefix_snapshot(self):
         """Read the last accepted profile with the user-maintained Agent self."""
-        with self._lock:
+        with self.store.locked():
             return self.self_path.read_text(encoding='utf-8') + '\n\n' + self.profile_snapshot()['content']
 
     def _parse_profile(self, content):
@@ -140,7 +161,7 @@ class ProfileMemory:
                     if not isinstance(row['fact_id'], str) or row['fact_id'] in seen:
                         raise ValueError()
                     seen.add(row['fact_id'])
-                row = self._fact_values(dict(row, subject='USER', category=category, confidence=1.0))
+                row = self.facts.validate(dict(row, subject='USER', category=category, confidence=1.0))
             except (ValueError, TypeError) as exc:
                 raise ProfileEditError('Invalid memory.md row: use JSON fact_id, predicate, object under a fixed category; new fact_id is null') from exc
             rows.append(row)
@@ -170,54 +191,37 @@ class ProfileMemory:
                 remaining.add(target)
                 if target is not None and row['object'] == original[target]['object']:
                     continue
-                result = self._write_fact(db, row, [source], 'user_correction', correction_target=target)
+                result = self.facts.write_fact(db, row, [source], 'user_correction', correction_target=target)
                 if target and result != target:
-                    self._invalidate(db, target, result, now, 'Explicit memory.md user correction')
+                    self.facts.invalidate(db, target, result, now, 'Explicit memory.md user correction')
             for target in original.keys() - remaining:
-                self._invalidate(db, target, None, now, 'User removed memory.md fact', status='forgotten')
+                self.facts.invalidate(db, target, None, now, 'User removed memory.md fact', status='forgotten')
                 db.execute('INSERT INTO fact_sources VALUES (?,?,?,?,?,?,?,?)',
                            (target, source['source_task_id'], edit_id, str(self.profile_path), observed, now, None, 'user_forget'))
             self._publish_profile(db, previous, observed)
             return True
 
     def profile_versions(self):
-        with self._lock, self._connect() as db:
+        with self.store.read() as db:
             rows = [dict(row) for row in db.execute('SELECT * FROM profile_versions ORDER BY version')]
         for row in rows:
             row['source_fact_ids'] = json.loads(row['source_fact_ids'])
         return rows
 
-    def consolidate(self, client):
-        success = super().consolidate(client)
-        if success:
-            self.refresh_profile()
-        return success
-
-    def correct(self, fact_id, fact, *, source, operation_id=None):
-        result = super().correct(fact_id, fact, source=source, operation_id=operation_id)
-        self._refresh_after_operation()
-        return result
-
-    def forget(self, fact_id, *, source, operation_id=None):
-        result = super().forget(fact_id, source=source, operation_id=operation_id)
-        self._refresh_after_operation()
-        return result
-
-    def _refresh_after_operation(self):
-        try:
-            self.refresh_profile()
-        except ProfileEditError:
-            # The user will resolve/import the file at the next task boundary.
-            pass
-
     def refresh_profile(self):
         """Publish active facts at a consolidation boundary without version churn."""
         with self._profile_transaction() as db:
-            previous = self._latest_profile(db)
-            observed = self.profile_path.read_text(encoding='utf-8')
-            if observed != previous['content']:
-                raise ProfileEditError('memory.md contains user edits; import them at the next task before consolidation')
-            return self._publish_profile(db, previous, observed)
+            return self.stage_refresh(db)
+
+    def stage_refresh(self, db, *, preserve_edits=False):
+        """Stage a version and outbox in the caller's fact transaction."""
+        previous = self._latest_profile(db)
+        observed = self.profile_path.read_text(encoding='utf-8')
+        if observed != previous['content']:
+            if preserve_edits:
+                return previous
+            raise ProfileEditError('memory.md contains user edits; import them at the next task before consolidation')
+        return self._publish_profile(db, previous, observed)
 
     def _publish_profile(self, db, previous, observed):
         now = timestamp()

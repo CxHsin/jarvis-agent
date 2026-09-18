@@ -7,6 +7,7 @@ import math
 import re
 
 from stable_memory import timestamp
+from memory_store import MemoryStore
 
 
 def terms(text):
@@ -23,7 +24,15 @@ def current(row, now):
 
 
 class MemoryRetrieval:
-    def _init_retrieval(self, db):
+    def __init__(self, store: MemoryStore, *, embedding_client=None, rewrite_client=None,
+                 embedding_model=None, embedding_dimensions=1536):
+        self.store = store
+        self.embedding_dimensions = embedding_dimensions
+        self._vec_available = False
+        self.configure_retrieval(embedding_client=embedding_client,
+                                 rewrite_client=rewrite_client, embedding_model=embedding_model)
+
+    def initialize(self, db):
         db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(fact_id UNINDEXED, text, subject, predicate, object)")
         db.execute("CREATE TABLE IF NOT EXISTS memory_embedding_cache (fact_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS memory_index_config (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -42,7 +51,7 @@ class MemoryRetrieval:
             self._vec_available = False
         # Also migrates old unsegmented FTS rows, without making network calls.
         for row in list(db.execute("SELECT fact_id FROM memory_facts")):
-            self._index_fact(db, row["fact_id"])
+            self.index_fact(db, row["fact_id"])
 
     def configure_retrieval(self, *, embedding_client=None, rewrite_client=None, embedding_model=None):
         self.embedding_client = embedding_client
@@ -65,7 +74,7 @@ class MemoryRetrieval:
             raise ValueError("Zero embedding")
         return [value / norm for value in result]
 
-    def _index_fact(self, db, fact_id):
+    def index_fact(self, db, fact_id):
         row = db.execute("SELECT fact_id,text,subject,predicate,object FROM memory_facts WHERE fact_id=?", (fact_id,)).fetchone()
         if row:
             db.execute("DELETE FROM memory_fts WHERE fact_id=?", (fact_id,))
@@ -78,7 +87,7 @@ class MemoryRetrieval:
             return False
         if not self._vec_available:
             return True
-        with self._connect() as db:
+        with self.store.read() as db:
             rows = list(db.execute("SELECT fact_id,text FROM memory_facts WHERE status!='forgotten'"))
             cached = dict(db.execute("SELECT fact_id,signature FROM memory_embedding_cache"))
         failed = False
@@ -92,7 +101,7 @@ class MemoryRetrieval:
             except Exception:
                 vector = None
                 failed = True
-            with self._lock, self._connect() as db:
+            with self.store.transaction() as db:
                 actual = db.execute("SELECT text,status FROM memory_facts WHERE fact_id=?", (row["fact_id"],)).fetchone()
                 if not actual or actual["status"] == "forgotten" or actual["text"] != row["text"]:
                     continue
@@ -124,7 +133,7 @@ class MemoryRetrieval:
         if not query_terms or not records:
             return {}, {}
         expression = " OR ".join('"' + term + '"' for term in query_terms)
-        with self._connect() as db:
+        with self.store.read() as db:
             rows = db.execute("SELECT fact_id FROM memory_fts WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts), fact_id", (expression,))
             ids = [row["fact_id"] for row in rows if row["fact_id"] in records]
         ranks = {key: index + 1 for index, key in enumerate(ids)}
@@ -141,7 +150,7 @@ class MemoryRetrieval:
         try:
             vector = self._embed(query)
             ids = list(records)
-            with self._connect() as db:
+            with self.store.read() as db:
                 # Pre-filter eligible facts so invalid versions cannot crowd out current facts.
                 rows = list(db.execute(
                     "SELECT fact_id,distance FROM memory_vec WHERE embedding MATCH ? AND k=? AND fact_id IN (" +
@@ -169,7 +178,7 @@ class MemoryRetrieval:
         rewritten = self._rewrite(query)
         vector_failed = self._sync_vectors()
         now = timestamp()
-        with self._connect() as db:
+        with self.store.read() as db:
             records = {row["fact_id"]: dict(row) for row in db.execute("SELECT * FROM memory_facts")
                        if row["status"] != "forgotten" and (include_history or current(row, now))}
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -197,7 +206,7 @@ class MemoryRetrieval:
             except Exception:
                 pass
         result, seen = [], set()
-        with self._connect() as db:
+        with self.store.read() as db:
             for key in ranked:
                 # Recheck after external calls; concurrent forgetting must win.
                 row = db.execute("SELECT * FROM memory_facts WHERE fact_id=?", (key,)).fetchone()

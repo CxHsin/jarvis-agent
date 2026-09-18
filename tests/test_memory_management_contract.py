@@ -68,3 +68,52 @@ def test_configured_embedding_survives_normal_agent_startup(tmp_path, monkeypatc
         assert any(call.get('model') == 'embed' for call in calls)
     finally:
         agent.close()
+
+
+def test_agent_reports_failed_correction_without_partial_memory_change(tmp_path):
+    import sqlite3
+    from tests.test_memory_transactions import fact, source
+
+    class Authorization:
+        def complete(self, messages, tools, tool_choice):
+            return {'content': '{"authorized": true}'}
+
+    class CorrectionClient:
+        calls = 0
+        target = None
+        results = []
+
+        def complete(self, messages, tools, tool_choice):
+            self.calls += 1
+            phase = (self.calls - 1) % 3
+            if phase == 2:
+                self.results.append(messages[-1]['content'])
+                return {'role': 'assistant', 'content': 'done'}
+            name, args = ('tool_search', {'query': 'memory'}) if phase == 0 else (
+                'memory_manage', {'action': 'correct', 'fact_id': self.target, 'fact': fact('English')})
+            return {'role': 'assistant', 'content': None, 'tool_calls': [dict(
+                id=str(self.calls), type='function', function=dict(name=name, arguments=json.dumps(args)))]}
+
+    client = CorrectionClient()
+    config = Config(base_url='http://example.test', api_key='', model='test', root_dir=tmp_path,
+                    state_dir=tmp_path / 'state', max_rounds=4)
+    agent = Agent(config, client, memory_authorization_client=Authorization())
+    try:
+        memory = agent.store.memory
+        client.target = memory.remember(fact('Chinese'), source=source('Chinese'))
+        memory.refresh_profile()
+        before = memory.facts(True), memory.conflicts(), memory.profile_versions()
+        with sqlite3.connect(memory.path) as db:
+            db.execute("""CREATE TRIGGER fail_profile BEFORE INSERT ON profile_versions
+                          BEGIN SELECT RAISE(ABORT, 'profile write failed'); END""")
+        agent.run_request('Correct my preferred language to English')
+        assert 'profile write failed' in client.results[-1]
+        assert (memory.facts(True), memory.conflicts(), memory.profile_versions()) == before
+        with sqlite3.connect(memory.path) as db:
+            db.execute('DROP TRIGGER fail_profile')
+        agent.run_request('Correct my preferred language to English')
+        assert [row['object'] for row in memory.facts()] == ['English']
+        assert memory.facts()[0]['sources'][0]['quote'] == 'Correct my preferred language to English'
+        assert 'English' in memory.task_prefix()
+    finally:
+        agent.close()

@@ -14,3 +14,5 @@ The model-facing surface is limited to `memory_search` and `memory_manage` (`rem
 - Memory recall never treats the profile Markdown as the database of record.
 - The first implementation does not need a second history database or algorithm-specific tools.
 - Search indexes can be rebuilt from persisted facts. Re-extraction from task trajectories may produce different facts; corrections, forgetting decisions, and profile versions must be backed up with the database rather than assumed recoverable from user queries alone.
+
+The explicit component and transaction ownership introduced by #38 is recorded in [ADR 0011](0011-memory-components-and-transactions.md), including atomic fact/profile intents and post-commit file recovery.
