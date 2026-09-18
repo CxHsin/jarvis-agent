@@ -181,6 +181,7 @@ class WindowsShell:
             env = dict(SystemRoot=os.environ['SystemRoot'], WINDIR=os.environ['SystemRoot'],
                 COMSPEC=executable, PATH=os.pathsep.join([str(system), str(Path(sys.executable).parent)]),
                 PYTHON_RUNTIME=str(Path(sys.executable).resolve()),
+                JARVIS_LAUNCHER=str(Path(__file__).resolve().with_name('shell_launcher.py')),
                 TEMP=self.temp.name, TMP=self.temp.name, USERPROFILE=self.temp.name, HOME=self.temp.name)
             for key in ('SystemDrive', 'ALLUSERSPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ProgramData',
                         'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'USERNAME', 'USERDOMAIN'):
@@ -192,15 +193,21 @@ class WindowsShell:
             # PowerShell's native command resolver probes the AppContainer provider and
             # rejects otherwise valid absolute paths.  Keep the original paths and use
             # Process.Start for Python, while retaining the shell process as the Job root.
-            bridge = r'''function python {
+            bridge = r'''function ConvertTo-WinArg([string] $value) {
+    if ($value.Length -eq 0) { return '""' }
+    $escaped = $value -replace '(\\*)"', '$1$1\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
+function python {
+    $manifest = Join-Path $env:TEMP 'jarvis-python-argv.json'
+    $argv = @($env:PYTHON_RUNTIME) + @($args)
+    [IO.File]::WriteAllText($manifest, ($argv | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $env:PYTHON_RUNTIME
     $psi.UseShellExecute = $false
-    # QuoteArgument follows Windows argv rules, including embedded quotes,
-    # trailing backslashes, spaces, Unicode, and empty arguments.
-    $psi.Arguments = (($args | ForEach-Object {
-        [System.Management.Automation.Language.CodeGeneration]::QuoteArgument([string]$_)
-    }) -join ' ')
+    $psi.EnvironmentVariables['JARVIS_PYTHON_MANIFEST'] = $manifest
+    $psi.Arguments = '-I ' + (ConvertTo-WinArg $env:JARVIS_LAUNCHER)
     $child = [System.Diagnostics.Process]::Start($psi)
     $child.WaitForExit()
     if ($child.ExitCode -ne 0) { exit $child.ExitCode }
