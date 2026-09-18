@@ -67,6 +67,27 @@ Path('probe-result.json').write_text(json.dumps(results))
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_python_bridge_preserves_windows_arguments(tmp_path):
+    """The PowerShell bridge must preserve argv, including quotes and slashes."""
+    script = tmp_path / 'argv probe.py'
+    script.write_text(
+        'import json, sys\nfrom pathlib import Path\n'
+        "Path('argv.json').write_text(json.dumps(sys.argv[1:]))\n",
+        encoding='utf-8')
+    args = ['space value', 'ümlaut', 'quote"value', r'C:\\', '']
+    rendered = ' '.join("'" + value.replace("'", "''") + "'" for value in args)
+    command = f"python -I '{script}' {rendered}"
+    agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(
+        answer(call('bash', {'command': command})), {'content': 'done'}))
+    try:
+        agent.run_request('Run argv check')
+        assert json.loads((tmp_path / 'argv.json').read_text()) == args
+        assert tool_results(agent)[0]['ok'] is True
+    finally:
+        agent.close()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
 def test_deleting_granted_file_does_not_break_next_shell(tmp_path):
     (tmp_path / 'delete-me.txt').write_text('temporary')
     agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(

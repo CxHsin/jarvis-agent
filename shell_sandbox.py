@@ -196,7 +196,11 @@ class WindowsShell:
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $env:PYTHON_RUNTIME
     $psi.UseShellExecute = $false
-    $psi.Arguments = (($args | ForEach-Object { '"' + ($_.ToString().Replace('"', '\"')) + '"' }) -join ' ')
+    # QuoteArgument follows Windows argv rules, including embedded quotes,
+    # trailing backslashes, spaces, Unicode, and empty arguments.
+    $psi.Arguments = (($args | ForEach-Object {
+        [System.Management.Automation.Language.CodeGeneration]::QuoteArgument([string]$_)
+    }) -join ' ')
     $child = [System.Diagnostics.Process]::Start($psi)
     $child.WaitForExit()
     if ($child.ExitCode -ne 0) { exit $child.ExitCode }
