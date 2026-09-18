@@ -220,28 +220,11 @@ class PendingMemory:
         self._worker.start()
 
     def recover_completed(self):
-        # Recover evicted tasks after a crash without bypassing the saved window.
-        for path in (self.directory / 'trajectories').glob('*.jsonl'):
-            tasks = {}
-            for index, line in enumerate(path.read_text(encoding='utf-8').splitlines()):
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                event.setdefault('event_id', uuid.uuid5(uuid.NAMESPACE_URL, f'{path.stem}:{index}:{line}').hex)
-                task_id = event.get('task_id')
-                if event['type'] == 'task':
-                    tasks[task_id] = dict(event, events=[], status='active')
-                if task_id in tasks:
-                    tasks[task_id]['events'].append(event)
-                    if event['type'] == 'task_end':
-                        tasks[task_id]['status'] = event['status']
-            count = next(reversed(tasks.values())).get('recent_task_count', 5) if tasks else 5
-            ended = [task for task in tasks.values() if task['status'] not in {'active', 'failed'}]
-            retained = {task['task_id'] for task in ended[-count:]}
-            for task in tasks.values():
-                if task['status'] == 'completed' and task['task_id'] not in retained:
-                    self.enqueue(task, path)
+        from task_history import rebuild_projections
+        # Use precisely the foreground fold, including rollback and migration
+        # validity, and the window persisted by the most recent task.
+        rebuild_projections(self.directory, self)
+        self.project()
 
     def close(self, *, wait=False):
         with self.store.locked():

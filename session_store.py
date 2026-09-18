@@ -376,11 +376,20 @@ class SessionStore:
             self._file = None
         self._lock.release()
 
-    def _refresh_history(self) -> None:
+    def _refresh_history(self, *, tolerate_publication_failure=False) -> None:
         self.history = TaskHistory(
             self.memory_directory, self.session_id, self._recent_task_count, self.memory,
             event_path=self.path if self._format_version == SESSION_FORMAT_VERSION else None,
+            publish=False,
         )
+        try:
+            self.history.project()
+        except Exception as exc:
+            self._history_dirty = True
+            if not tolerate_publication_failure:
+                raise
+            print(f"[会话投影] 原始事件已保存，派生视图等待重建: {exc}", file=sys.stderr)
+            return
         self._history_dirty = False
 
     def __enter__(self) -> "SessionStore":
@@ -438,7 +447,9 @@ class SessionStore:
 
     def recent_messages(self) -> list[dict[str, Any]]:
         if self._history_dirty:
-            self._refresh_history()
+            # Only publication may fail open; a failed canonical read must not
+            # silently substitute stale conversation state.
+            self._refresh_history(tolerate_publication_failure=True)
         return self.history.messages()
 
     def context_messages(self) -> list[dict[str, Any]]:
@@ -447,7 +458,17 @@ class SessionStore:
         return contents.messages if contents.has_checkpoint else self.recent_messages()
 
     def record_recent_context(self, messages: Sequence[Mapping[str, Any]]) -> None:
-        self._append({"type": "recent_context", "messages": list(messages)})
+        if self._format_version == SESSION_FORMAT_VERSION:
+            # A checkpoint is already durably authoritative. Never replace it
+            # with full task evidence from the independent Recent projection.
+            if self.load().has_checkpoint:
+                return
+            if list(messages) != self.recent_messages():
+                raise ValueError('Recent context must select canonical messages')
+            self._append({'type': 'recent_context',
+                          'message_event_ids': self.history.message_event_ids()})
+        else:
+            self._append({"type": "recent_context", "messages": list(messages)})
 
     def record_runtime(self, state: Mapping[str, Any], audit: Mapping[str, Any] | None = None) -> None:
         record = {"type": "runtime", "state": dict(state)}
@@ -526,6 +547,8 @@ class SessionStore:
             return contents
         text = self.path.read_text(encoding="utf-8", errors="replace")
         records, warnings = _read_records(text)
+        original_messages = {record['event_id']: record['message'] for record in records
+                             if record.get('type') == RECORD_MESSAGE and 'event_id' in record}
         compact_compressed_ids: list[str] = []
         for record in _visible_records(records):
             kind = record.get("type")
@@ -537,7 +560,11 @@ class SessionStore:
                 if isinstance(message, Mapping):
                     contents.messages.append(dict(message))
             elif kind == "recent_context":
-                contents.messages = [dict(message) for message in record.get("messages", [])]
+                if 'message_event_ids' in record:
+                    contents.messages = [dict(original_messages[event_id])
+                                         for event_id in record['message_event_ids']]
+                else:
+                    contents.messages = [dict(message) for message in record.get("messages", [])]
                 contents.has_checkpoint = False
             elif kind == "runtime":
                 contents.runtime = dict(record.get("state") or {})

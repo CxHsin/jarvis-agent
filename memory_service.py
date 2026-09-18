@@ -145,6 +145,14 @@ class MemoryService:
 
     def _recover_completed(self):
         # Compatibility for existing host recovery callers.
+        self.rebuild_projections()
+
+    def rebuild_projections(self):
+        """Repair History, per-session Recent and eligible Pending inputs.
+
+        Original events and committed extraction results are never rewritten.
+        No model calls are made; an existing batch retains its identity/status.
+        """
         self._pending.recover_completed()
 
     def close(self, *, wait=False):

@@ -5,11 +5,84 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+from threading import RLock
 import uuid
 
 
+# Serialize shared daily files and session projections in the supported process.
+_projection_lock = RLock()
+
+
+def read_events(path, session_id):
+    if not path.exists():
+        return []
+    events = []
+    for index, line in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # A torn tail remains untouched in the original file.
+        if not isinstance(event, dict):
+            continue
+        event.setdefault('event_id', uuid.uuid5(uuid.NAMESPACE_URL, f'{session_id}:{index}:{line}').hex)
+        events.append(event)
+    return events
+
+
+def event_sources(directory):
+    """Committed canonical streams, plus trajectories not yet migrated."""
+    from session_migration import committed_path
+    migrated = set()
+    sources = []
+    for original in sorted((directory.parent / 'sessions').glob('*/*.jsonl')):
+        path = committed_path(original)
+        if path != original:
+            migrated.add(original.stem)
+        events = read_events(path, original.stem)
+        if events and events[0].get('version') == 2:
+            sources.append((original.stem, path, events))
+    for path in sorted((directory / 'trajectories').glob('*.jsonl')):
+        if path.stem not in migrated:
+            sources.append((path.stem, path, read_events(path, path.stem)))
+    return sources
+
+
+def project_history(directory):
+    """Rebuild daily user-input indexes without consuming edited Markdown."""
+    with _projection_lock:
+        days = {}
+        for _, path, events in event_sources(directory):
+            for event in events:
+                if event.get('type') != 'task' or event.get('migration_projection') == 'session':
+                    continue
+                now = event['recorded_at']
+                query = json.dumps(event['goal'], ensure_ascii=False)
+                line = (f'- occurred_at={event.get("occurred_at")} recorded_at={now} '
+                        f'task={event["task_id"]} event={event["event_id"]} source={path}: {query}\n')
+                days.setdefault(now[:10], []).append((now, event['event_id'], line))
+        for day, rows in days.items():
+            _publish(directory / 'history' / f'{day}.md', ''.join(row[2] for row in sorted(rows)))
+
+
+def rebuild_projections(directory, memory):
+    """Keep recovery's snapshot and publication in one foreground lock scope."""
+    with _projection_lock:
+        for session_id, path, _ in event_sources(directory):
+            history = TaskHistory(directory, session_id, None, memory, event_path=path, publish=False)
+            history.project(include_history=False)
+        project_history(directory)
+
+
+def _publish(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(content, encoding='utf-8')
+    temporary.replace(path)
+
+
 class TaskHistory:
-    def __init__(self, directory: Path, session_id: str, count: int, memory=None, *, event_path=None):
+    def __init__(self, directory: Path, session_id: str, count: int | None, memory=None, *,
+                 event_path=None, publish=True):
         self.directory = directory
         self.session_id = session_id
         self.count = count
@@ -19,17 +92,15 @@ class TaskHistory:
         self.recent_path = directory / "recent" / session_id / "recent.md"
         self.tasks = []
         self._needs_separator = False
-        if self.path.exists():
-            text = self.path.read_text(encoding="utf-8", errors="replace")
-            self._needs_separator = bool(text and not text.endswith("\n"))
-            for index, line in enumerate(text.splitlines()):
-                try:
-                    event = json.loads(line)
-                    event.setdefault("event_id", uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:{index}:{line}").hex)
-                    self._apply(event)
-                except json.JSONDecodeError:
-                    continue
-        self._project()
+        with _projection_lock:
+            for event in read_events(self.path, session_id):
+                self._apply(event)
+            if count is None:
+                self.count = self.tasks[-1].get('recent_task_count', 5) if self.tasks else 5
+            if self.path.exists() and not self._shared_events:
+                self._needs_separator = not self.path.read_bytes().endswith(b'\n')
+            if publish:
+                self.project()
 
     def _apply(self, event):
         if event.get('migration_projection') == 'session':
@@ -53,6 +124,10 @@ class TaskHistory:
             self.tasks[-1]["events"].append(event)
 
     def record(self, record):
+        with _projection_lock:
+            self._record(record)
+
+    def _record(self, record):
         if self._shared_events:
             event = dict(record)
             now = event["recorded_at"]
@@ -60,7 +135,7 @@ class TaskHistory:
             event = self._record_legacy(record)
             now = event["recorded_at"]
         self._apply(event)
-        if event["type"] == "task":
+        if event["type"] == "task" and not self._shared_events:
             history = self.directory / "history" / f"{now[:10]}.md"
             history.parent.mkdir(parents=True, exist_ok=True)
             # JSON quoting keeps each query on one auditable Markdown line.
@@ -71,7 +146,7 @@ class TaskHistory:
                 handle.flush()
                 os.fsync(handle.fileno())
         if event["type"] in {"task", "message", "task_end", "context_reset", "context_rollback"}:
-            self._project()
+            self.project(include_history=event['type'] == 'task')
 
     def _record_legacy(self, record):
         now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -101,17 +176,24 @@ class TaskHistory:
     def messages(self):
         return deepcopy([message for task in self.recent_tasks() for message in task["messages"]])
 
-    def _project(self):
+    def message_event_ids(self):
+        return [event['event_id'] for task in self.recent_tasks() for event in task['events']
+                if event['type'] == 'message']
+
+    def project(self, *, include_history=True):
+        with _projection_lock:
+            self._project_locked(include_history)
+
+    def _project_locked(self, include_history):
+        if self._shared_events and include_history:
+            project_history(self.directory)
         if self.memory is not None:
             retained = {task["task_id"] for task in self.recent_tasks()}
             for task in self.tasks:
                 if task["status"] == "completed" and task["task_id"] not in retained:
                     self.memory.enqueue(task, self.path)
-        self.recent_path.parent.mkdir(parents=True, exist_ok=True)
         content = "# Recent\n\n"
         for task in self.recent_tasks():
             content += f'## {task["task_id"]} ({task["status"]})\n\n'
             content += json.dumps(task["messages"], ensure_ascii=False, indent=2) + "\n\n"
-        temporary = self.recent_path.with_suffix(".tmp")
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(self.recent_path)
+        _publish(self.recent_path, content)
