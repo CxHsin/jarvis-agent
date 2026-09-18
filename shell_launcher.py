@@ -9,7 +9,8 @@ def main():
     manifest = os.environ.get("JARVIS_PYTHON_MANIFEST")
     if not manifest:
         return 64
-    with open(manifest, encoding="utf-8") as stream:
+    # Windows PowerShell 5.1 may emit a UTF-8 BOM for manifest writes.
+    with open(manifest, encoding="utf-8-sig") as stream:
         argv = json.load(stream)
     if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
         return 65
