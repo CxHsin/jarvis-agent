@@ -126,7 +126,7 @@ class Config:
     embedding_base_url: str | None = None
     embedding_api_key: str = ""
     embedding_model: str | None = None
-    embedding_dimensions: int = 1536
+    embedding_dimensions: int | None = None
 
     def __post_init__(self) -> None:
         if self.recent_task_count < 1:
@@ -137,8 +137,11 @@ class Config:
             raise ConfigurationError("PROVIDER_TOOL_MODE 必须是 native 或 emulated。")
         if not 0 < self.tool_max_timeout <= 3600:
             raise ConfigurationError("TOOL_MAX_TIMEOUT 必须大于 0 且不超过 3600 秒。")
-        if self.embedding_dimensions < 1:
-            raise ConfigurationError("EMBEDDING_DIMENSIONS 必须是正整数。")
+        if self.embedding_dimensions is not None and (
+            isinstance(self.embedding_dimensions, bool) or not isinstance(self.embedding_dimensions, int)
+            or not 1 <= self.embedding_dimensions <= 65536
+        ):
+            raise ConfigurationError("EMBEDDING_DIMENSIONS 必须是 1 到 65536 的整数。")
         if self.context_window_tokens is not None and self.context_window_source == "unknown":
             object.__setattr__(self, "context_window_source", "configured")
 
@@ -225,7 +228,7 @@ class Config:
             embedding_base_url=_setting(values, "EMBEDDING_BASE_URL") or None,
             embedding_api_key=_setting(values, "EMBEDDING_API_KEY", "") or "",
             embedding_model=_setting(values, "EMBEDDING_MODEL") or None,
-            embedding_dimensions=positive_int("EMBEDDING_DIMENSIONS", 1536),
+            embedding_dimensions=optional_positive_int("EMBEDDING_DIMENSIONS"),
             text_extensions=extensions,
             request_timeout=timeout,
             max_read_chars=positive_int("MAX_READ_CHARS", 12_000),

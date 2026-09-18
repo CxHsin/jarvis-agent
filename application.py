@@ -15,12 +15,18 @@ def assemble_memory(config, *, embedding_client=None, rewrite_client=None):
     protect_legacy_memory(config)
     endpoint = getattr(config, 'embedding_base_url', None)
     model = getattr(config, 'embedding_model', None)
-    if embedding_client is None and endpoint and model:
+    dimensions = getattr(config, 'embedding_dimensions', None)
+    settings = dict(base_url=endpoint, api_key=getattr(config, 'embedding_api_key', ''),
+                    model=model, dimensions=dimensions)
+    missing = [key for key, value in settings.items() if value is None or not str(value).strip()]
+    configuration = dict(state='disabled' if len(missing) == 4 else 'incomplete', missing=missing)
+    if embedding_client is None and not missing:
         embedding_client = OpenAIEmbeddingClient(endpoint, getattr(config, 'embedding_api_key', ''),
                                                  model, getattr(config, 'request_timeout', 60.0))
     return MemoryService(resolve_state_dir(config) / 'memory', embedding_client=embedding_client,
                          rewrite_client=rewrite_client, embedding_model=model,
-                         embedding_dimensions=getattr(config, 'embedding_dimensions', 1536))
+                         embedding_dimensions=dimensions,
+                         embedding_configuration=configuration if embedding_client is None else None)
 
 
 def standalone_store(config, *, session_id=None, resume=False):

@@ -37,13 +37,13 @@ class MemoryService:
     """
 
     def __init__(self, directory: Path, *, embedding_client=None, rewrite_client=None,
-                 embedding_model=None, embedding_dimensions=1536):
+                 embedding_model=None, embedding_dimensions=None, embedding_configuration=None):
         self._store = MemoryStore(directory)
         self.directory = self._store.directory
         self.path = self._store.path
         self._retrieval = MemoryRetrieval(self._store, embedding_client=embedding_client,
             rewrite_client=rewrite_client, embedding_model=embedding_model,
-            embedding_dimensions=embedding_dimensions)
+            embedding_dimensions=embedding_dimensions, embedding_configuration=embedding_configuration)
         self._facts = StableMemory(self._store, self._retrieval.index_fact)
         self._profile = ProfileMemory(self._store, self._facts)
         self._pending = PendingMemory(self._store, self._facts, self._profile)
@@ -92,6 +92,9 @@ class MemoryService:
     def search(self, query, *, include_history=False, limit=8):
         return self._retrieval.search(query, include_history=include_history, limit=limit)
 
+    def vector_status(self):
+        return self._retrieval.vector_status()
+
     def configure_retrieval(self, *, embedding_client=None, rewrite_client=None, embedding_model=None):
         self._retrieval.configure_retrieval(embedding_client=embedding_client,
             rewrite_client=rewrite_client, embedding_model=embedding_model)
@@ -136,11 +139,14 @@ class MemoryService:
         return self._pending.consolidate_due(client, now)
 
     def start_worker(self, client, retry_seconds=60):
-        self._pending.start_worker(client, retry_seconds)
+        self._retrieval.start_worker(retry_seconds)
+        if client is not None:
+            self._pending.start_worker(client, retry_seconds)
 
     def _recover_completed(self):
         # Compatibility for existing host recovery callers.
         self._pending.recover_completed()
 
     def close(self, *, wait=False):
+        self._retrieval.close(wait=wait)
         self._pending.close(wait=wait)

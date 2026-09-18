@@ -1,10 +1,12 @@
 """Hybrid retrieval over versioned facts; indexes are disposable derived state."""
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import hashlib
 import json
 import math
 import re
+from threading import Event, Thread
 
 from stable_memory import timestamp
 from memory_store import MemoryStore
@@ -23,22 +25,49 @@ def current(row, now):
         row["valid_to"] is None or row["valid_to"] > now)
 
 
+@dataclass(frozen=True)
+class EmbeddingRequest:
+    client: object
+    model: str | None
+    dimensions: int | None
+    generation: int
+
+    def signature(self, text):
+        return hashlib.sha256(json.dumps(
+            [self.model, self.dimensions, text], ensure_ascii=False).encode()).hexdigest()
+
+
 class MemoryRetrieval:
     def __init__(self, store: MemoryStore, *, embedding_client=None, rewrite_client=None,
-                 embedding_model=None, embedding_dimensions=1536):
+                 embedding_model=None, embedding_dimensions=None, embedding_configuration=None):
         self.store = store
         self.embedding_dimensions = embedding_dimensions
         self._vec_available = False
+        self._wake = Event()
+        self._stop = Event()
+        self._worker = None
+        self._backfill_failed = False
+        self._generation = 0
         self.configure_retrieval(embedding_client=embedding_client,
                                  rewrite_client=rewrite_client, embedding_model=embedding_model)
+        if embedding_configuration is not None:
+            self._configuration = embedding_configuration
 
     def initialize(self, db):
         db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(fact_id UNINDEXED, text, subject, predicate, object)")
         db.execute("CREATE TABLE IF NOT EXISTS memory_embedding_cache (fact_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS memory_index_config (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        if isinstance(self.embedding_dimensions, bool) or not isinstance(self.embedding_dimensions, int) or not 1 <= self.embedding_dimensions <= 65536:
+        if self.embedding_dimensions is not None and (isinstance(self.embedding_dimensions, bool) or not isinstance(self.embedding_dimensions, int) or not 1 <= self.embedding_dimensions <= 65536):
             raise ValueError("Embedding dimensions must be a positive integer up to 65536")
+        self._initialize_vectors(db)
+        # Also migrates old unsegmented FTS rows, without making network calls.
+        for row in list(db.execute("SELECT fact_id FROM memory_facts")):
+            self.index_fact(db, row["fact_id"])
+
+    def _initialize_vectors(self, db):
         try:
+            if self._configuration['missing']:
+                raise ValueError('Embedding configuration is incomplete')
             db.execute("SELECT vec_version()")
             previous = db.execute("SELECT value FROM memory_index_config WHERE name='dimensions'").fetchone()
             if previous is None or previous[0] != str(self.embedding_dimensions):
@@ -49,23 +78,30 @@ class MemoryRetrieval:
             self._vec_available = True
         except Exception:
             self._vec_available = False
-        # Also migrates old unsegmented FTS rows, without making network calls.
-        for row in list(db.execute("SELECT fact_id FROM memory_facts")):
-            self.index_fact(db, row["fact_id"])
 
     def configure_retrieval(self, *, embedding_client=None, rewrite_client=None, embedding_model=None):
-        self.embedding_client = embedding_client
-        self.rewrite_client = rewrite_client
-        self.embedding_model = embedding_model
+        with self.store.locked():
+            self.embedding_client = embedding_client
+            self.rewrite_client = rewrite_client
+            self.embedding_model = embedding_model
+            self._generation += 1
+            self._request = EmbeddingRequest(embedding_client, embedding_model,
+                                             self.embedding_dimensions, self._generation)
+            settings = dict(client=embedding_client, model=embedding_model, dimensions=self.embedding_dimensions)
+            missing = [key for key, value in settings.items() if value is None or not str(value).strip()]
+            self._configuration = dict(state='disabled' if embedding_client is None and not embedding_model
+                                       else 'incomplete', missing=missing)
+            self._backfill_failed = False
+            self._wake.set()
 
-    def _embed(self, text):
-        client = self.embedding_client
+    def _embed(self, text, request):
+        client = request.client
         if client is None:
             raise ValueError("Embedding service is not configured")
-        result = client.embed(text, model=self.embedding_model) if hasattr(client, "embed") else client(text)
+        result = client.embed(text, model=request.model) if hasattr(client, "embed") else client(text)
         if isinstance(result, dict):
             result = result.get("embedding") or (result.get("data") or [{}])[0].get("embedding")
-        if not isinstance(result, (tuple, list)) or len(result) != self.embedding_dimensions:
+        if not isinstance(result, (tuple, list)) or len(result) != request.dimensions:
             raise ValueError("Embedding dimension mismatch")
         if any(isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) for value in result):
             raise ValueError("Invalid embedding values")
@@ -80,37 +116,96 @@ class MemoryRetrieval:
             db.execute("DELETE FROM memory_fts WHERE fact_id=?", (fact_id,))
             db.execute("INSERT INTO memory_fts VALUES (?,?,?,?,?)",
                        (row["fact_id"], *(searchable(row[key]) for key in ("text", "subject", "predicate", "object"))))
+            self._wake.set()
+
+    def start_worker(self, retry_seconds=60):
+        with self.store.locked():
+            if self._worker is not None or self._stop.is_set():
+                return
+
+            def run():
+                while not self._stop.is_set():
+                    self._wake.clear()
+                    request = self._request
+                    try:
+                        failed = self._sync_vectors()
+                    except Exception:
+                        # Facts and persisted signatures remain the retry source.
+                        failed = True
+                    with self.store.locked():
+                        if request == self._request:
+                            self._backfill_failed = failed
+                    self._wake.wait(retry_seconds)
+
+            self._worker = Thread(target=run, name='jarvis-memory-vectors', daemon=True)
+            self._worker.start()
+
+    def close(self, *, wait=False):
+        with self.store.locked():
+            self._stop.set()
+            self._wake.set()
+        if self._worker is not None:
+            self._worker.join(timeout=None if wait else 0.1)
+
+    def vector_status(self):
+        with self.store.read() as db:
+            records = {row['fact_id']: dict(row) for row in db.execute(
+                "SELECT fact_id,text FROM memory_facts WHERE status!='forgotten'")}
+            ready = len(self._eligible_vectors(db, records))
+        state = (self._configuration['state'] if self._configuration['missing'] else
+                 'unavailable' if not self._vec_available else
+                 'retrying' if self._backfill_failed else
+                 'backfilling' if ready < len(records) else 'ready')
+        return dict(state=state, ready=ready, pending=len(records) - ready,
+                    missing=list(self._configuration['missing']))
 
     def _sync_vectors(self):
         """Backfill/retry embeddings outside the fact-writing transaction."""
-        if self.embedding_client is None:
+        if self._configuration['missing']:
             return False
         if not self._vec_available:
-            return True
+            with self.store.transaction() as db:
+                self._initialize_vectors(db)
+            if not self._vec_available:
+                return True
         with self.store.read() as db:
+            request = self._request
             rows = list(db.execute("SELECT fact_id,text FROM memory_facts WHERE status!='forgotten'"))
-            cached = dict(db.execute("SELECT fact_id,signature FROM memory_embedding_cache"))
+            cached = self._cached_vectors(db)
         failed = False
         for row in rows:
-            signature = hashlib.sha256(json.dumps(
-                [self.embedding_model, self.embedding_dimensions, row["text"]], ensure_ascii=False).encode()).hexdigest()
+            if self._stop.is_set() or request != self._request:
+                break
+            signature = request.signature(row['text'])
             if cached.get(row["fact_id"]) == signature:
                 continue
             try:
-                vector = self._embed(row["text"])
+                vector = self._embed(row["text"], request)
             except Exception:
-                vector = None
                 failed = True
+                continue
             with self.store.transaction() as db:
                 actual = db.execute("SELECT text,status FROM memory_facts WHERE fact_id=?", (row["fact_id"],)).fetchone()
-                if not actual or actual["status"] == "forgotten" or actual["text"] != row["text"]:
+                if self._stop.is_set() or request != self._request or not actual or actual["status"] == "forgotten" or actual["text"] != row["text"]:
                     continue
                 db.execute("DELETE FROM memory_vec WHERE fact_id=?", (row["fact_id"],))
                 db.execute("DELETE FROM memory_embedding_cache WHERE fact_id=?", (row["fact_id"],))
-                if vector is not None:
-                    db.execute("INSERT INTO memory_vec VALUES (?,?)", (row["fact_id"], json.dumps(vector)))
-                    db.execute("INSERT INTO memory_embedding_cache VALUES (?,?)", (row["fact_id"], signature))
+                db.execute("INSERT INTO memory_vec VALUES (?,?)", (row["fact_id"], json.dumps(vector)))
+                db.execute("INSERT INTO memory_embedding_cache VALUES (?,?)", (row["fact_id"], signature))
         return failed
+
+    @staticmethod
+    def _cached_vectors(db):
+        return dict(db.execute('SELECT c.fact_id,c.signature FROM memory_embedding_cache c '
+                               'JOIN memory_vec v ON v.fact_id=c.fact_id '
+                               'JOIN memory_facts f ON f.fact_id=c.fact_id WHERE f.status!=\'forgotten\''))
+
+    def _eligible_vectors(self, db, records):
+        if self._configuration['missing'] or not self._vec_available:
+            return []
+        cached = self._cached_vectors(db)
+        return [key for key, row in records.items()
+                if cached.get(key) == self._request.signature(row['text'])]
 
     def _rewrite(self, query):
         if self.rewrite_client is None:
@@ -141,16 +236,25 @@ class MemoryRetrieval:
         return ranks, quality
 
     def _vector(self, query, records):
-        if self.embedding_client is None:
+        if self._configuration['missing']:
             return {}, {}, False
         if not self._vec_available:
             return {}, {}, True
         if not records:
             return {}, {}, False
         try:
-            vector = self._embed(query)
-            ids = list(records)
             with self.store.read() as db:
+                request = self._request
+                ids = self._eligible_vectors(db, records)
+            if not ids:
+                return {}, {}, False
+            vector = self._embed(query, request)
+            with self.store.read() as db:
+                if request != self._request:
+                    return {}, {}, False
+                ids = self._eligible_vectors(db, {key: records[key] for key in ids})
+                if not ids:
+                    return {}, {}, False
                 # Pre-filter eligible facts so invalid versions cannot crowd out current facts.
                 rows = list(db.execute(
                     "SELECT fact_id,distance FROM memory_vec WHERE embedding MATCH ? AND k=? AND fact_id IN (" +
@@ -176,9 +280,10 @@ class MemoryRetrieval:
         include_history = include_history or bool(re.search(
             r"\b(history|historical|former|previous|past|before)\b|when (did|was)|used to|以前|曾经|过去|变化|什么时候|\b\d{4}(?:-\d{2})?", query, re.I))
         rewritten = self._rewrite(query)
-        vector_failed = self._sync_vectors()
+        vector_failed = False
         now = timestamp()
         with self.store.read() as db:
+            request = self._request
             records = {row["fact_id"]: dict(row) for row in db.execute("SELECT * FROM memory_facts")
                        if row["status"] != "forgotten" and (include_history or current(row, now))}
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -191,7 +296,7 @@ class MemoryRetrieval:
         ranked, scores = self._rank(paths, records)
         best_quality = max([0.0, *lexical_quality.values(), *semantic_quality.values()])
         hyde_used = False
-        if (len(ranked) < 3 or best_quality < 0.35) and self.rewrite_client is not None and self.embedding_client is not None:
+        if (len(ranked) < 3 or best_quality < 0.35) and self.rewrite_client is not None and semantic and not vector_failed:
             try:
                 response = self.rewrite_client.complete([
                     {"role": "system", "content": "Generate a short hypothetical passage for vector retrieval, not a factual claim. Do not invent specific identifying details."},
@@ -207,10 +312,14 @@ class MemoryRetrieval:
                 pass
         result, seen = [], set()
         with self.store.read() as db:
+            if request != self._request:
+                semantic = {}
+                ranked, scores = self._rank([lexical], records)
             for key in ranked:
                 # Recheck after external calls; concurrent forgetting must win.
                 row = db.execute("SELECT * FROM memory_facts WHERE fact_id=?", (key,)).fetchone()
-                if row is None or row["status"] == "forgotten" or (not include_history and not current(row, now)):
+                if (row is None or row["status"] == "forgotten" or row['text'] != records[key]['text']
+                        or (not include_history and not current(row, now))):
                     continue
                 identity = (row["subject"], row["predicate"], row["object_normalized"])
                 if include_history:
@@ -231,5 +340,6 @@ class MemoryRetrieval:
                 if len(result) == limit:
                     break
         return dict(query=query, rewritten_query=rewritten, facts=result, hyde_used=hyde_used,
-                    vector_available=self._vec_available and self.embedding_client is not None and not vector_failed,
-                    vector_failed=vector_failed, token_budget=1000)
+                    vector_available=bool(semantic) and not vector_failed,
+                    vector_failed=vector_failed or self._backfill_failed,
+                    vector_status=self.vector_status(), token_budget=1000)

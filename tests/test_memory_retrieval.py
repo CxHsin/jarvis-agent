@@ -5,6 +5,7 @@ import pytest
 from jarvis_agent import Agent, Config
 from memory_service import MemoryService
 from stable_memory import timestamp
+from tests.memory_helpers import wait_ready
 
 
 sqlite_vec = pytest.importorskip("sqlite_vec")
@@ -39,11 +40,13 @@ def source():
 def test_memory_search_uses_real_fts_vec_and_ephemeral_hyde(tmp_path):
     rewrite = FakeRewrite()
     memory = MemoryService(tmp_path, embedding_client=FakeEmbedding(), rewrite_client=rewrite,
-                           embedding_dimensions=3)
+                           embedding_model="test", embedding_dimensions=3)
     fact_id = memory.remember({"subject": "USER", "predicate": "likes", "object": "tea",
                                "text": "Tea is my preferred drink", "category": "work_preferences"},
                               source=source())
 
+    memory.start_worker(None)
+    wait_ready(memory)
     result = memory.search("What drink do I prefer?")
 
     assert result["vector_available"] is True
@@ -51,7 +54,7 @@ def test_memory_search_uses_real_fts_vec_and_ephemeral_hyde(tmp_path):
     assert result["facts"][0]["sources"][0]["source_event_id"] == "event-1"
     assert not memory.facts(include_inactive=True)[0].get("candidate_text")
     assert any(call[0]["role"] == "system" for call in rewrite.calls)
-    memory.close()
+    memory.close(wait=True)
 
 
 def test_memory_tools_are_reachable_through_agent_runtime(tmp_path):
@@ -75,7 +78,7 @@ def test_memory_tools_are_reachable_through_agent_runtime(tmp_path):
 
     config = Config(base_url="http://example.test", api_key="", model="test",
                     root_dir=tmp_path, state_dir=tmp_path / "state", max_rounds=4,
-                    embedding_dimensions=3)
+                    embedding_model="test", embedding_dimensions=3)
     agent = Agent(config, Client(), embedding_client=FakeEmbedding())
     try:
         agent.store.memory.remember({"subject": "USER", "predicate": "likes", "object": "tea",

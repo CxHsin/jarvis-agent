@@ -4,6 +4,7 @@ import pytest
 
 from jarvis_agent import Agent, Config
 from tests.test_memory_recall_contract import remember
+from tests.memory_helpers import wait_ready
 
 
 class ToolClient:
@@ -58,10 +59,11 @@ def test_configured_embedding_survives_normal_agent_startup(tmp_path, monkeypatc
     monkeypatch.setattr('urllib.request.urlopen', urlopen)
     config = Config(base_url='http://example.test', api_key='', model='test', root_dir=tmp_path,
                     state_dir=tmp_path / 'state', embedding_base_url='http://embedding.test/v1',
-                    embedding_model='embed', embedding_dimensions=3)
+                    embedding_model='embed', embedding_api_key='test-key', embedding_dimensions=3)
     agent = Agent(config, ToolClient())
     try:
         remember(agent.store.memory, 'tea')
+        wait_ready(agent.store.memory)
         result = agent.store.memory.search('tea')
         assert result['facts']
         assert result['vector_available'] is True
