@@ -27,4 +27,4 @@ def test_replay_preserves_fact_provenance_and_history_window(tmp_path):
     assert all(row['observed']['history_has_probe'] for row in history)
     assert all(row['observed']['recent_has_answer'] for row in history)
     assert all(not row['observed']['history_has_answer'] for row in history)
-    assert report['dataset']['version'] == 1
+    assert report['dataset']['version'] == 2
