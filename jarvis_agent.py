@@ -17,7 +17,6 @@ import urllib.request
 from datetime import datetime, timezone
 from copy import deepcopy
 from pathlib import Path
-from threading import Event
 from typing import Any, Callable, Mapping, Sequence
 
 from context_manager import CONTEXT_RECOVERED_MARKER, ContextManager, estimate_tokens
@@ -27,7 +26,7 @@ from context_budget import ContextBudget
 from memory_profile import ProfileEditError
 from session_store import (SessionContents, SessionLockedError, SessionNotFoundError, SessionStore,
                            resolve_state_dir)
-from tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolCall, ToolScheduler,
+from tool_runtime import (ToolRegistry, ToolRuntime,
                           PermissionPolicy, ProviderSession, ToolProviderAdapter, ProviderLoadError, failure)
 
 
@@ -451,47 +450,22 @@ class Agent:
                 "tool_search": self._search_tools,
                 "list_directory": self.workspace.list_directory, "search_file_content": self.workspace.search_file_content, "read_file": self.workspace.read_file,
             }
-            if tool_runtime is None:
-                for definition in TOOL_DEFINITIONS:
-                    schema = definition["function"]
-                    self.tool_registry.register(
-                        ToolMetadata(tool_id=str(schema["name"]), version="1", schema=schema,
-                                     risk="high" if schema["name"] == "bash" else "medium" if schema["name"] == "edit" else "low",
-                                     side_effects=("memory",) if schema["name"] == "memory_manage" else ("filesystem",) if schema["name"] in {"edit", "bash"} else (),
-                                     timeout=60 if schema["name"] == "bash" else 30,
-                                     concurrency="parallel" if schema["name"] in {"read", "edit"} else "serial"),
-                        self._contextual_edit if schema["name"] == "edit" else self._contextual_bash if schema["name"] == "bash" else
-                        (lambda query, include_history=False: self.store.memory.search(query, include_history=include_history)) if schema["name"] == "memory_search" else
-                        self._contextual_memory_manage if schema["name"] == "memory_manage" else self.tool_functions[str(schema["name"])],
-                        contextual=schema["name"] in {"edit", "bash", "memory_manage"},
-                    )
-                for alias in ("list_directory", "search_file_content", "read_file"):
-                    if (alias, "1") not in self.tool_registry._tools:
-                        self.tool_registry.register(ToolMetadata(alias, "1", {"name": alias, "description": "Legacy alias", "parameters": {"type": "object", "additionalProperties": True}}), self.tool_functions[alias])
-                tool_runtime = ToolRuntime(
-                    self.tool_registry,
-                    stable=tuple((name, "1") for name in ("read", "edit", "bash", "tool_search", "list_directory")),
-                )
-            self.tool_runtime = tool_runtime
-            if not self.tool_registry.versions("memory_search"):
-                self.tool_registry.register(
-                    ToolMetadata("memory_search", "1", TOOL_DEFINITIONS[-2]["function"]),
-                    lambda query, include_history=False: self.store.memory.search(query, include_history=include_history),
-                )
-            if not self.tool_registry.versions("memory_manage"):
-                self.tool_registry.register(
-                    ToolMetadata("memory_manage", "1", TOOL_DEFINITIONS[-1]["function"], side_effects=("memory",)),
-                    self._contextual_memory_manage, contextual=True,
-                )
-            self.tool_runtime.policy = permission_policy or self.tool_runtime.policy
-            if permission_policy is None and not supplied_runtime:
-                self.tool_runtime.policy = PermissionPolicy(self.config.tool_permission_mode,
-                                                           max_timeout=self.config.tool_max_timeout)
-            self.tool_runtime.policy.on_event = self._policy_event
-            self.tool_runtime.dispatcher.policy = self.tool_runtime.policy
-            self.tool_runtime.dispatcher.confirm = confirm_tool
-            self.tool_runtime.dispatcher.recorder = self._record_audit
-            self.tool_runtime.dispatcher.resource_resolver = self._tool_resources
+            self.tool_runtime = tool_runtime or ToolRuntime(self.tool_registry,
+                stable=tuple((name, "1") for name in
+                             ("read", "edit", "bash", "tool_search", "list_directory")))
+            self.tool_runtime.install_tools(TOOL_DEFINITIONS, {
+                **self.tool_functions, "edit": self._contextual_edit, "bash": self._contextual_bash,
+                "memory_search": lambda query, include_history=False:
+                    self.store.memory.search(query, include_history=include_history),
+                "memory_manage": self._contextual_memory_manage,
+            }, defaults=not supplied_runtime)
+            policy = permission_policy
+            if policy is None and not supplied_runtime:
+                policy = PermissionPolicy(self.config.tool_permission_mode,
+                                          max_timeout=self.config.tool_max_timeout)
+            self.tool_runtime.configure(policy=policy, confirm=confirm_tool,
+                                        recorder=self._record_audit, policy_recorder=self._policy_event)
+            self.tool_runtime.attach_workspace(self.workspace)
             self.provider_session = ProviderSession(self.config.provider_tool_mode)
             self.provider_adapter = ToolProviderAdapter(self.tool_runtime, self.provider_session)
             self.native_loader = native_loader
@@ -572,14 +546,6 @@ class Agent:
         self._append_message({"role": "system", "content": "Active tool definitions:\n" +
                               json.dumps(missing, ensure_ascii=False, sort_keys=True, separators=(",", ":"))})
         return True
-
-    def _tool_resources(self, metadata, arguments):
-        if metadata.tool_id in {"read", "read_file", "edit"}:
-            path = arguments.get("path")
-            if not isinstance(path, str):
-                return {"*"}
-            return {"file:" + os.path.normcase(str(self.workspace._resolve_read(path)))}
-        return set()
 
     def _contextual_edit(self, context, **arguments):
         return self.workspace.edit(**arguments, execution_context=context)
@@ -673,94 +639,14 @@ class Agent:
         return list(calls) if isinstance(calls, list) else []
 
     @staticmethod
-    def _normalise_args(raw: Any) -> dict[str, Any]:
-        if raw is None or raw == "":
-            return {}
-        if isinstance(raw, dict):
-            return raw
+    def _normalise_args(raw):
         try:
-            parsed = json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
-            raise WorkspaceError("工具参数不是有效 JSON。")
-        if not isinstance(parsed, dict):
-            raise WorkspaceError("工具参数必须是 JSON 对象。")
-        return parsed
+            return ToolRuntime.normalise_args(raw)
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from exc
 
-    def _execute_tool(self, name: str, arguments: Any, *, version=None, fingerprint=None,
-                      call_id="", cancellation=None, authorization=None) -> dict[str, Any]:
-        try:
-            args = self._normalise_args(arguments)
-            key, error = self.tool_runtime.binding(self._runtime_task_id, name, version, fingerprint)
-            if error:
-                self._record_audit(dict(error, tool_id=name, call_id=call_id, phase="rejected"))
-                return error
-            result = self.tool_runtime.execute(self._runtime_task_id, *key, args, fingerprint=fingerprint,
-                                               call_id=call_id, cancellation=cancellation,
-                                               authorization=authorization)
-            if result.get("ok"):
-                payload = result.get("result")
-                return payload if isinstance(payload, dict) else {"ok": True, "value": payload}
-            return {k: v for k, v in result.items() if k != "audit"}
-        except (TypeError, WorkspaceError, OSError, ValueError) as exc:
-            return failure("invalid_arguments", str(exc))
-
-    def _execute_batch(self, calls, on_result):
-        prepared = []
-        errors = {}
-        cancellation = Event()
-        for index, raw in enumerate(calls):
-            function = raw.get("function") or {}
-            name, cid = function.get("name", ""), str(raw.get("id") or f"missing-{index}")
-            try:
-                args = dict(self._normalise_args(function.get("arguments", {})))
-                dependencies = args.pop("_depends_on", raw.get("depends_on", ()))
-                version = args.pop("_version", raw.get("version"))
-                fingerprint = args.pop("_schema_fingerprint", raw.get("schema_fingerprint"))
-                if not isinstance(dependencies, (list, tuple)) or not all(isinstance(x, str) for x in dependencies):
-                    raise ValueError("_depends_on must be an array of call IDs")
-                key, error = self.tool_runtime.binding(self._runtime_task_id, name, version, fingerprint)
-                if error:
-                    errors[cid] = error
-                elif name == "edit" and isinstance(args.get("path"), str) and "expected_hash" not in args:
-                    target = self.workspace._resolve(args["path"])
-                    args["expected_hash"] = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
-                prepared.append(ToolCall(cid, name, key[1] if key else version or "1", args,
-                                         tuple(dependencies), fingerprint))
-            except (ValueError, TypeError, OSError) as exc:
-                errors[cid] = failure("invalid_arguments", str(exc))
-                prepared.append(ToolCall(cid, name, "1"))
-        if errors:
-            # Reject the batch before effects when its dependency graph cannot be trusted.
-            for item in prepared:
-                result = errors.get(item.call_id, failure("batch_rejected", "another call is invalid"))
-                self._record_audit(dict(result, call_id=item.call_id, tool_id=item.tool_id, phase="rejected"))
-                on_result(item, result)
-            return False
-
-        def execute(item, arguments, token, grant):
-            payload = self._execute_tool(item.tool_id, arguments, version=item.version,
-                                         fingerprint=item.fingerprint, call_id=item.call_id, cancellation=token,
-                                         authorization=grant)
-            return {"ok": True, "result": payload} if payload.get("ok", True) else payload
-
-        batch_audit_start = len(self.tool_runtime.dispatcher.audit)
-
-        def record(item, result):
-            if not any(e.get("call_id") == item.call_id and e.get("phase") == "finished"
-                       for e in self.tool_runtime.dispatcher.audit[batch_audit_start:]):
-                self.tool_runtime.dispatcher.record({"call_id": item.call_id, "tool_id": item.tool_id,
-                                                     "phase": "finished", "ok": result.get("ok", False),
-                                                     "error": result.get("error"),
-                                                     "policy_version": self.tool_runtime.policy.version})
-            on_result(item, result.get("result") if result.get("ok") else result)
-
-        scheduler = ToolScheduler(self.tool_registry, dispatcher=self.tool_runtime.dispatcher)
-        outcome = scheduler.execute(prepared, cancellation=cancellation, execute=execute, on_result=record)
-        if not outcome["ok"]:
-            for item in prepared:
-                self._record_audit(dict(outcome, call_id=item.call_id, phase="rejected"))
-                on_result(item, outcome)
-        return cancellation.is_set()
+    def _execute_tool(self, name, arguments, **kwargs):
+        return self.tool_runtime.execute_model_call(self._runtime_task_id, name, arguments, **kwargs)
 
     def _complete_with_tools(self, messages, tools, choice):
         def native():
@@ -843,7 +729,7 @@ class Agent:
         message_snapshot = deepcopy(self.messages)
         context_snapshot = self.context.snapshot()
         runtime_snapshot = self.tool_runtime.snapshot()
-        audit_start = len(self.tool_runtime.dispatcher.audit)
+        audit_start = self.tool_runtime.audit_cursor()
         audit_event_start = len(self._audit_events)
         self.context.begin_task(user_text)
         recent = self.store.context_messages()
@@ -852,9 +738,7 @@ class Agent:
                 self.store.record_recent_context(recent)
                 self.messages[1:] = recent
         self._runtime_task_id = f"{self.store.session_id}:{self.context.task_number}"
-        compatibility = tuple((name, "1") for name in ("list_directory", "search_file_content", "read_file")
-                              if self.tool_registry.versions(name))
-        self.tool_runtime.begin_task(self._runtime_task_id, compatibility)
+        self.tool_runtime.begin_task(self._runtime_task_id)
         self._save_runtime()
         self.usage_ledger.reset()
         self._append_message({"role": "user", "content": user_text})
@@ -945,7 +829,7 @@ class Agent:
                                           "name": item.tool_id, "content": result_text})
                     self.context.record_tool_result(item.tool_id, item.arguments, result, item.call_id)
                     handled_call_indexes.update(i for i, c in enumerate(calls) if c.get("id") == item.call_id)
-                cancelled = self._execute_batch(calls, record_result)
+                cancelled = self.tool_runtime.execute_batch(self._runtime_task_id, calls, record_result)
                 if cancelled:
                     task_status = "cancelled"
                     active_calls = []
@@ -981,7 +865,7 @@ class Agent:
             return None
         except ModelRequestError as exc:
             task_status = "failed"
-            executed = any(e.get("phase") == "started" for e in self.tool_runtime.dispatcher.audit[audit_start:])
+            executed = self.tool_runtime.executed_since(audit_start)
             if not executed:
                 context_valid = False
                 # Policy/fallback decisions survive a failed request; activation does not.
@@ -994,7 +878,7 @@ class Agent:
                 self.messages[:] = message_snapshot
                 self.context.restore(context_snapshot)
                 self.tool_runtime.restore(dict(runtime_snapshot, policy=policy))
-                self.tool_registry._tasks.pop(self._runtime_task_id, None)
+                self.tool_runtime.end_task(self._runtime_task_id)
             print(f"模型请求失败: {exc}")
             return None
         finally:

@@ -536,3 +536,113 @@ def test_request_rollback_preserves_permission_audit(tmp_path):
         assert not (tmp_path / "x.txt").exists()
     finally:
         agent.close()
+
+def test_agent_preserves_injected_runtime_confirmation(tmp_path):
+    registry = ToolRegistry()
+    seen = []
+    registry.register(ToolMetadata("host_write", "1", {"name": "host_write", "parameters": {
+        "type": "object"}}, side_effects=("host",)), lambda: seen.append("write") or "saved")
+    runtime = ToolRuntime(registry, stable=(("host_write", "1"),),
+                          policy=PermissionPolicy("approve-all"), confirm=lambda metadata, args: True)
+    agent = Agent(config(tmp_path), Client(answer(call("host_write")), {"content": "done"}),
+                  tool_runtime=runtime)
+    try:
+        assert agent.run_request("write") == "done"
+        assert seen == ["write"]
+        assert tool_results(agent) == [{"ok": True, "value": "saved"}]
+        assert any(e.get("phase") == "confirmation" and e["confirmed"]
+                   for e in agent.store.load().audit)
+    finally:
+        agent.close()
+
+def test_agent_preserves_host_resource_resolution(tmp_path):
+    registry = ToolRegistry()
+    seen = []
+    registry.register(ToolMetadata("host", "1", {"name": "host", "parameters": {
+        "type": "object"}}, concurrency="parallel"), lambda: seen.append("executed"))
+    def resources(metadata, arguments):
+        raise ValueError("host resource unavailable")
+    runtime = ToolRuntime(registry, stable=(("host", "1"),), resource_resolver=resources)
+    agent = Agent(config(tmp_path), Client(answer(call("host")), {"content": "done"}), tool_runtime=runtime)
+    try:
+        agent.run_request("use host")
+        assert seen == []
+        assert tool_results(agent)[0]["error"]["code"] == "invalid_arguments"
+        assert "host resource unavailable" in tool_results(agent)[0]["error"]["message"]
+    finally:
+        agent.close()
+
+def test_agent_timeout_keeps_host_resource_and_unknown_audit_on_restore(tmp_path):
+    release, finished = Event(), Event()
+    seen = []
+    def slow():
+        try:
+            release.wait(5)
+            seen.append("slow")
+            return "late"
+        finally:
+            finished.set()
+    runtime = ToolRuntime(ToolRegistry(), stable=(("slow", "1"), ("next", "1")))
+    for name, handler in (("slow", slow), ("next", lambda: seen.append("next"))):
+        runtime.register(ToolMetadata(name, "1", {"name": name, "parameters": {"type": "object"}},
+                         timeout=0.03, resources=("host-file",), side_effects=("write",),
+                         concurrency="parallel"), handler)
+    agent = Agent(config(tmp_path), Client(answer(call("slow", call_id="slow")),
+                  answer(call("next", call_id="next")), {"content": "done"}), tool_runtime=runtime)
+    session = agent.store.session_id
+    try:
+        agent.run_request("run")
+        results = tool_results(agent)
+        assert results[0]["error"]["code"] == "timeout"
+        assert results[0]["uncertain"] is True
+        assert results[1]["error"]["code"] == "resource_conflict"
+        assert seen == []
+    finally:
+        release.set()
+        assert finished.wait(2)
+        agent.close()
+    resumed = Agent(config(tmp_path), Client({"content": "restored"}), resume=session)
+    try:
+        assert tool_results(resumed) == results
+        assert any(e.get("call_id") == "slow" and e.get("uncertain")
+                   for e in resumed.store.load().audit)
+        assert seen == ["slow"]
+    finally:
+        resumed.close()
+
+
+def test_agent_records_parallel_results_and_references_deterministically(tmp_path):
+    second_finished = Event()
+    def first():
+        assert second_finished.wait(2)
+        return "first"
+    def second():
+        second_finished.set()
+        return {"text": "second"}
+    runtime = ToolRuntime(ToolRegistry(), stable=(("first", "1"), ("second", "1"), ("join", "1")))
+    for name, handler, parameters in (
+        ("first", first, {"type": "object"}),
+        ("second", second, {"type": "object"}),
+        ("join", lambda text: {"text": text}, {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}),
+    ):
+        runtime.register(ToolMetadata(name, "1", {"name": name, "parameters": parameters},
+                                      concurrency="parallel"), handler)
+    client = Client(answer(call("first", call_id="a"), call("second", call_id="b"),
+                    call("join", {"text": {"$result": {"call_id": "a", "path": ["value"]}}}, "c")),
+                    {"content": "done"})
+    agent = Agent(config(tmp_path), client, tool_runtime=runtime)
+    session = agent.store.session_id
+    try:
+        agent.run_request("parallel dependencies")
+        messages = [m for m in client.requests[-1][0] if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in messages] == ["a", "b", "c"]
+        assert [json.loads(m["content"]) for m in messages] == [
+            {"ok": True, "value": "first"}, {"text": "second"}, {"text": "first"}]
+    finally:
+        agent.close()
+    resumed = Agent(config(tmp_path), Client({"content": "done"}), resume=session)
+    try:
+        assert [m for m in resumed.messages if m["role"] == "tool"] == messages
+    finally:
+        resumed.close()

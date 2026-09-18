@@ -69,6 +69,10 @@ Profile publication uses a durable SQLite outbox: fact IDs and profile versions 
 
 供应商模式由 `PROVIDER_TOOL_MODE` 显式选择，与模型容量配置无关。通用 Chat Completions 客户端使用 `emulated`。原生供应商由宿主传入 `Agent(native_loader=...)`，协议为 `(measured_client, messages, stable_tools, active_definitions, tool_choice) -> assistant_message`；适配器负责供应商专有的 deferred/tool-reference 请求。可重试的网络/能力错误连续失败三次后，本会话只回退一次并重新发出 emulated 请求；失败调用的局部引用不会写入历史。模式、回退次数、历史版本与权限随会话恢复。没有原生适配器时配置 `native` 会按相同规则回退。
 
+工具执行以 `ToolRuntime` 为边界：`register` / `install_tools` 管理版本注册，`begin_task` / `discover` 管理当前任务激活，`execute_batch` 统一参数协议、授权、依赖调度、工作区资源、编辑快照、结果转换与审计。Agent 只提交模型调用，并通过结果回调写入会话消息和上下文证据，不访问 registry/dispatcher 私有状态。结果在每个依赖波次内按请求顺序记录；执行审计保留实际发生顺序，不能把并行执行时间顺序当成模型结果顺序。
+
+宿主可通过 `agent.tool_runtime.register(...)` 注册扩展；原有 `agent.tool_registry.register(...)` 保留兼容。注入 `Agent(tool_runtime=...)` 时保留运行时的确认回调与资源解析限制，显式 `confirm_tool` 可替换确认回调；工作区路径资源与宿主资源共同约束执行。会话通过 `configure` 接管审计持久化，运行时实例属于该会话，不应同时注入多个会话；共享不可变定义可使用同一 registry，其执行租约在超时后仍共享。模型协议、固定工具与兼容别名保持不变。
+
 验收：`python -m pytest -q`。`tests/test_tool_runtime_acceptance.py` 从 Agent 循环验证发现、权限、依赖、并发、编辑冲突、原生回退、恢复和压缩；供应商专有协议通过可注入适配器测试，未调用真实付费模型服务。
 
 ## 模型容量与缓存

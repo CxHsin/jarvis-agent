@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from threading import RLock
+from threading import Event, RLock
 
 from jsonschema import Draft202012Validator
 
@@ -235,11 +236,76 @@ class ToolRuntime:
         self.dispatcher = ToolDispatcher(registry, policy=self.policy, confirm=confirm,
                                          recorder=recorder, resource_resolver=resource_resolver)
 
+    def attach_workspace(self, workspace):
+        """Combine workspace paths with host leases; never replace host restrictions."""
+        host_resolver = self.dispatcher.resource_resolver
+        def resources(metadata, arguments):
+            held = set(host_resolver(metadata, arguments)) if host_resolver else set()
+            if metadata.tool_id in {"read", "read_file", "edit"}:
+                path = arguments.get("path")
+                held.update({"file:" + os.path.normcase(str(workspace._resolve_read(path)))}
+                            if isinstance(path, str) else {"*"})
+            return held
+        self.dispatcher.resource_resolver = resources
+        self._workspace = workspace
+
+    def register(self, metadata, handler, *, contextual=False):
+        return self.registry.register(metadata, handler, contextual=contextual)
+
+    def install_tools(self, definitions, handlers, *, defaults=False):
+        """Register the fixed catalog and legacy aliases, or add missing memory tools."""
+        for definition in definitions:
+            schema = definition["function"]
+            name = schema["name"]
+            if not defaults and (name not in {"memory_search", "memory_manage"}
+                                 or self.registry.versions(name)):
+                continue
+            self.register(ToolMetadata(name, "1", schema,
+                risk="high" if name == "bash" else "medium" if name == "edit" else "low",
+                side_effects=("memory",) if name == "memory_manage" else
+                             ("filesystem",) if name in {"edit", "bash"} else (),
+                timeout=60 if name == "bash" else 30,
+                concurrency="parallel" if name in {"read", "edit"} else "serial"),
+                handlers[name], contextual=name in {"edit", "bash", "memory_manage"})
+        if defaults:
+            for alias in ("list_directory", "search_file_content", "read_file"):
+                if not self.registry.versions(alias):
+                    self.register(ToolMetadata(alias, "1", {"name": alias,
+                        "description": "Legacy alias", "parameters": {
+                            "type": "object", "additionalProperties": True}}), handlers[alias])
+
+    def audit_cursor(self):
+        return len(self.dispatcher.audit)
+
+    def executed_since(self, cursor):
+        return any(e.get("phase") == "started" for e in self.dispatcher.audit[cursor:])
+
+    def end_task(self, task_id):
+        self.registry._tasks.pop(str(task_id), None)
+
+    def configure(self, *, policy=None, confirm=None, recorder=None, policy_recorder=None):
+        """Attach session recording without discarding host execution configuration."""
+        if policy is not None:
+            self.policy = policy
+            self.dispatcher.policy = policy
+        if confirm is not None:
+            self.confirm = confirm
+            self.dispatcher.confirm = confirm
+        if recorder is not None:
+            self.recorder = recorder
+            self.dispatcher.recorder = recorder
+        if policy_recorder is not None:
+            self.policy.on_event = policy_recorder
+
     @property
     def stable_tools(self):
         return tuple(self.registry.get(*key) for key in self._stable)
 
-    def begin_task(self, task_id, compatibility=()):
+    def begin_task(self, task_id, compatibility=None):
+        if compatibility is None:
+            compatibility = tuple((name, "1") for name in
+                                  ("list_directory", "search_file_content", "read_file")
+                                  if self.registry.versions(name))
         self.registry._tasks[str(task_id)] = set()
         for key in (*self._stable, *compatibility):
             self.activate(task_id, *key)
@@ -293,6 +359,101 @@ class ToolRuntime:
     def execute(self, task_id, tool_id, version, arguments=None, **kwargs):
         key, error = self.binding(task_id, tool_id, version, kwargs.get("fingerprint"))
         return error or self.dispatcher.execute(*key, arguments, **kwargs)
+
+    @staticmethod
+    def normalise_args(raw) -> dict:
+        if raw is None or raw == "":
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError("工具参数不是有效 JSON。")
+        if not isinstance(parsed, dict):
+            raise ValueError("工具参数必须是 JSON 对象。")
+        return parsed
+
+    def execute_model_call(self, task_id, name: str, arguments, *, version=None, fingerprint=None,
+                           call_id="", cancellation=None, authorization=None) -> dict:
+        try:
+            args = self.normalise_args(arguments)
+            key, error = self.binding(task_id, name, version, fingerprint)
+            if error:
+                self.dispatcher.record(dict(error, tool_id=name, call_id=call_id, phase="rejected"))
+                return error
+            result = self.execute(task_id, *key, args, fingerprint=fingerprint,
+                                               call_id=call_id, cancellation=cancellation,
+                                               authorization=authorization)
+            if result.get("ok"):
+                payload = result.get("result")
+                return payload if isinstance(payload, dict) else {"ok": True, "value": payload}
+            return {k: v for k, v in result.items() if k != "audit"}
+        except (TypeError, ValueError, OSError) as exc:
+            return failure("invalid_arguments", str(exc))
+
+    def execute_batch(self, task_id, calls, on_result):
+        """Execute model calls and deliver converted results in dependency-wave order.
+
+        The caller records messages/evidence via on_result on the scheduling thread;
+        worker audit events retain their actual execution order.
+        """
+        prepared = []
+        errors = {}
+        cancellation = Event()
+        for index, raw in enumerate(calls):
+            function = raw.get("function") or {}
+            name, cid = function.get("name", ""), str(raw.get("id") or f"missing-{index}")
+            try:
+                args = dict(self.normalise_args(function.get("arguments", {})))
+                dependencies = args.pop("_depends_on", raw.get("depends_on", ()))
+                version = args.pop("_version", raw.get("version"))
+                fingerprint = args.pop("_schema_fingerprint", raw.get("schema_fingerprint"))
+                if not isinstance(dependencies, (list, tuple)) or not all(isinstance(x, str) for x in dependencies):
+                    raise ValueError("_depends_on must be an array of call IDs")
+                key, error = self.binding(task_id, name, version, fingerprint)
+                if error:
+                    errors[cid] = error
+                elif hasattr(self, "_workspace") and name == "edit" and isinstance(args.get("path"), str) and "expected_hash" not in args:
+                    target = self._workspace._resolve(args["path"])
+                    args["expected_hash"] = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
+                prepared.append(ToolCall(cid, name, key[1] if key else version or "1", args,
+                                         tuple(dependencies), fingerprint))
+            except (ValueError, TypeError, OSError) as exc:
+                errors[cid] = failure("invalid_arguments", str(exc))
+                prepared.append(ToolCall(cid, name, "1"))
+        if errors:
+            # Reject the batch before effects when its dependency graph cannot be trusted.
+            for item in prepared:
+                result = errors.get(item.call_id, failure("batch_rejected", "another call is invalid"))
+                self.dispatcher.record(dict(result, call_id=item.call_id, tool_id=item.tool_id, phase="rejected"))
+                on_result(item, result)
+            return False
+
+        def execute(item, arguments, token, grant):
+            payload = self.execute_model_call(task_id, item.tool_id, arguments, version=item.version,
+                                         fingerprint=item.fingerprint, call_id=item.call_id, cancellation=token,
+                                         authorization=grant)
+            return {"ok": True, "result": payload} if payload.get("ok", True) else payload
+
+        batch_audit_start = len(self.dispatcher.audit)
+
+        def record(item, result):
+            if not any(e.get("call_id") == item.call_id and e.get("phase") == "finished"
+                       for e in self.dispatcher.audit[batch_audit_start:]):
+                self.dispatcher.record({"call_id": item.call_id, "tool_id": item.tool_id,
+                                                     "phase": "finished", "ok": result.get("ok", False),
+                                                     "error": result.get("error"),
+                                                     "policy_version": self.policy.version})
+            on_result(item, result.get("result") if result.get("ok") else result)
+
+        scheduler = ToolScheduler(self.registry, dispatcher=self.dispatcher)
+        outcome = scheduler.execute(prepared, cancellation=cancellation, execute=execute, on_result=record)
+        if not outcome["ok"]:
+            for item in prepared:
+                self.dispatcher.record(dict(outcome, call_id=item.call_id, phase="rejected"))
+                on_result(item, outcome)
+        return cancellation.is_set()
 
     def stable_fingerprint(self):
         return hashlib.sha256(canonical(self.schemas("")).encode()).hexdigest()
