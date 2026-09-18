@@ -41,7 +41,7 @@ def memory_rows(target: Path, scale: int, repeats: int):
                 result, elapsed = clocked(lambda: memory.search('topic000000'))
                 rows.append({'operation':'memory_search','scenario':scenario,'scale':scale,
                     'elapsed_ms':elapsed,'observed':{'objects':[x['object'] for x in result['facts']],
-                    'source_event':result['facts'][0]['sources'][0]['source_event_id'],
+                    'source_event':result['facts'][0]['sources'][0]['source_event_id'], 'scan_operations':scale,
                     'embedding_calls':(client.calls-before) if client else 0,
                     'vector_available':result['vector_available']}})
             memory.close()
@@ -61,7 +61,7 @@ def history_rows(target: Path, scale: int, repeats: int):
             text=''.join(p.read_text(encoding='utf-8') for p in (Path(directory)/'history').glob('*.md'))
             rows.append({'operation':'history_task','scenario':'projection','scale':scale,'elapsed_ms':elapsed,
                 'observed':{'history_has_probe':'probe-0' in text,'history_has_answer':'answer-0' in text,
-                'recent_has_answer':f'answer-{scale-1}' in json.dumps(value)}})
+                'recent_has_answer':f'answer-{scale-1}' in json.dumps(value), 'scan_operations':scale * 3}})
     return rows
 
 def main():
@@ -77,10 +77,11 @@ def main():
             output_path=Path(workspace)/'shell.out'
             with output_path.open('wb') as output:
                 started=time.perf_counter(); process=start_shell('echo baseline', workspace, protected, output); preparation=(time.perf_counter()-started)*1000
-            process.start()
+            process.start(); executed=time.perf_counter()
             while process.poll() is None: time.sleep(0.001)
+            execution=(time.perf_counter()-executed)*1000
             process.close()
-            shell.update({'preparation_ms':preparation,'execution_ms':None,'command':'echo baseline'})
+            shell.update({'preparation_ms':preparation,'execution_ms':execution,'command':'echo baseline'})
     report={'dataset':{'version':DATASET_VERSION,'scale':args.scales,'repeats':args.repeats,'seed':'fixed synthetic literals'},
       'environment':{'python':sys.version,'platform':platform.platform(),'commit':os.environ.get('BASELINE_COMMIT','unknown')},
       'methodology':{'warmup':'none; each temporary dataset is cold, repeated operations are warm within a run','timing':'perf_counter wall time; filesystem and sqlite included','limits':'single process, local temporary storage, synthetic client; no arbitrary threshold'},
