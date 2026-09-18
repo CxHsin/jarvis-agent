@@ -1,0 +1,11 @@
+{"type":"session","version":1,"id":"legacy","workspace":"legacy-workspace","started_at":"2026-01-01T00:00:00+00:00"}
+{"type":"task","number":1,"goal":"remember tea"}
+{"type":"message","message":{"role":"user","content":"remember tea"}}
+{"type":"message","message":{"role":"assistant","content":null,"tool_calls":[{"id":"read-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"note.txt\"}"}}]}}
+{"type":"message","message":{"role":"tool","tool_call_id":"read-1","content":"tea evidence"}}
+{"type":"message","message":{"role":"assistant","content":"remembered"}}
+{"type":"archive","entry":{"call_id":"read-1","tool":"read","arguments":{"path":"note.txt"},"result":{"content":"tea evidence"},"task":1}}
+{"type":"compact","kept_from":5,"content":"[CONTEXT_COMPRESSED] tea summary","method":"model","compressed_call_ids":["read-1"]}
+{"type":"task","number":2,"goal":"continue"}
+{"type":"message","message":{"role":"user","content":"continue"}}
+{"type":"message","message":{"role":"assistant","content":"continued"}}

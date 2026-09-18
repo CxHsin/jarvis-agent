@@ -1,0 +1,13 @@
+{"type":"task","number":1,"goal":"remember tea","task_id":"legacy:tea","event_id":"tea-task","recorded_at":"2026-01-01T00:00:00+00:00","occurred_at":null,"recent_task_count":5}
+{"type":"message","message":{"role":"user","content":"remember tea"},"task_id":"legacy:tea","event_id":"tea-user","recorded_at":"2026-01-01T00:00:01+00:00","occurred_at":null}
+{"type":"message","message":{"role":"assistant","content":null,"tool_calls":[{"id":"read-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"note.txt\"}"}}]},"task_id":"legacy:tea","event_id":"tea-call","recorded_at":"2026-01-01T00:00:02+00:00","occurred_at":null}
+{"type":"message","message":{"role":"tool","tool_call_id":"read-1","content":"tea evidence"},"task_id":"legacy:tea","event_id":"tea-result","recorded_at":"2026-01-01T00:00:03+00:00","occurred_at":null}
+{"type":"message","message":{"role":"assistant","content":"remembered"},"task_id":"legacy:tea","event_id":"tea-answer","recorded_at":"2026-01-01T00:00:04+00:00","occurred_at":null}
+{"type":"task_end","status":"completed","task_id":"legacy:tea","event_id":"tea-end","recorded_at":"2026-01-01T00:00:05+00:00","occurred_at":null}
+{"type":"task","number":2,"goal":"rolled back input","task_id":"legacy:failed","event_id":"failed-task","recorded_at":"2026-01-01T00:01:00+00:00","occurred_at":null}
+{"type":"message","message":{"role":"user","content":"rolled back input"},"task_id":"legacy:failed","event_id":"failed-user","recorded_at":"2026-01-01T00:01:01+00:00","occurred_at":null}
+{"type":"task_end","status":"failed","task_id":"legacy:failed","event_id":"failed-end","recorded_at":"2026-01-01T00:01:02+00:00","occurred_at":null}
+{"type":"task","number":2,"goal":"continue","task_id":"legacy:continue","event_id":"continue-task","recorded_at":"2026-01-01T00:02:00+00:00","occurred_at":null}
+{"type":"message","message":{"role":"user","content":"continue"},"task_id":"legacy:continue","event_id":"continue-user","recorded_at":"2026-01-01T00:02:01+00:00","occurred_at":null}
+{"type":"message","message":{"role":"assistant","content":"conflicting answer"},"task_id":"legacy:continue","event_id":"continue-answer","recorded_at":"2026-01-01T00:02:02+00:00","occurred_at":null}
+{"type":"task_end","status":"completed","task_id":"legacy:continue","event_id":"continue-end","recorded_at":"2026-01-01T00:02:03+00:00","occurred_at":null}

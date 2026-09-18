@@ -101,7 +101,7 @@ DeepSeek 缓存默认开启。Jarvis 读取 `prompt_cache_hit_tokens`、`prompt_
 
 ## 结构
 
-个人历史位于跨工作区共享的 `STATE_DIR/memory/`：`history/YYYY-MM-DD.md` 只追加用户输入、事件时间、UTC 记录时间和任务/事件来源标识；未知事件时间为空，不以接收时间代替。新会话以 `sessions/<工作区>/<会话标识>.jsonl` 作为消息、任务、工具结果与审计的共同原始记录；每条事件带版本、稳定身份、会话与任务关联、顺序和时间，写穿落盘后再更新派生视图。旧会话仍读取原有会话文件及 `memory/trajectories/<会话标识>.jsonl`，本阶段不迁移或删除旧数据。模型失败回滚及上下文压缩不会删除新会话的原始证据。`recent/<会话标识>/recent.md` 每条消息后更新，保存在途任务和最近 `RECENT_TASK_COUNT` 个已结束任务（默认 5）。失败且没有工具执行的请求保留审计记录，但不占 Recent 窗口。恢复使用同一会话的窗口；新会话独立开始。
+个人历史位于跨工作区共享的 `STATE_DIR/memory/`：`history/YYYY-MM-DD.md` 只追加用户输入、事件时间、UTC 记录时间和任务/事件来源标识；未知事件时间为空，不以接收时间代替。新会话以 `sessions/<工作区>/<会话标识>.jsonl` 作为消息、任务、工具结果与审计的共同原始记录；每条事件带版本、稳定身份、会话与任务关联、顺序和时间，写穿落盘后再更新派生视图。首次 `--resume` 旧会话会自动迁移，原文件与 `memory/trajectories/<会话标识>.jsonl` 原样保留；新记录及来源映射位于同工作区会话目录的 `migrations/<会话标识>/`。模型失败回滚及上下文压缩不会删除新会话的原始证据。`recent/<会话标识>/recent.md` 每条消息后更新，保存在途任务和最近 `RECENT_TASK_COUNT` 个已结束任务（默认 5）。失败且没有工具执行的请求保留审计记录，但不占 Recent 窗口。恢复使用同一会话的窗口；新会话独立开始。
 
 下一任务从 Recent 的完整消息建立上下文，并经过既有压缩与 token 硬上限检查；可读 Recent 文件和原始轨迹保持完整，即使模型请求需要压缩。Recent 是可重建视图，不能通过编辑它改变原始记录。
 
@@ -130,3 +130,10 @@ with Application(Config.from_env(), client=model_client) as app:
 `Application` 接受主模型、压缩、提取、embedding、查询改写及记忆授权客户端；`create_session` 接受既有工具运行时、权限策略、确认回调与原生供应商宿主注入。消息、Recent、上下文、权限与请求计量属于会话，不能通过共享模型客户端把其他会话消息混入请求。`Agent(config, ...)` 仍可直接使用，它为兼容调用创建独立应用并在 `Agent.close()` 时关闭。`SessionStore.create/resume` 的独立调用保留 `store.memory` 访问，由装配层提供无后台线程的记忆服务；`SessionStore.close()` 不负责关闭记忆。手动启动记忆 worker 的旧宿主须显式关闭它，或改用 `Application` 管理。旧磁盘格式仍可读取，会话跨进程锁与数据库并发保护保持不变；新会话事件格式见 [ADR 0008](docs/adr/0008-unified-session-events.md)。
 
 `Workspace` 负责文件访问边界和读写工具，`ToolRuntime` 负责稳定工具注册、动态搜索、权限与执行审计，`ContextBudget` 是窗口、预留与发送上限的唯一来源，`ContextManager` 负责证据索引与预算判定，`CompactionService` 负责压缩（自动触发与 `/compact` 走同一入口、产出相同的状态效果），`SessionStore` 负责会话记录的追加、加锁和加载（旧格式保留兼容截断路径），`ChatCompletionsClient` 负责兼容接口，`Agent.run_request` 展示完整的模型-工具循环。后续阶段可以在不改动命令行入口的情况下替换搜索、加入记忆或增加其他工具。
+
+
+### 旧数据自动迁移与失败恢复
+
+沿用 `--resume [会话标识]`，无需手工导入。首次恢复旧会话先创建不可覆盖的 `migrations/<会话标识>/backup/`（会话、轨迹、Memory DB），验证恢复上下文、事件身份及来源后发布 `committed.json` 切换到 `events.jsonl`。记忆服务启动前另把现存数据库与人工 Markdown 保存到 `STATE_DIR/migrations/legacy-memory/`；数据库通过 SQLite 在线备份保护 WAL 中的已提交数据，事实不会重新提取。原有记忆来源路径仍保留，来源映射及冲突详情可在提交报告中核对。
+
+进程中断或磁盘写入失败后，修复存储问题并再次运行相同 `--resume` 即可。提交前旧会话仍可列出、原文件可读取；原文件若在备份后被其他旧程序修改，迁移会拒绝切换以避免混合不同快照，此时保留整个状态目录交由人工核对。不要删除或覆盖备份。提交后若报告派生视图失败，新事件已经提交，再次恢复只重建视图；不要将旧日志覆盖回新事件。冲突保留双方并在恢复时报告；尾部半条记录保存在原文件和备份，中间损坏记录需人工核对后再重试。详情见 [ADR 0010](docs/adr/0010-legacy-session-migration.md)。

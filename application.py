@@ -11,6 +11,8 @@ from session_store import resolve_state_dir
 
 def assemble_memory(config, *, embedding_client=None, rewrite_client=None):
     """Also supports standalone SessionStore compatibility without a worker."""
+    from session_migration import protect_legacy_memory
+    protect_legacy_memory(config)
     endpoint = getattr(config, 'embedding_base_url', None)
     model = getattr(config, 'embedding_model', None)
     if embedding_client is None and endpoint and model:

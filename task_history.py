@@ -32,6 +32,8 @@ class TaskHistory:
         self._project()
 
     def _apply(self, event):
+        if event.get('migration_projection') == 'session':
+            return
         kind = event["type"]
         if kind == "task":
             if self.tasks and self.tasks[-1]["status"] == "active":

@@ -173,6 +173,8 @@ def _first_record(path: Path) -> dict[str, Any] | None:
 
 
 def _read_info(path: Path) -> SessionInfo | None:
+    from session_migration import committed_path
+    path = committed_path(path)
     header = _first_record(path)
     if not header or header.get("type") != RECORD_SESSION:
         return None
@@ -227,6 +229,8 @@ def _visible_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """Project context validity without rolling back independent durable facts."""
     visible = []
     for record in records:
+        if record.get('migration_projection') == 'trajectory':
+            continue
         if record.get("type") in {"context_reset", "context_rollback"}:
             through = record["through_sequence"]
             visible = [event for event in visible if event.get("sequence", 0) <= through
@@ -336,10 +340,15 @@ class SessionStore:
         self._lock.acquire()
         try:
             if existing:
+                from session_migration import committed_path, migrate
+                self.path = committed_path(self.path)
                 header = _first_record(self.path) or {}
                 self._format_version = int(header.get("version", 1))
                 if self._format_version not in {1, SESSION_FORMAT_VERSION}:
                     raise SessionError(f"不支持的会话版本: {self._format_version}")
+                if self._format_version == 1:
+                    self.path = migrate(self)
+                    self._format_version = SESSION_FORMAT_VERSION
                 text = self.path.read_text(encoding="utf-8", errors="replace")
                 self._needs_separator = bool(text and not text.endswith("\n"))
                 records, _ = _read_records(text)
@@ -348,7 +357,12 @@ class SessionStore:
                     if record.get("type") == RECORD_TASK:
                         self._task_id = record.get("task_id")
             self._file = open(self.path, "a+", encoding="utf-8")
-            self._refresh_history()
+            try:
+                self._refresh_history()
+            except Exception as exc:
+                if (self.path.parent / 'committed.json').exists():
+                    raise SessionError('迁移已经提交；派生视图重建失败，修复存储问题后再次恢复会话。') from exc
+                raise
         except BaseException:
             if self._file is not None:
                 self._file.close()
@@ -566,4 +580,9 @@ class SessionStore:
                 except (TypeError, ValueError):
                     continue
         contents.warnings = tuple(warnings)
+        report_path = self.path.parent / 'committed.json'
+        if report_path.exists():
+            report = json.loads(report_path.read_text(encoding='utf-8'))
+            contents.warnings += tuple(report.get('warnings', []))
+            contents.warnings += tuple(f"迁移冲突已保留双方: {item}" for item in report.get('conflicts', []))
         return contents
