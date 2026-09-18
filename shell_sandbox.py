@@ -177,7 +177,7 @@ class WindowsShell:
             startup.attributes = c.cast(self.attrs, c.c_void_p)
             info = ProcessInfo()
             system = Path(os.environ['SystemRoot']) / 'System32'
-            executable = str(system / 'cmd.exe')
+            executable = str(system / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe')
             env = dict(SystemRoot=os.environ['SystemRoot'], WINDIR=os.environ['SystemRoot'],
                 COMSPEC=executable, PATH=os.pathsep.join([str(system), str(Path(sys.executable).parent)]),
                 TEMP=self.temp.name, TMP=self.temp.name, USERPROFILE=self.temp.name, HOME=self.temp.name)
@@ -188,7 +188,9 @@ class WindowsShell:
             environment = c.create_unicode_buffer('\0'.join(f'{key}={value}' for key, value in sorted(env.items())) + '\0\0')
             create_process = api(self.kernel, 'CreateProcessW', [w.LPCWSTR, w.LPWSTR, c.c_void_p,
                 c.c_void_p, w.BOOL, w.DWORD, c.c_void_p, w.LPCWSTR, c.POINTER(StartupEx), c.POINTER(ProcessInfo)])
-            self._check(create_process(executable, c.create_unicode_buffer(f'"{executable}" /d /s /c "{command}"'),
+            encoded = __import__('base64').b64encode(command.encode('utf-16le')).decode('ascii')
+            command_line = f'"{executable}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}'
+            self._check(create_process(executable, c.create_unicode_buffer(command_line),
                 None, None, True, 0x80000 | 0x400 | 0x4 | 0x08000000, environment,
                 str(workspace), c.byref(startup), c.byref(info)))
             self.process, self.thread, self.pid = info.process, info.thread, info.pid

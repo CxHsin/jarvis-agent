@@ -31,5 +31,5 @@ def test_failed_shell_preview_includes_cause_and_exit_code():
 
 def test_shell_schema_explains_actual_interpreter_and_listing_alternative():
     schema = next(d["function"] for d in TOOL_DEFINITIONS if d["function"]["name"] == "bash")
-    assert "cmd.exe" in schema["description"]
+    assert "PowerShell" in schema["description"]
     assert "list_directory" in schema["description"]

@@ -70,8 +70,8 @@ Path('probe-result.json').write_text(json.dumps(results))
 def test_deleting_granted_file_does_not_break_next_shell(tmp_path):
     (tmp_path / 'delete-me.txt').write_text('temporary')
     agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(
-        answer(call('bash', {'command': 'del delete-me.txt'})),
-        answer(call('bash', {'command': 'echo next>next.txt'}, call_id='second')), {'content': 'done'}))
+        answer(call('bash', {'command': "Remove-Item -LiteralPath 'delete-me.txt'"})),
+        answer(call('bash', {'command': "Set-Content -LiteralPath 'next.txt' -Value next"}, call_id='second')), {'content': 'done'}))
     try:
         agent.run_request('Delete the temporary file and write the next file')
         assert not (tmp_path / 'delete-me.txt').exists()
