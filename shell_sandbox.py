@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -67,6 +68,8 @@ class WindowsShell:
         self.mutex_owned = False
         self.returncode = None
         self.temp = tempfile.TemporaryDirectory(prefix='jarvis-shell-')
+        launcher_path = Path(self.temp.name) / 'shell_launcher.py'
+        shutil.copyfile(Path(__file__).with_name('shell_launcher.py'), launcher_path)
         self.protected = protected
         self.readonly = {Path(__file__).resolve().parent, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve()}
         self._fds = []
@@ -181,7 +184,7 @@ class WindowsShell:
             env = dict(SystemRoot=os.environ['SystemRoot'], WINDIR=os.environ['SystemRoot'],
                 COMSPEC=executable, PATH=os.pathsep.join([str(system), str(Path(sys.executable).parent)]),
                 PYTHON_RUNTIME=str(Path(sys.executable).resolve()),
-                JARVIS_LAUNCHER=str(Path(__file__).resolve().with_name('shell_launcher.py')),
+                JARVIS_LAUNCHER=str(launcher_path),
                 TEMP=self.temp.name, TMP=self.temp.name, USERPROFILE=self.temp.name, HOME=self.temp.name)
             for key in ('SystemDrive', 'ALLUSERSPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ProgramData',
                         'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'USERNAME', 'USERDOMAIN'):
