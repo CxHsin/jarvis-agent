@@ -2,7 +2,7 @@ from copy import deepcopy
 from threading import Event
 import pytest
 
-from jarvis_agent import Config
+from configuration import Config
 from tests.test_memory_recall_contract import remember
 
 
@@ -46,7 +46,7 @@ def test_sessions_share_memory_without_sharing_messages_or_lifetime(tmp_path):
 
 def test_application_preserves_session_locks_and_releases_them_on_exit(tmp_path):
     from application import Application
-    from session_store import SessionLockedError
+    from session.session_store import SessionLockedError
 
     config = Config('http://example.test', '', 'test', root_dir=tmp_path,
                     state_dir=tmp_path / 'state')

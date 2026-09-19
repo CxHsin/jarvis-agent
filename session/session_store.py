@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from task_history import TaskHistory
+from session.task_history import TaskHistory
 
 
 SESSION_FORMAT_VERSION = 2
@@ -173,7 +173,7 @@ def _first_record(path: Path) -> dict[str, Any] | None:
 
 
 def _read_info(path: Path) -> SessionInfo | None:
-    from session_migration import committed_path
+    from session.session_migration import committed_path
     path = committed_path(path)
     header = _first_record(path)
     if not header or header.get("type") != RECORD_SESSION:
@@ -340,7 +340,7 @@ class SessionStore:
         self._lock.acquire()
         try:
             if existing:
-                from session_migration import committed_path, migrate
+                from session.session_migration import committed_path, migrate
                 self.path = committed_path(self.path)
                 header = _first_record(self.path) or {}
                 self._format_version = int(header.get("version", 1))

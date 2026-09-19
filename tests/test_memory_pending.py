@@ -1,4 +1,4 @@
-from session_store import SessionStore
+from session.session_store import SessionStore
 from tests.test_session_persistence import SessionTestBase
 from tests.test_jarvis_agent import FakeClient, FailingClient
 import json
@@ -8,7 +8,7 @@ from dataclasses import replace
 from io import StringIO
 from threading import Event
 import time
-from jarvis_agent import Agent
+from agent.agent import Agent
 
 
 class PendingTests(SessionTestBase):

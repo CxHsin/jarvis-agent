@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 from dataclasses import dataclass, field, replace
 from typing import Mapping
-from session_store import resolve_state_dir
-from tool_runtime import PermissionPolicy
+from session.session_store import resolve_state_dir
+from tools.tool_runtime import PermissionPolicy
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
 

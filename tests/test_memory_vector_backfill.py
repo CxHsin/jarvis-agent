@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from tests.memory_helpers import wait_ready, wait_state
-from memory_service import MemoryService
+from memory.memory_service import MemoryService
 from tests.test_memory_recall_contract import remember
 from application import Application
 from configuration import Config

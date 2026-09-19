@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
-from context_budget import estimate_tokens
+from context.context_budget import estimate_tokens
 
 
 CONTEXT_SUMMARY_OPEN = "<context_summary>"

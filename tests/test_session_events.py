@@ -7,9 +7,9 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from session_store import SessionStore, session_directory
+from session.session_store import SessionStore, session_directory
 from tests.test_jarvis_agent import FakeClient, FailingClient, ScriptedClient
-from model_client import ModelRequestError
+from models.model_client import ModelRequestError
 from tests.test_session_persistence import SessionTestBase
 
 
@@ -56,7 +56,8 @@ class UnifiedSessionEventsTests(SessionTestBase):
         script = '''
 import json, os, sys
 from pathlib import Path
-from jarvis_agent import Agent, Config
+from agent.agent import Agent
+from configuration import Config
 class Client:
     def complete(self, *args, **kwargs):
         return {"role": "assistant", "content": "<context_summary>durable checkpoint</context_summary>"}
@@ -118,8 +119,10 @@ agent.compact_now()
         script = '''
 import json, os, sys
 from pathlib import Path
-from jarvis_agent import Agent, Config, ModelRequestError
-from tool_runtime import ProviderLoadError
+from agent.agent import Agent
+from configuration import Config
+from models.model_client import ModelRequestError
+from tools.tool_runtime import ProviderLoadError
 class Client:
     def complete(self, *args, **kwargs):
         agent.tool_runtime.policy.change_mode("approve-all")
@@ -160,7 +163,8 @@ agent.run_request("failed raw input")
         script = '''
 import json, os, sys
 from pathlib import Path
-from jarvis_agent import Agent, Config
+from agent.agent import Agent
+from configuration import Config
 agent = Agent(Config(base_url="http://example.test", api_key="", model="test",
     root_dir=Path(sys.argv[1]), state_dir=Path(sys.argv[2]),
     tool_permission_mode="broad-access"), object())
@@ -284,7 +288,8 @@ agent.tool_runtime.policy.revoke()
         script = '''
 import os
 from pathlib import Path
-from jarvis_agent import Agent, Config
+from agent.agent import Agent
+from configuration import Config
 class Client:
     calls = 0
     def complete(self, messages, tools, tool_choice):

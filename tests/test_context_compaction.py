@@ -1,9 +1,9 @@
 import unittest
 from pathlib import Path
 
-from compaction import is_overflow_error
-from context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
-from jarvis_agent import Config
+from context.compaction import is_overflow_error
+from context.context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
+from configuration import Config
 from tests.test_jarvis_agent import FakeClient
 
 

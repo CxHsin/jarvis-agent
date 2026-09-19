@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from jarvis_agent import Agent
+from agent.agent import Agent
 from tests.test_tool_runtime_acceptance import Client, answer, call, config, tool_results
 
 
@@ -74,7 +74,7 @@ def test_python_bridge_preserves_windows_arguments(tmp_path):
         'import json, sys\nfrom pathlib import Path\n'
         "Path('argv.json').write_text(json.dumps(sys.argv[1:]))\n",
         encoding='utf-8')
-    args = ['space value', 'ümlaut', 'quote"value', r'C:\\', '']
+    args = ['space value', '鐪塵laut', 'quote"value', r'C:\\', '']
     rendered = ' '.join("'" + value.replace("'", "''") + "'" for value in args)
     command = f"python -I '{script}' {rendered} 123"
     agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(
@@ -103,35 +103,70 @@ def test_deleting_granted_file_does_not_break_next_shell(tmp_path):
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
-def test_detached_child_cannot_survive_shell_exit_or_break_out_of_job(tmp_path):
-    script = tmp_path / 'spawn.py'
-    script.write_text('''import json, subprocess, sys, time
-from pathlib import Path
-escaped = False
-try:
-    subprocess.Popen([sys.executable, '-I', '-c', 'pass'], creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB)
-    escaped = True
-except OSError:
-    pass
-child = subprocess.Popen([sys.executable, '-I', '-c',
-    "from pathlib import Path; import time; Path('child-ready').write_text('ready'); time.sleep(3); Path('late.txt').write_text('bad')"],
-    creationflags=subprocess.DETACHED_PROCESS)
-until = time.monotonic() + 5
-while not Path('child-ready').exists() and time.monotonic() < until:
-    time.sleep(0.01)
-Path('spawn-result.json').write_text(json.dumps({'escaped': escaped, 'ready': Path('child-ready').exists(), 'pid': child.pid}))
-''', encoding='utf-8')
-    agent = Agent(config(tmp_path, tool_permission_mode='broad-access'), Client(
-        answer(call('bash', {'command': f"python -I '{script}'", 'timeout': 30})), {'content': 'done'}))
-    try:
-        agent.run_request('Run the child-process check')
-        result = json.loads((tmp_path / 'spawn-result.json').read_text())
-        assert result['escaped'] is False
-        assert result['ready'] is True
-        time.sleep(3.1)
-        assert not (tmp_path / 'late.txt').exists()
-    finally:
-        agent.close()
+@pytest.mark.parametrize('creationflags', [subprocess.CREATE_BREAKAWAY_FROM_JOB if os.name == 'nt' else 0,
+                                         subprocess.DETACHED_PROCESS if os.name == 'nt' else 0])
+def test_child_remains_in_job_and_dies_on_shell_exit(tmp_path, creationflags):
+    """Creation success does not prove breakaway; inspect the actual child."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    import tempfile
+    from tools.shell_sandbox import start_shell
+
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    child_script = workspace / 'child.py'
+    child_script.write_text(
+        "import os, time\nfrom pathlib import Path\n"
+        "Path('child-ready.tmp').write_text(str(os.getpid()))\nPath('child-ready.tmp').replace('child-ready')\ntime.sleep(60)\n"
+        "Path('late.txt').write_text('bad')\n", encoding='utf-8')
+    script = workspace / 'spawn.py'
+    script.write_text(
+        "import subprocess, sys, time\nfrom pathlib import Path\n"
+        "try:\n"
+        f"    subprocess.Popen([sys.executable, '-I', 'child.py'], creationflags={creationflags})\n"
+        "except OSError as exc:\n"
+        "    Path('rejected.tmp').write_text(str(exc.winerror))\n    Path('rejected.tmp').replace('rejected')\n"
+        "until = time.monotonic() + 20\n"
+        "while not Path('release').exists() and time.monotonic() < until: time.sleep(0.01)\n",
+        encoding='utf-8')
+    with tempfile.TemporaryFile() as output:
+        shell = start_shell(f"python -I '{script}'", workspace, tmp_path / 'state', output)
+        child_handle = None
+        try:
+            shell.start()
+            until = time.monotonic() + 15
+            while not any((workspace / name).exists() for name in ('child-ready', 'rejected')):
+                assert shell.poll() is None, 'Shell exited before child reported its state'
+                assert time.monotonic() < until, 'Child did not start'
+                time.sleep(0.01)
+            if (workspace / 'rejected').exists():
+                assert creationflags == subprocess.CREATE_BREAKAWAY_FROM_JOB
+                assert (workspace / 'rejected').read_text() == '5'  # ERROR_ACCESS_DENIED
+            else:
+                kernel = shell.kernel
+                kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+                kernel.OpenProcess.restype = w.HANDLE
+                kernel.IsProcessInJob.argtypes = [w.HANDLE, w.HANDLE, c.POINTER(w.BOOL)]
+                # Read the executing interpreter's PID, not a venv redirector's PID.
+                pid = int((workspace / 'child-ready').read_text())
+                child_handle = kernel.OpenProcess(0x100000 | 0x1000, False, pid)
+                assert child_handle
+                member = w.BOOL()
+                assert kernel.IsProcessInJob(child_handle, shell.job, c.byref(member))
+                assert member.value, 'Child escaped the Jarvis job'
+            (workspace / 'release').write_text('release')
+            until = time.monotonic() + 10
+            while shell.poll() is None:
+                assert time.monotonic() < until, 'Shell did not exit'
+                time.sleep(0.01)
+            shell.close()
+            if child_handle:
+                assert shell.wait_for(child_handle, 5000) == 0, 'Child survived job cleanup'
+            assert not (workspace / 'late.txt').exists()
+        finally:
+            shell.close()
+            if child_handle:
+                shell.close_handle(child_handle)
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')

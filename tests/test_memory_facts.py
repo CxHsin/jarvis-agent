@@ -1,8 +1,8 @@
 import json
 
-from session_store import SessionStore
+from session.session_store import SessionStore
 from tests.test_session_persistence import SessionTestBase
-from jarvis_agent import Agent
+from agent.agent import Agent
 from tests.test_jarvis_agent import FakeClient
 from contextlib import redirect_stdout
 from io import StringIO
@@ -35,7 +35,7 @@ class MemoryFactsTests(SessionTestBase):
             store.end_task()
             store.memory.process_pending(StableModel())
             original = store.memory.facts()[0]
-            from stable_memory import timestamp
+            from memory.stable_memory import timestamp
             corrected = store.memory.correct(original['fact_id'], dict(subject='USER',
                 predicate='communication_style', object='detailed', category='communication'),
                 source=self.source('Correction: detailed', timestamp(), 'correction'))
@@ -131,7 +131,7 @@ class MemoryFactsTests(SessionTestBase):
             store.end_task()
             store.memory.process_pending(StableModel())
             fact_id = store.memory.facts()[0]['fact_id']
-            from stable_memory import timestamp
+            from memory.stable_memory import timestamp
             store.memory.forget(fact_id, source=self.source('Forget that', timestamp(), 'forget'), operation_id='forget')
             store.record_task(3, 'next')
             store.end_task()

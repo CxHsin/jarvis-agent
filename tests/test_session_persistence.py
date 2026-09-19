@@ -8,14 +8,17 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from context_manager import (
+from context.context_manager import (
     CONTEXT_COMPRESSED_MARKER,
     CONTEXT_RECOVERED_MARKER,
     ContextManager,
 )
-from jarvis_agent import Agent, Config, TOOL_DEFINITIONS, main, save_global_tool_permission_mode
-from session_store import SessionLockedError, SessionNotFoundError, SessionStore
-from tool_runtime import PermissionPolicy
+from agent.agent import Agent
+from configuration import Config, save_global_tool_permission_mode
+from tools.definitions import TOOL_DEFINITIONS
+from jarvis_agent import main
+from session.session_store import SessionLockedError, SessionNotFoundError, SessionStore
+from tools.tool_runtime import PermissionPolicy
 from tests.test_jarvis_agent import FakeClient, FailingClient
 
 

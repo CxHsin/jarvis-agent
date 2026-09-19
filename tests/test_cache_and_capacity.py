@@ -7,11 +7,13 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from cache_metrics import cache_usage, MeasuredClient, UsageLedger
-from context_budget import ContextBudget, OUTPUT_FLOOR_TOKENS
-from context_manager import ContextManager, estimate_tokens
-from jarvis_agent import Config, ConfigurationError, ChatCompletionsClient, Agent, ModelRequestError
-from model_capabilities import load_capability
+from models.cache_metrics import cache_usage, MeasuredClient, UsageLedger
+from context.context_budget import ContextBudget, OUTPUT_FLOOR_TOKENS
+from context.context_manager import ContextManager, estimate_tokens
+from configuration import Config, ConfigurationError
+from models.model_client import ChatCompletionsClient, ModelRequestError
+from agent.agent import Agent
+from models.model_capabilities import load_capability
 from tests.test_jarvis_agent import FakeHTTPResponse, FakeClient, make_agent
 
 
@@ -91,12 +93,12 @@ class CapacityTests(unittest.TestCase):
 
     def test_known_model_needs_no_network_and_sends_output_limit(self):
         client = ChatCompletionsClient(Config(base_url="https://api.deepseek.com", api_key="", model="deepseek-v4-flash"))
-        with patch("jarvis_agent.urllib.request.urlopen") as network:
+        with patch("models.model_client.urllib.request.urlopen") as network:
             config = client.resolve_config()
         network.assert_not_called()
         self.assertEqual(config.max_output_tokens, 32768)
         response = {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 10}}
-        with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse(response)) as network:
+        with patch("models.model_client.urllib.request.urlopen", return_value=FakeHTTPResponse(response)) as network:
             client.complete([{"role": "user", "content": "hello"}], [])
         self.assertEqual(json.loads(network.call_args.args[0].data)["max_tokens"], 32768)
 
@@ -104,9 +106,9 @@ class CapacityTests(unittest.TestCase):
         client = ChatCompletionsClient(self.config())
         payloads = [FakeHTTPResponse({"max_input_tokens": 90000}), FakeHTTPResponse({"data": [
             {"id": "other", "context_window": 90000}, {"id": "test", "context_window": 20000}]})]
-        with patch("jarvis_agent.urllib.request.urlopen", side_effect=payloads):
+        with patch("models.model_client.urllib.request.urlopen", side_effect=payloads):
             self.assertEqual(client.discover_context_window(), 20000)
-        with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse({"data": [{"id": "other", "context_window": 90000}]})):
+        with patch("models.model_client.urllib.request.urlopen", return_value=FakeHTTPResponse({"data": [{"id": "other", "context_window": 90000}]})):
             self.assertIsNone(client.discover_context_window())
 
     def test_unknown_capacity_requires_configuration(self):
@@ -121,7 +123,7 @@ class CapacityTests(unittest.TestCase):
                 "context_window_tokens": 20000, "max_output_tokens": 500, "source": "test", "checked_at": "2026-09-11"}]}), encoding="utf-8")
             client = ChatCompletionsClient(self.config(model_capabilities_file=path, context_window_tokens=30000,
                                                       context_keep_recent_tokens=1000))
-            with patch("jarvis_agent.urllib.request.urlopen") as network:
+            with patch("models.model_client.urllib.request.urlopen") as network:
                 config = client.resolve_config()
             network.assert_not_called()
             self.assertEqual(config.context_window_tokens, 30000)
@@ -143,7 +145,7 @@ class CapacityTests(unittest.TestCase):
         client = ChatCompletionsClient(self.config(context_window_tokens=20000, context_reserve_tokens=1000,
                                                    context_keep_recent_tokens=4000))
         client.resolve_config()
-        with patch("jarvis_agent.urllib.request.urlopen") as network:
+        with patch("models.model_client.urllib.request.urlopen") as network:
             with self.assertRaises(ModelRequestError):
                 client.complete([{"role": "user", "content": "x" * 100000}], [])
         network.assert_not_called()
@@ -179,11 +181,11 @@ class CapacityTests(unittest.TestCase):
         messages = [{"role": "user", "content": "x" * 40000}]
         expected = max(1, min(8192, 20000 - estimate_tokens(messages, []) - OUTPUT_FLOOR_TOKENS))
         response = {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 10}}
-        with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse(response)) as network:
+        with patch("models.model_client.urllib.request.urlopen", return_value=FakeHTTPResponse(response)) as network:
             client.complete(messages, [])
         self.assertEqual(json.loads(network.call_args.args[0].data)["max_tokens"], expected)
         self.assertLess(expected, 8192)
-        with patch("jarvis_agent.urllib.request.urlopen") as network:
+        with patch("models.model_client.urllib.request.urlopen") as network:
             with self.assertRaises(ModelRequestError):
                 client.complete([{"role": "user", "content": "x" * 200000}], [])
         network.assert_not_called()

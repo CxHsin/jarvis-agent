@@ -52,7 +52,7 @@ def _backup_database(source_path, target_path):
 
 def protect_legacy_memory(config):
     """Capture existing personal state before MemoryService can recover/publish it."""
-    from session_store import _first_record, _SessionLock, resolve_state_dir
+    from session.session_store import _first_record, _SessionLock, resolve_state_dir
     state = resolve_state_dir(config)
     if not any((_first_record(path) or {}).get('version', 1) == 1
                for path in (state / 'sessions').glob('*/*.jsonl')):
@@ -182,7 +182,7 @@ def _validate_memory_sources(database, report):
 
 
 def _validate(store, original, candidate, events):
-    from session_store import SessionStore
+    from session.session_store import SessionStore
     recovered = []
     for path in (original, candidate):
         reader = SessionStore(store.config, store.session_id, store.started_at)

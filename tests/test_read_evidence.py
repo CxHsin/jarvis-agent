@@ -5,7 +5,8 @@ from io import StringIO
 
 import pytest
 
-from jarvis_agent import Agent, Config
+from agent.agent import Agent
+from configuration import Config
 from tests.test_jarvis_agent import FakeClient
 
 

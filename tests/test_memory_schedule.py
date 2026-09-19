@@ -2,7 +2,7 @@ from datetime import datetime
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from memory_service import MemoryService
+from memory.memory_service import MemoryService
 
 
 def test_nightly_batch_rolls_over_at_local_three_am():

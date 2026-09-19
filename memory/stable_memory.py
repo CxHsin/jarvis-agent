@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable
 from sqlite3 import Connection
 
-from memory_store import MemoryStore
+from memory.memory_store import MemoryStore
 
 
 CATEGORIES = {'identity', 'work_preferences', 'communication', 'long_term_goals',

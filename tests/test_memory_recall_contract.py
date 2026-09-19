@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 
-from memory_service import MemoryService
+from memory.memory_service import MemoryService
 from tests.memory_helpers import wait_ready, wait_state
 
 

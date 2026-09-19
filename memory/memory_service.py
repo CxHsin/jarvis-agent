@@ -3,11 +3,11 @@
 import json
 from pathlib import Path
 import urllib.request
-from stable_memory import StableMemory
-from memory_retrieval import MemoryRetrieval
-from memory_profile import ProfileMemory
-from memory_store import MemoryStore
-from memory_pending import PendingMemory
+from memory.stable_memory import StableMemory
+from memory.memory_retrieval import MemoryRetrieval
+from memory.memory_profile import ProfileMemory
+from memory.memory_store import MemoryStore
+from memory.memory_pending import PendingMemory
 
 
 class OpenAIEmbeddingClient:

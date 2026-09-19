@@ -31,7 +31,7 @@ def read_events(path, session_id):
 
 def event_sources(directory):
     """Committed canonical streams, plus trajectories not yet migrated."""
-    from session_migration import committed_path
+    from session.session_migration import committed_path
     migrated = set()
     sources = []
     for original in sorted((directory.parent / 'sessions').glob('*/*.jsonl')):

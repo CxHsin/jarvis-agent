@@ -4,14 +4,14 @@ from dataclasses import replace
 from contextlib import ExitStack
 
 from configuration import Config
-from memory_service import MemoryService, OpenAIEmbeddingClient
-from model_client import ChatCompletionsClient
-from session_store import resolve_state_dir
+from memory.memory_service import MemoryService, OpenAIEmbeddingClient
+from models.model_client import ChatCompletionsClient
+from session.session_store import resolve_state_dir
 
 
 def assemble_memory(config, *, embedding_client=None, rewrite_client=None):
     """Also supports standalone SessionStore compatibility without a worker."""
-    from session_migration import protect_legacy_memory
+    from session.session_migration import protect_legacy_memory
     protect_legacy_memory(config)
     endpoint = getattr(config, 'embedding_base_url', None)
     model = getattr(config, 'embedding_model', None)
@@ -35,7 +35,7 @@ def standalone_store(config, *, session_id=None, resume=False):
     Hosts that start background work must own and close that memory explicitly,
     or use Application for automatic lifetime management.
     """
-    from session_store import SessionStore
+    from session.session_store import SessionStore
     memory = assemble_memory(config)
     if resume:
         return SessionStore.resume(config, session_id, memory=memory)
@@ -97,7 +97,7 @@ class Application:
         self._ready = True
 
     def create_session(self, *, resume=None, store=None, **tool_host):
-        from jarvis_agent import Agent
+        from agent.agent import Agent
         if self._closed:
             raise RuntimeError('Application is closed')
         return Agent(self.config, resume=resume, store=store, application=self, **tool_host)

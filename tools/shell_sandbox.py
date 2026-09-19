@@ -72,7 +72,7 @@ class WindowsShell:
         launcher_path = Path(self.temp.name) / 'shell_launcher.py'
         shutil.copyfile(Path(__file__).with_name('shell_launcher.py'), launcher_path)
         self.protected = protected
-        self.readonly = {Path(__file__).resolve().parent, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve()}
+        self.readonly = {Path(__file__).resolve().parents[1], Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve()}
         self._fds = []
         self.attrs = None
 

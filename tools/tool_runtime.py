@@ -232,7 +232,7 @@ class ToolRuntime:
         self.registry, self._stable = registry, tuple(stable)
         self.policy = policy or PermissionPolicy()
         self.confirm, self.recorder, self.history = confirm, recorder, {}
-        from tool_execution import ToolDispatcher
+        from tools.tool_execution import ToolDispatcher
         self.dispatcher = ToolDispatcher(registry, policy=self.policy, confirm=confirm,
                                          recorder=recorder, resource_resolver=resource_resolver)
 
@@ -537,5 +537,5 @@ class ToolProviderAdapter:
 NativeProviderAdapter = ToolProviderAdapter
 
 # Preserve public imports while keeping execution separate from registration.
-from tool_execution import (ToolCall, ToolDispatcher, ToolScheduler, DependencyScheduler,
+from tools.tool_execution import (ToolCall, ToolDispatcher, ToolScheduler, DependencyScheduler,
                             schedule_tool_calls, execute_tool_calls)

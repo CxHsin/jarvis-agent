@@ -6,9 +6,9 @@ from urllib.parse import quote
 from dataclasses import replace
 from typing import Any, Mapping, Sequence
 from configuration import Config, ConfigurationError
-from context_budget import ContextBudget
-from context_manager import estimate_tokens
-from model_capabilities import load_capability
+from context.context_budget import ContextBudget
+from context.context_manager import estimate_tokens
+from models.model_capabilities import load_capability
 
 class ModelRequestError(RuntimeError):
     """Raised when the model endpoint cannot complete a request."""

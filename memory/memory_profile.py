@@ -5,8 +5,8 @@ import math
 import uuid
 from contextlib import contextmanager
 
-from stable_memory import StableMemory, timestamp
-from memory_store import MemoryStore
+from memory.stable_memory import StableMemory, timestamp
+from memory.memory_store import MemoryStore
 
 
 PROFILE_CATEGORIES = ('identity', 'work_preferences', 'communication',

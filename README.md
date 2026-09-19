@@ -118,16 +118,47 @@ Python 命令由沙箱临时目录中的固定 launcher 启动，参数通过 UT
 ## 项目结构
 
 ```text
-jarvis_agent.py       CLI 与 Agent 交互入口
-application.py        应用装配与共享生命周期
-session_store.py      会话事件、恢复和迁移
-context_manager.py    上下文投影、预算和压缩
-memory_*.py           事实、检索、画像和 Pending
-tool_runtime.py       工具注册、权限、调度和审计
-shell_sandbox.py      Windows shell 隔离
-tests/                外部行为与持久化契约测试
-docs/adr/             架构决策记录
+jarvis_agent.py          CLI：启动、命令解析与交互
+application.py           应用装配与共享生命周期
+configuration.py         配置解析与用户默认设置
+agent/
+  agent.py               Agent 任务执行与模型—工具循环
+context/
+  context_manager.py     上下文投影与组装
+  context_budget.py      输入预算与 token 估算
+  compaction.py          压缩、切点与溢出恢复
+session/
+  session_store.py       会话事件、持久化与恢复
+  session_migration.py   旧会话迁移
+  task_history.py        任务轨迹及 History/Recent 投影
+memory/
+  memory_service.py      记忆公开操作与组件装配
+  memory_store.py        SQLite 连接与事务
+  stable_memory.py       稳定事实、来源与有效期
+  memory_retrieval.py    关键词与向量召回
+  memory_profile.py      用户画像与人工编辑
+  memory_pending.py      候选提取、晋级与后台调度
+  memory_authorization.py 记忆写入授权判断
+models/
+  model_client.py        模型通信与请求处理
+  model_capabilities.py  模型容量查询
+  model_capabilities.json 模型能力目录
+  cache_metrics.py       模型用量与缓存统计
+tools/
+  definitions.py         内置工具定义
+  workspace.py           工作区文件操作与 shell 工具入口
+  tool_runtime.py        工具注册、发现、权限与审计
+  tool_execution.py      工具执行、取消与依赖调度
+  shell_sandbox.py       Windows shell 隔离
+  shell_launcher.py      沙箱 Python 启动桥接
+tests/                  外部行为与持久化契约测试
+benchmarks/             离线性能基线
+docs/adr/               架构决策记录
 ```
+
+按职责定位代码：`session` 保存发生过的事件及其投影，`memory` 管理跨任务的稳定事实，`context` 决定本次发送给模型的内容。`agent` 协调任务，`tools` 执行具体操作，`models` 处理模型通信及容量和用量。应用负责装配与关闭资源；本次目录划分不改变已有生命周期与持久化契约，也不引入统一的 `core` 杂项目录。
+
+Python 调用方从所属模块导入，例如 `from agent.agent import Agent`、`from memory.memory_service import MemoryService`。原有根目录模块导入路径已迁移；CLI 仍使用 `python jarvis_agent.py`。模型能力 JSON 随 `models` 模块存放，shell launcher 随 `tools` 模块存放。
 
 ## 许可
 

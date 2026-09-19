@@ -12,8 +12,8 @@ import json
 from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
-from cache_metrics import cache_usage
-from compaction import (
+from models.cache_metrics import cache_usage
+from context.compaction import (
     CONTEXT_COMPRESSED_MARKER,
     CONTEXT_FALLBACK_MARKER,
     CONTEXT_SUMMARY_CLOSE,
@@ -21,7 +21,7 @@ from compaction import (
     CompactionResult,
     CompactionService,
 )
-from context_budget import ContextBudget, estimate_tokens
+from context.context_budget import ContextBudget, estimate_tokens
 
 
 CONTEXT_RECOVERED_MARKER = "[CONTEXT_RECOVERED]"

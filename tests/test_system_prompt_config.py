@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from jarvis_agent import Agent, Config, DEFAULT_SYSTEM_PROMPT
+from agent.agent import Agent
+from configuration import Config, DEFAULT_SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize('value', ['请用中文简洁回答。', '', '   '])

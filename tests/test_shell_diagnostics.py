@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from jarvis_agent import Agent, TOOL_DEFINITIONS, decode_shell_output
+from agent.agent import Agent
+from tools.definitions import TOOL_DEFINITIONS
+from tools.workspace import decode_shell_output
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows OEM code page")

@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
-from memory_service import MemoryService
-from memory_profile import ProfileEditError
+from memory.memory_service import MemoryService
+from memory.memory_profile import ProfileEditError
 
 
 def user_edit(name='Alice'):

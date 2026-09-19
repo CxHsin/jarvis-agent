@@ -9,11 +9,13 @@ from copy import deepcopy
 
 import pytest
 
-from jarvis_agent import Agent, Config, Workspace
+from agent.agent import Agent
+from configuration import Config
+from tools.workspace import Workspace
 from unittest.mock import patch
-from tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolDispatcher,
+from tools.tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolDispatcher,
                           PermissionPolicy, ProviderLoadError)
-from jarvis_agent import ModelRequestError
+from models.model_client import ModelRequestError
 
 
 class Client:

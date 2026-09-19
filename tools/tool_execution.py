@@ -54,7 +54,7 @@ class ExecutionContext:
 
 class ToolDispatcher:
     def __init__(self, registry, *, policy=None, confirm=None, recorder=None, resource_resolver=None):
-        from tool_runtime import PermissionPolicy
+        from tools.tool_runtime import PermissionPolicy
         self.registry, self.policy = registry, policy or PermissionPolicy()
         self.confirm, self.recorder = confirm, recorder
         self.resource_resolver = resource_resolver

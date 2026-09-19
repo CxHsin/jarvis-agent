@@ -12,7 +12,7 @@ def revision(t):
  try:return subprocess.check_output(['git','-C',str(t),'rev-parse','HEAD'],text=True).strip()
  except Exception:return 'unavailable'
 def memory(target,scale,repeats):
- sys.path.insert(0,str(target)); M=importlib.import_module('memory_service').MemoryService; out=[]
+ sys.path.insert(0,str(target)); M=importlib.import_module('memory.memory_service' if (target / 'memory').is_dir() else 'memory_service').MemoryService; out=[]
  for scenario,client in [('no-vector',None),('rebuilding',CountingEmbedding(3)),('ready',CountingEmbedding(3))]:
   with tempfile.TemporaryDirectory() as d:
    m=M(Path(d),embedding_client=client,embedding_model='synthetic',embedding_dimensions=3)
@@ -25,7 +25,7 @@ def memory(target,scale,repeats):
    m.close()
  return out
 def projections(target,scale,repeats):
- sys.path.insert(0,str(target)); mod=importlib.import_module('task_history'); T=mod.TaskHistory; out=[]
+ sys.path.insert(0,str(target)); mod=importlib.import_module('session.task_history' if (target / 'session').is_dir() else 'task_history'); T=mod.TaskHistory; out=[]
  for _ in range(repeats):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d); h=T(root,'synthetic-session',scale)

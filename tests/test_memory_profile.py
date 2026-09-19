@@ -1,12 +1,12 @@
 import json
 
-from session_store import SessionStore
+from session.session_store import SessionStore
 from tests.test_session_persistence import SessionTestBase
 from tests.test_jarvis_agent import FakeClient
-from jarvis_agent import Agent
+from agent.agent import Agent
 from contextlib import redirect_stdout
 from io import StringIO
-from memory_profile import ProfileEditError
+from memory.memory_profile import ProfileEditError
 
 
 class MemoryProfileTests(SessionTestBase):
@@ -144,7 +144,7 @@ class MemoryProfileTests(SessionTestBase):
             store.memory.process_pending(StableModel())
             self.assertEqual(store.memory.profile_snapshot(), profile)
             fact = store.memory.facts()[0]
-            from stable_memory import timestamp
+            from memory.stable_memory import timestamp
             corrected = store.memory.correct(fact['fact_id'], dict(subject='USER', predicate=fact['predicate'],
                 object='detailed', category='communication'),
                 source=dict(quote='Correction: detailed', recorded_at=timestamp()))

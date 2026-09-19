@@ -3,10 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
-from memory_service import MemoryService
+from memory.memory_service import MemoryService
 from application import assemble_memory
 
-from session_store import SessionStore, session_directory
+from session.session_store import SessionStore, session_directory
 from tests.test_jarvis_agent import FakeClient
 from tests.test_session_persistence import SessionTestBase
 
@@ -16,7 +16,7 @@ import os, sys
 from pathlib import Path
 from application import assemble_memory
 from configuration import Config
-from session_store import SessionStore
+from session.session_store import SessionStore
 config = Config(base_url='http://example.test', api_key='', model='test', root_dir=Path(sys.argv[1]), state_dir=Path(sys.argv[2]))
 memory = assemble_memory(config) if sys.argv[4] == 'session' else None
 sync, replace = os.fsync, os.replace
@@ -189,7 +189,7 @@ class LegacyMigrationTests(SessionTestBase):
         recent_parent = self.state / 'memory' / 'recent' / 'legacy'
         recent_parent.parent.mkdir(parents=True)
         recent_parent.write_text('blocked derived directory', encoding='utf-8')
-        from session_store import SessionError
+        from session.session_store import SessionError
         with self.assertRaisesRegex(SessionError, '迁移已经提交'):
             self.agent(FakeClient([]), resume='legacy')
         canonical = original.parent / 'migrations' / 'legacy' / 'events.jsonl'

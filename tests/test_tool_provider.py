@@ -1,6 +1,6 @@
 import pytest
 
-from tool_runtime import (
+from tools.tool_runtime import (
     ProviderCapabilityMode, ProviderLoadError, ProviderSession,
     ToolProviderAdapter, ToolRegistry, ToolRuntime,
 )

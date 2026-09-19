@@ -2,9 +2,10 @@ import json
 
 import pytest
 
-from jarvis_agent import Agent, Config
-from memory_service import MemoryService
-from stable_memory import timestamp
+from agent.agent import Agent
+from configuration import Config
+from memory.memory_service import MemoryService
+from memory.stable_memory import timestamp
 from tests.memory_helpers import wait_ready
 
 

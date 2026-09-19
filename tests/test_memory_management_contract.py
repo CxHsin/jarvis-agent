@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from jarvis_agent import Agent, Config
+from agent.agent import Agent
+from configuration import Config
 from tests.test_memory_recall_contract import remember
 from tests.memory_helpers import wait_ready
 

@@ -7,9 +7,9 @@ from pathlib import Path
 import sqlite3
 from threading import Event, Thread
 import uuid
-from stable_memory import StableMemory, timestamp
-from memory_profile import ProfileMemory, ProfileEditError
-from memory_store import MemoryStore
+from memory.stable_memory import StableMemory, timestamp
+from memory.memory_profile import ProfileMemory, ProfileEditError
+from memory.memory_store import MemoryStore
 
 
 EXTRACTION_INSTRUCTIONS = """Extract Pending personal memory candidates from the supplied immutable task events.
@@ -220,7 +220,7 @@ class PendingMemory:
         self._worker.start()
 
     def recover_completed(self):
-        from task_history import rebuild_projections
+        from session.task_history import rebuild_projections
         # Use precisely the foreground fold, including rollback and migration
         # validity, and the window persisted by the most recent task.
         rebuild_projections(self.directory, self)

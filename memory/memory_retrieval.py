@@ -8,8 +8,8 @@ import math
 import re
 from threading import Event, Thread
 
-from stable_memory import timestamp
-from memory_store import MemoryStore
+from memory.stable_memory import timestamp
+from memory.memory_store import MemoryStore
 
 
 def terms(text):

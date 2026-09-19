@@ -3,7 +3,7 @@ from io import StringIO
 
 from tests.test_session_persistence import SessionTestBase
 from tests.test_jarvis_agent import FakeClient
-from session_store import SessionStore
+from session.session_store import SessionStore
 
 
 class HistoryRecentTests(SessionTestBase):

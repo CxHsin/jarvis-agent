@@ -4,8 +4,8 @@ import sqlite3
 
 import pytest
 
-from memory_service import MemoryService
-from stable_memory import timestamp
+from memory.memory_service import MemoryService
+from memory.stable_memory import timestamp
 
 
 def fact(value):
@@ -118,7 +118,7 @@ def test_late_operation_failure_keeps_facts_sources_conflicts_and_index_atomic(t
 
 def test_correction_publication_recovers_without_overwriting_newer_manual_edit(tmp_path, monkeypatch):
     from pathlib import Path
-    from memory_profile import ProfileEditError
+    from memory.memory_profile import ProfileEditError
 
     memory = MemoryService(tmp_path)
     original = memory.remember(fact('Chinese'), source=source('Chinese'))

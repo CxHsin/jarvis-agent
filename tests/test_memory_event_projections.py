@@ -8,11 +8,11 @@ from pathlib import Path
 from threading import Event, Thread
 from unittest.mock import patch
 
-from jarvis_agent import Agent
-from memory_service import MemoryService
+from agent.agent import Agent
+from memory.memory_service import MemoryService
 
 from tests.test_jarvis_agent import FakeClient, ScriptedClient
-from model_client import ModelRequestError
+from models.model_client import ModelRequestError
 from tests.test_session_persistence import SessionTestBase
 
 
@@ -59,7 +59,7 @@ class EventProjectionTests(SessionTestBase):
         self.assertEqual(len(agent.store.memory.pending_batches()), 1)
 
     def test_migrated_projection_keeps_legacy_provenance_and_checkpoint(self):
-        from session_store import session_directory
+        from session.session_store import session_directory
         fixtures = Path(__file__).parent / 'fixtures' / 'legacy'
         original = session_directory(self.config()) / 'legacy.jsonl'
         original.parent.mkdir(parents=True)
@@ -132,7 +132,8 @@ class EventProjectionTests(SessionTestBase):
         script = '''
 import json, os, sys
 from pathlib import Path
-from jarvis_agent import Agent, Config
+from agent.agent import Agent
+from configuration import Config
 class Client:
     def complete(self, *args):
         return {'role': 'assistant', 'content': 'answer'}
@@ -155,7 +156,7 @@ agent.run_request('second input')
         process = subprocess.run([sys.executable, '-c', script, str(self.root), str(self.state)],
                                  capture_output=True, timeout=30)
         self.assertEqual(process.returncode, 41, process.stderr.decode(errors='replace'))
-        from session_store import SessionStore
+        from session.session_store import SessionStore
         path = SessionStore.list_sessions(self.config())[0].path
         with path.open('ab') as handle:
             handle.write(b'{"type":"message"')

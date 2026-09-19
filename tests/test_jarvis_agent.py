@@ -7,16 +7,13 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
-from jarvis_agent import (
-    Agent,
-    ChatCompletionsClient,
-    Config,
-    ModelRequestError,
-    TOOL_DEFINITIONS,
-    Workspace,
-    parse_compact_argument,
-)
+from context.context_manager import CONTEXT_COMPRESSED_MARKER, ContextManager
+from agent.agent import Agent
+from models.model_client import ChatCompletionsClient, ModelRequestError
+from configuration import Config
+from tools.definitions import TOOL_DEFINITIONS
+from tools.workspace import Workspace
+from jarvis_agent import parse_compact_argument
 
 
 _STATE_ROOT = Path(tempfile.mkdtemp(prefix="jarvis-test-state-"))
@@ -197,7 +194,7 @@ class AgentTests(unittest.TestCase):
                 root_dir=Path(directory),
             )
             client = ChatCompletionsClient(config)
-            with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse({"context_length": 32768})) as urlopen:
+            with patch("models.model_client.urllib.request.urlopen", return_value=FakeHTTPResponse({"context_length": 32768})) as urlopen:
                 self.assertEqual(client.discover_context_window(), 32768)
             request = urlopen.call_args.args[0]
             self.assertEqual(request.full_url, "http://example.test/v1/models/test-model")
@@ -214,7 +211,7 @@ class AgentTests(unittest.TestCase):
                 state_dir=_STATE_ROOT,
             )
             client = ChatCompletionsClient(config)
-            with patch("jarvis_agent.urllib.request.urlopen", return_value=FakeHTTPResponse({"data": [{"id": "test-model", "max_model_len": 65536}]})):
+            with patch("models.model_client.urllib.request.urlopen", return_value=FakeHTTPResponse({"data": [{"id": "test-model", "max_model_len": 65536}]})):
                 agent = make_agent(self, config, client)
             self.assertEqual(agent.config.context_window_tokens, 65536)
             self.assertEqual(agent.config.context_window_source, "upstream")
@@ -234,7 +231,7 @@ class AgentTests(unittest.TestCase):
                 state_dir=_STATE_ROOT,
             )
             client = ChatCompletionsClient(config)
-            with patch("jarvis_agent.urllib.request.urlopen") as urlopen:
+            with patch("models.model_client.urllib.request.urlopen") as urlopen:
                 agent = make_agent(self, config, client)
             self.assertEqual(agent.config.context_window_tokens, 16384)
             self.assertEqual(agent.config.context_window_source, "configured")
