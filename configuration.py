@@ -2,10 +2,8 @@
 import json
 import os
 from pathlib import Path
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Mapping
-from session.session_store import resolve_state_dir
-from tools.tool_runtime import PermissionPolicy
 
 DEFAULT_TEXT_EXTENSIONS = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py")
 
@@ -49,42 +47,17 @@ def _setting(values: Mapping[str, str], key: str, default: str | None = None) ->
     return values.get(key, default)
 
 
-GLOBAL_SETTINGS_FILE = "settings.json"
-
-
-def _global_settings_path(state_dir: Path) -> Path:
-    return state_dir / GLOBAL_SETTINGS_FILE
+def save_global_tool_permission_mode(state_dir: Path, mode: str) -> None:
+    """Legacy session-test helper: persist history without enabling a grant."""
+    path = state_dir / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"tool_permission_mode": mode}), encoding="utf-8")
 
 
 def load_global_tool_permission_mode(state_dir: Path) -> str | None:
-    """Read the user-wide permission default, if one was explicitly saved."""
-
-    path = _global_settings_path(state_dir)
-    if not path.exists():
-        return None
-    try:
-        values = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigurationError(f"无法读取全局设置: {path}") from exc
-    if not isinstance(values, dict):
-        raise ConfigurationError("全局设置必须是 JSON 对象。")
-    mode = values.get("tool_permission_mode")
-    if mode is not None and mode not in PermissionPolicy.MODES:
-        raise ConfigurationError("全局设置中的 TOOL_PERMISSION_MODE 无效。")
-    return mode
-
-
-def save_global_tool_permission_mode(state_dir: Path, mode: str) -> None:
-    """Atomically save the user-wide tool permission default."""
-
-    if mode not in PermissionPolicy.MODES:
-        raise ValueError("invalid permission mode")
-    path = _global_settings_path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"tool_permission_mode": mode}, ensure_ascii=False, indent=2) + "\n",
-                         encoding="utf-8")
-    temporary.replace(path)
+    """Read historical settings only; the execution policy ignores this value."""
+    path = state_dir / "settings.json"
+    return json.loads(path.read_text(encoding="utf-8")).get("tool_permission_mode") if path.exists() else None
 
 
 @dataclass(frozen=True)
@@ -119,7 +92,7 @@ class Config:
     context_compaction_failure_limit: int = 3
     tool_output_preview_chars: int = 500
     verbose_tool_output: bool = False
-    tool_permission_mode: str = "approve-dangerous"
+    tool_permission_mode: str | None = None  # legacy constructor compatibility; ignored
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     provider_tool_mode: str = "emulated"
     tool_max_timeout: float = 60.0
@@ -127,8 +100,6 @@ class Config:
     def __post_init__(self) -> None:
         if self.recent_task_count < 1:
             raise ConfigurationError("RECENT_TASK_COUNT 必须大于 0。")
-        if self.tool_permission_mode not in PermissionPolicy.MODES:
-            raise ConfigurationError("无效的 TOOL_PERMISSION_MODE。")
         if self.provider_tool_mode not in {"native", "emulated"}:
             raise ConfigurationError("PROVIDER_TOOL_MODE 必须是 native 或 emulated。")
         if not 0 < self.tool_max_timeout <= 3600:
@@ -179,10 +150,7 @@ class Config:
                 return False
             raise ConfigurationError(f"{name} 必须是 true/false。")
 
-        root_value = _setting(values, "ROOT_DIR", str(Path.cwd()))
-        root_dir = Path(root_value or Path.cwd()).expanduser().resolve()
-        if not root_dir.exists() or not root_dir.is_dir():
-            raise ConfigurationError(f"ROOT_DIR 不是可访问的目录: {root_dir}")
+        root_dir = Path.cwd().resolve()
         state_value = _setting(values, "STATE_DIR")
         state_dir = Path(state_value).expanduser().resolve() if state_value else None
 
@@ -204,7 +172,6 @@ class Config:
             raise ConfigurationError("REQUEST_TIMEOUT 必须大于 0。")
 
         context_window = optional_positive_int("CONTEXT_WINDOW_TOKENS")
-        configured_permission_mode = _setting(values, "TOOL_PERMISSION_MODE")
         state_config = cls(
             base_url=base_url.rstrip("/"),
             api_key=_setting(values, "API_KEY", "") or "",
@@ -212,7 +179,6 @@ class Config:
             max_rounds=positive_int("MAX_ROUNDS", 5),
             root_dir=root_dir,
             state_dir=state_dir,
-            tool_permission_mode=configured_permission_mode or "approve-dangerous",
             system_prompt=(_setting(values, "SYSTEM_PROMPT") or "").strip() or DEFAULT_SYSTEM_PROMPT,
             provider_tool_mode=_setting(values, "PROVIDER_TOOL_MODE", "emulated"),
             tool_max_timeout=positive_int("TOOL_MAX_TIMEOUT", 60),
@@ -238,7 +204,4 @@ class Config:
             tool_output_preview_chars=positive_int("TOOL_OUTPUT_PREVIEW_CHARS", 500),
             verbose_tool_output=boolean("VERBOSE_TOOL_OUTPUT"),
         )
-        if os.environ.get("TOOL_PERMISSION_MODE") is not None:
-            return state_config
-        global_permission_mode = load_global_tool_permission_mode(resolve_state_dir(state_config))
-        return replace(state_config, tool_permission_mode=global_permission_mode or state_config.tool_permission_mode)
+        return state_config

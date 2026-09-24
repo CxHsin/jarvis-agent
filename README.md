@@ -1,17 +1,16 @@
 # Jarvis
 
-一个面向个人工作流的本地命令行 Agent。Jarvis 通过兼容 OpenAI Chat Completions 的模型接口完成多轮对话，并在用户授权下读取、编辑和执行工作区工具。会话事件和权限状态保存在本地；当前不提供跨会话个人记忆。
+一个面向个人工作流的本地 Agent，提供 CLI 和 Windows 下单用户 Telegram 私聊入口。Jarvis 通过兼容 OpenAI Chat Completions 的模型接口完成多轮对话，使用工作区内文件工具及 Windows AppContainer 沙箱中的命令。会话事件保存在本地；当前不提供跨会话个人记忆。
 
-> 当前项目是可运行的本地 CLI 基线，默认使用离线可测试的本地存储；它不是 Web 服务，也不要求部署数据库或后台服务。
+> Telegram 使用本机 long polling，不需要公网服务；进程退出时 Bot 不工作。模型只使用 `read`、`write`、`edit`、`bash`。默认工作区是启动命令时所在目录；会话仍按工作区分区。
 
 ## 功能
 
 - 多轮模型交互与工具调用，支持并行独立工具和依赖调用。
-- 工作区文件工具：`read`、`edit`、`bash`、`list_directory`，以及动态 `tool_search`。
+- 工作区文件工具：`read`、`write`、`edit`、`bash`（Windows PowerShell）。
 - 会话列表与恢复：`--list`、`--resume`，恢复不会重新执行历史工具调用。
 - 上下文预算、`/compact` 压缩和溢出恢复；原始事件保留，可重新投影模型上下文。
 - 会话内近期任务选择由上下文投影负责，不依赖个人记忆。
-- 三档工具权限：`approve-all`、`approve-dangerous`、`broad-access`。
 - Windows shell 使用 AppContainer 和 Job object 约束进程树；Python 参数通过固定 launcher 与 JSON manifest 传递。
 
 ## 快速开始
@@ -29,25 +28,36 @@ git clone https://github.com/CxHsin/jarvis-agent.git
 cd jarvis-agent
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
+Copy-Item .env.example C:\private\jarvis.env
 ```
 
-编辑 `.env`，至少填写：
+在工作区外的配置文件中至少填写：
 
 ```dotenv
 BASE_URL=https://api.deepseek.com/v1
 API_KEY=your-api-key
 MODEL=deepseek-v4-flash
-ROOT_DIR=C:\path\to\your\workspace
 ```
 
-启动：
+从希望作为工作区的目录运行 CLI，例如：
 
 ```powershell
-.\.venv\Scripts\python.exe .\jarvis_agent.py
+Set-Location C:\path\to\your\workspace
+python C:\path\to\jarvis-agent\jarvis_agent.py --env-file C:\private\jarvis.env
 ```
 
-不要把 `.env`、API key 或包含交互记录的 `STATE_DIR` 提交到 Git。`.env` 已被 Git 忽略；生产使用时建议把状态目录放在工作区之外。
+不要把配置文件、API key、Bot Token 或包含交互记录的 `STATE_DIR` 提交到 Git。生产使用时建议把状态目录放在工作区之外。
+
+## Telegram 私聊入口（Windows）
+
+将 `TELEGRAM_BOT_TOKEN` 放在**工作区外**的配置文件或进程环境变量中，并设置数字 `TELEGRAM_ALLOWED_USER_ID`（不是用户名）。不要把真实 Token 保存在启动工作区内：`bash` 沙箱能读取工作区文件，Bot 会拒绝从工作区内 `.env` 读取 Token。以另一个目录为工作区时可使用位于该目录外的配置文件：
+
+```powershell
+Set-Location C:\path\to\workspace
+python C:\path\to\jarvis-agent\telegram_bot.py --env-file C:\private\jarvis-bot.env
+```
+
+只接收配置用户的私聊文本，其他聊天和文件消息不触发模型。消息串行处理；`/cancel` 请求取消当前任务，但无法撤销已发生的修改。重复投递不再次执行；重启后执行状态未知的任务不会自动重跑。同一私聊在不同工作区有不同的会话；回到旧目录启动可恢复该目录的会话。当前不支持越界确认放行；工作区外文件访问被拒绝。Bot 进程关闭后需要重新启动才能继续收消息。没有真实 Bot 凭据时只能进行离线模拟测试，不能视为真实 Telegram 验收。
 
 ## CLI
 
@@ -60,7 +70,6 @@ python jarvis_agent.py [--env-file PATH] [--list] [--resume [SESSION_ID]]
 - `--resume`：恢复最近一个会话；也可以传入会话 ID。
 - `exit`：退出交互模式。
 - `/compact`：压缩当前任务之前的历史；`/compact 2000` 指定保留的 token 数。
-- `/permissions`、`/all`、`/safe`、`/wide`：查看或调整工具权限模式。
 
 ## 配置
 
@@ -71,16 +80,19 @@ python jarvis_agent.py [--env-file PATH] [--list] [--resume [SESSION_ID]]
 | `BASE_URL` | 模型接口地址 | 无 |
 | `API_KEY` | 模型接口密钥 | 无 |
 | `MODEL` | 主模型名称 | 无 |
-| `ROOT_DIR` | 工作区根目录 | 无 |
+| `ROOT_DIR` | 不再覆盖启动目录；请从目标目录启动 | 当前目录 |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token，仅 Bot 入口需要 | 无 |
+| `TELEGRAM_ALLOWED_USER_ID` | 允许的数字 Telegram 用户 ID，仅 Bot 入口需要 | 无 |
 | `STATE_DIR` | 会话状态目录 | Windows 为 `%LOCALAPPDATA%\jarvis` |
-| `TOOL_PERMISSION_MODE` | `approve-all`、`approve-dangerous` 或 `broad-access` | `approve-dangerous` |
 | `MAX_ROUNDS` | 单次请求最多模型轮数 | `5` |
 | `REQUEST_TIMEOUT` | 模型请求超时秒数 | `60` |
 | `COMPRESSION_MODEL` | 可选的上下文压缩模型 | 主模型 |
 
 ## 工具与安全边界
 
-工具运行在当前权限策略下。`broad-access` 只应在明确理解风险后使用；`bash` 会被视为高风险操作。
+Bot Token 与模型 API Key 都属于秘密；推荐把配置文件放在工作区外。工作区中存在 `.env` 时，为避免沙箱中的命令读取其内容，`bash` 会拒绝启动（即使不是 Bot Token）。
+
+文件工具仅允许访问启动工作区；在此范围内 `read/write/edit` 不逐次询问。越界路径默认拒绝，目前没有通过 Telegram 确认后提权的通道。`bash` 只能在 Windows AppContainer 沙箱内执行；沙箱初始化失败时不会以普通权限重试。
 
 Windows 下 `bash` 的实现是 PowerShell，不是 Bash。PowerShell provider 对卷根和部分绝对路径的 `Set-Location`、`Remove-Item` 可能被 AppContainer 拒绝；删除或写入工作区文件请使用 .NET API，例如：
 
@@ -123,7 +135,7 @@ models/
   model_capabilities.json 模型能力目录
   cache_metrics.py       模型用量与缓存统计
 tools/
-  definitions.py         内置工具定义
+  definitions.py         内置四工具定义
   workspace.py           工作区文件操作与 shell 工具入口
   tool_runtime.py        工具注册、发现、权限与审计
   tool_execution.py      工具执行、取消与依赖调度

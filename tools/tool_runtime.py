@@ -155,50 +155,30 @@ class ToolRegistry:
 
 
 class PermissionPolicy:
-    """A versioned user grant; a session cannot silently widen it."""
-    MODES = {"approve-all": 0, "approve-dangerous": 1, "broad-access": 2}
-
-    def __init__(self, mode="approve-dangerous", *, max_timeout=60.0, max_output=32768,
+    """Execution limits and explicit host denials; legacy grants are never restored."""
+    def __init__(self, mode=None, *, max_timeout=60.0, max_output=32768,
                  denied_tools=(), on_event=None):
-        if mode not in self.MODES or not 0 < max_timeout <= 3600 or max_output < 256:
-            raise ValueError("invalid permission policy")
-        self._mode, self._revoked, self.version = mode, False, 1
+        if mode not in (None, "approve-all", "approve-dangerous", "broad-access"):
+            raise ValueError("invalid legacy permission policy")
+        if not 0 < max_timeout <= 3600 or max_output < 256:
+            raise ValueError("invalid execution limits")
+        self._revoked, self.version = False, 1
         self.max_timeout, self.max_output = max_timeout, max_output
         self.denied_tools = frozenset(denied_tools)
         self.audit, self.on_event, self._lock = [], on_event, RLock()
 
     @property
-    def mode(self):
-        return self._mode
-
-    @property
     def revoked(self):
         return self._revoked
-
-    def _event(self, action, **values):
-        event = {"action": action, "policy_version": self.version, **values}
-        self.audit.append(event)
-        if self.on_event:
-            self.on_event(event)
-
-    def change_mode(self, mode, *, confirmed=False):
-        if mode not in self.MODES:
-            raise ValueError("invalid permission mode")
-        with self._lock:
-            if self.MODES[mode] > self.MODES[self.mode] and not confirmed:
-                self._event("upgrade_denied", requested_mode=mode)
-                return failure("confirmation_required", "permission upgrade requires confirmation")
-            previous = self.mode
-            self._mode = mode
-            self.version += 1
-            self._event("mode_changed", previous=previous, mode=mode, confirmed=bool(confirmed))
-            return {"ok": True}
 
     def revoke(self):
         with self._lock:
             self._revoked = True
             self.version += 1
-            self._event("revoked")
+            event = {"action": "revoked", "policy_version": self.version}
+            self.audit.append(event)
+            if self.on_event:
+                self.on_event(event)
 
     def visible(self, metadata):
         return metadata.tool_id not in self.denied_tools and not (self.revoked and metadata.side_effects)
@@ -208,18 +188,15 @@ class PermissionPolicy:
             return False, "permission_denied"
         if metadata.side_effects and self.revoked:
             return False, "policy_revoked"
-        needs_confirmation = self.mode == "approve-all" or self.mode == "approve-dangerous" and metadata.risk == "high"
-        if needs_confirmation and not confirmed:
-            return False, "confirmation_required"
         return True, None
 
     def snapshot(self):
-        return {"mode": self.mode, "revoked": self.revoked, "version": self.version,
+        return {"revoked": self.revoked, "version": self.version,
                 "max_timeout": self.max_timeout, "max_output": self.max_output,
                 "denied_tools": sorted(self.denied_tools)}
 
     def restore(self, state):
-        self._mode = min((self.mode, state.get("mode", self.mode)), key=self.MODES.__getitem__)
+        # Old mode values (including broad-access) are historical facts, not grants.
         self._revoked = self.revoked or bool(state.get("revoked"))
         self.version = max(self.version, int(state.get("version", 1)))
         self.max_timeout = min(self.max_timeout, state.get("max_timeout", self.max_timeout))
@@ -241,9 +218,9 @@ class ToolRuntime:
         host_resolver = self.dispatcher.resource_resolver
         def resources(metadata, arguments):
             held = set(host_resolver(metadata, arguments)) if host_resolver else set()
-            if metadata.tool_id in {"read", "read_file", "edit"}:
+            if metadata.tool_id in {"read", "read_file", "edit", "write"}:
                 path = arguments.get("path")
-                held.update({"file:" + os.path.normcase(str(workspace._resolve_read(path)))}
+                held.update({"file:" + os.path.normcase(str(workspace._resolve(path)))}
                             if isinstance(path, str) else {"*"})
             return held
         self.dispatcher.resource_resolver = resources
@@ -260,17 +237,13 @@ class ToolRuntime:
             if not defaults and self.registry.versions(name):
                 continue
             self.register(ToolMetadata(name, "1", schema,
-                risk="high" if name == "bash" else "medium" if name == "edit" else "low",
-                side_effects=("filesystem",) if name in {"edit", "bash"} else (),
+                risk="high" if name == "bash" else "medium" if name in {"edit", "write"} else "low",
+                side_effects=("filesystem",) if name in {"edit", "write", "bash"} else (),
                 timeout=60 if name == "bash" else 30,
-                concurrency="parallel" if name in {"read", "edit"} else "serial"),
-                handlers[name], contextual=name in {"edit", "bash"})
-        if defaults:
-            for alias in ("list_directory", "search_file_content", "read_file"):
-                if not self.registry.versions(alias):
-                    self.register(ToolMetadata(alias, "1", {"name": alias,
-                        "description": "Legacy alias", "parameters": {
-                            "type": "object", "additionalProperties": True}}), handlers[alias])
+                concurrency="parallel" if name in {"read", "edit", "write"} else "serial"),
+                handlers[name], contextual=name in {"edit", "write", "bash"})
+        # Historical aliases are retained in restored event definitions only.
+        # They are neither registered as defaults nor activated on new tasks.
 
     def audit_cursor(self):
         return len(self.dispatcher.audit)
@@ -300,12 +273,9 @@ class ToolRuntime:
         return tuple(self.registry.get(*key) for key in self._stable)
 
     def begin_task(self, task_id, compatibility=None):
-        if compatibility is None:
-            compatibility = tuple((name, "1") for name in
-                                  ("list_directory", "search_file_content", "read_file")
-                                  if self.registry.versions(name))
+        # Historical definitions remain in history but cannot be activated by a new task.
         self.registry._tasks[str(task_id)] = set()
-        for key in (*self._stable, *compatibility):
+        for key in self._stable:
             self.activate(task_id, *key)
 
     def activate(self, task_id, tool_id, version):
@@ -390,7 +360,7 @@ class ToolRuntime:
         except (TypeError, ValueError, OSError) as exc:
             return failure("invalid_arguments", str(exc))
 
-    def execute_batch(self, task_id, calls, on_result):
+    def execute_batch(self, task_id, calls, on_result, cancellation=None):
         """Execute model calls and deliver converted results in dependency-wave order.
 
         The caller records messages/evidence via on_result on the scheduling thread;
@@ -398,7 +368,7 @@ class ToolRuntime:
         """
         prepared = []
         errors = {}
-        cancellation = Event()
+        cancellation = cancellation if cancellation is not None else Event()
         for index, raw in enumerate(calls):
             function = raw.get("function") or {}
             name, cid = function.get("name", ""), str(raw.get("id") or f"missing-{index}")
@@ -412,8 +382,8 @@ class ToolRuntime:
                 key, error = self.binding(task_id, name, version, fingerprint)
                 if error:
                     errors[cid] = error
-                elif hasattr(self, "_workspace") and name == "edit" and isinstance(args.get("path"), str) and "expected_hash" not in args:
-                    target = self._workspace._resolve(args["path"])
+                elif hasattr(self, "_workspace") and name in {"edit", "write"} and isinstance(args.get("path"), str) and "expected_hash" not in args:
+                    target = self._workspace._writable_target(args["path"])
                     args["expected_hash"] = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
                 prepared.append(ToolCall(cid, name, key[1] if key else version or "1", args,
                                          tuple(dependencies), fingerprint))

@@ -31,7 +31,8 @@ def test_failed_shell_preview_includes_cause_and_exit_code():
     assert "tool=bash" in preview
 
 
-def test_shell_schema_explains_actual_interpreter_and_listing_alternative():
+def test_shell_schema_explains_interpreter_and_fail_closed_boundary():
     schema = next(d["function"] for d in TOOL_DEFINITIONS if d["function"]["name"] == "bash")
     assert "PowerShell" in schema["description"]
-    assert "list_directory" in schema["description"]
+    assert "AppContainer" in schema["description"]
+    assert "list_directory" not in schema["description"]

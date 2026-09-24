@@ -64,20 +64,21 @@ class Agent:
             self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
             self.context = ContextManager(self.config, recorder=self.store)
             self.tool_functions: dict[str, ToolFunction] = {
-                "read": self.workspace.read, "edit": self.workspace.edit, "bash": self.workspace.bash,
-                "tool_search": self._search_tools,
-                "list_directory": self.workspace.list_directory, "search_file_content": self.workspace.search_file_content, "read_file": self.workspace.read_file,
+                "read": self.workspace.read, "write": self.workspace.write,
+                "edit": self.workspace.edit, "bash": self.workspace.bash,
             }
             self.tool_runtime = tool_runtime or ToolRuntime(self.tool_registry,
-                stable=tuple((name, "1") for name in
-                             ("read", "edit", "bash", "tool_search", "list_directory")))
+                stable=tuple((name, "1") for name in ("read", "write", "edit", "bash")))
             self.tool_runtime.install_tools(TOOL_DEFINITIONS, {
-                **self.tool_functions, "edit": self._contextual_edit, "bash": self._contextual_bash,
+                **self.tool_functions, "edit": self._contextual_edit,
+                "write": self._contextual_write, "bash": self._contextual_bash,
             }, defaults=not supplied_runtime)
+            # Host runtimes may retain historical definitions, but a new Jarvis
+            # task always has exactly the same four model-facing bindings.
+            self.tool_runtime._stable = tuple((name, "1") for name in ("read", "write", "edit", "bash"))
             policy = permission_policy
             if policy is None and not supplied_runtime:
-                policy = PermissionPolicy(self.config.tool_permission_mode,
-                                          max_timeout=self.config.tool_max_timeout)
+                policy = PermissionPolicy(max_timeout=self.config.tool_max_timeout)
             self.tool_runtime.configure(policy=policy, confirm=confirm_tool,
                                         recorder=self._record_audit, policy_recorder=self._policy_event)
             self.tool_runtime.attach_workspace(self.workspace)
@@ -138,6 +139,9 @@ class Agent:
 
     def _contextual_edit(self, context, **arguments):
         return self.workspace.edit(**arguments, execution_context=context)
+
+    def _contextual_write(self, context, **arguments):
+        return self.workspace.write(**arguments, execution_context=context)
 
     def _contextual_bash(self, context, **arguments):
         return self.workspace.bash(**arguments, execution_context=context)
@@ -216,8 +220,8 @@ class Agent:
         extensions = ", ".join(self.config.text_extensions)
         return (
             self.config.system_prompt + "\n" +
-            f"默认工作区是 {self.config.root_dir}；read/read_file 可读取工作区外的文本文件，相对路径以工作区为基准；文本扩展名包括 {extensions}。\n"
-            "tool_search 返回并激活工具定义，可在本次任务后续轮次调用；旧任务的定义不代表当前可调用。"
+            f"启动工作区是 {self.config.root_dir}；read/write/edit 仅可操作工作区内的文本文件，文本扩展名包括 {extensions}。"
+            "bash 仅在 Windows AppContainer 沙箱内执行；无法安全隔离时拒绝执行。"
             "同批调用可用 _depends_on 指定前置调用 ID；参数值可用 "
             '{"$result":{"call_id":"前置ID","path":["字段"]}} 引用前置结果。'
         )
@@ -310,7 +314,10 @@ class Agent:
             result["tool_calls"] = message["tool_calls"]
         return result
 
-    def run_request(self, user_text: str) -> str | None:
+    def run_request(self, user_text: str, cancellation=None) -> str | None:
+        """Run a task; cancellation is a cooperative threading.Event, never thread interruption."""
+        from threading import Event
+        cancellation = cancellation if cancellation is not None else Event()
         self.messages[0] = {"role": "system", "content": self._system_prompt()}
         task_system_message = dict(self.messages[0])
         request_offset = self.store.mark() if self.store is not None else None
@@ -334,6 +341,9 @@ class Agent:
         context_valid = True
         try:
             for round_number in range(1, self.config.max_rounds + 1):
+                if cancellation.is_set():
+                    task_status = "cancelled"
+                    return None
                 final_round = round_number == self.config.max_rounds
                 if final_round:
                     self.messages[0] = {
@@ -350,6 +360,9 @@ class Agent:
                 tools = [] if final_round else self.tool_runtime.schemas(self._runtime_task_id)
                 overflow_retried = False
                 while True:
+                    if cancellation.is_set():
+                        task_status = "cancelled"
+                        return None
                     request_messages = self.context.prepare_messages(self.messages, tools, self.compression_client)
                     if self._ensure_dynamic_definitions():
                         # Account for restored schemas without repeatedly compacting them away.
@@ -375,11 +388,17 @@ class Agent:
                     if metrics.get("over_budget"):
                         raise ModelRequestError("压缩后输入仍超过可用输入预算；请缩小本次输入或开启新会话。")
                     try:
+                        if cancellation.is_set():
+                            task_status = "cancelled"
+                            return None
                         message = self._complete_with_tools(
                             request_messages,
                             tools,
                             "none" if final_round else "auto",
                         )
+                        if cancellation.is_set():
+                            task_status = "cancelled"
+                            return None
                         break
                     except ModelRequestError as exc:
                         if overflow_retried or not is_overflow_error(exc):
@@ -389,6 +408,9 @@ class Agent:
                         recovered = self.context.compact(self.messages, tools, self.compression_client, OVERFLOW)
                         if not recovered.compacted:
                             raise
+                if cancellation.is_set():
+                    task_status = "cancelled"
+                    return None
                 self.context.record_usage(self.client.last_usage, request_messages, tools)
                 assistant = self._assistant_message(message)
                 self._append_message(assistant)
@@ -415,7 +437,8 @@ class Agent:
                                           "name": item.tool_id, "content": result_text})
                     self.context.record_tool_result(item.tool_id, item.arguments, result, item.call_id)
                     handled_call_indexes.update(i for i, c in enumerate(calls) if c.get("id") == item.call_id)
-                cancelled = self.tool_runtime.execute_batch(self._runtime_task_id, calls, record_result)
+                cancelled = self.tool_runtime.execute_batch(self._runtime_task_id, calls, record_result,
+                                                            cancellation=cancellation)
                 if cancelled:
                     task_status = "cancelled"
                     active_calls = []

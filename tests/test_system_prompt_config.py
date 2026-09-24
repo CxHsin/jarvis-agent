@@ -16,7 +16,8 @@ def test_system_prompt_from_dotenv(tmp_path, monkeypatch, value):
     assert config.system_prompt == (value.strip() or DEFAULT_SYSTEM_PROMPT)
     prompt = Agent._system_prompt(SimpleNamespace(config=config))
     assert prompt.startswith(config.system_prompt)
-    assert 'tool_search' in prompt
+    assert 'read' in prompt and 'write' in prompt and 'edit' in prompt and 'bash' in prompt
+    assert 'tool_search' not in prompt
     assert str(config.root_dir) in prompt
     if value.strip():
         assert '你是 Jarvis' not in prompt

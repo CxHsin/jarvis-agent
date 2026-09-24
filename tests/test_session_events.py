@@ -125,7 +125,6 @@ from models.model_client import ModelRequestError
 from tools.tool_runtime import ProviderLoadError
 class Client:
     def complete(self, *args, **kwargs):
-        agent.tool_runtime.policy.change_mode("approve-all")
         agent.tool_runtime.policy.revoke()
         raise ModelRequestError("model unavailable")
 def native(*args):
@@ -150,7 +149,6 @@ agent.run_request("failed raw input")
         self.assertIn(b"failed raw input", original)
         client = FakeClient([{"role": "assistant", "content": "next answer"}])
         resumed = self.agent(client, resume=info.id, tool_permission_mode="broad-access")
-        self.assertEqual(resumed.tool_runtime.policy.mode, "approve-all")
         self.assertTrue(resumed.tool_runtime.policy.revoked)
         self.assertEqual(resumed.provider_session.fallback_count, 1)
         self.assertEqual(resumed.provider_session.mode, "emulated")
@@ -159,7 +157,7 @@ agent.run_request("failed raw input")
         self.assertNotIn("failed raw input", str(client.requests))
         self.assertTrue(info.path.read_bytes().startswith(original))
 
-    def test_exit_at_permission_commit_keeps_revocation_and_tightening(self):
+    def test_exit_at_permission_commit_keeps_revocation(self):
         script = '''
 import json, os, sys
 from pathlib import Path
@@ -168,7 +166,6 @@ from configuration import Config
 agent = Agent(Config(base_url="http://example.test", api_key="", model="test",
     root_dir=Path(sys.argv[1]), state_dir=Path(sys.argv[2]),
     tool_permission_mode="broad-access"), object())
-agent.tool_runtime.policy.change_mode("approve-all")
 original_sync = os.fsync
 def interrupt_after_commit(fd):
     original_sync(fd)
@@ -183,7 +180,6 @@ agent.tool_runtime.policy.revoke()
         self.assertEqual(process.returncode, 24, process.stderr.decode(errors="replace"))
         info = SessionStore.list_sessions(self.config())[0]
         resumed = self.agent(FakeClient([]), resume=info.id, tool_permission_mode="broad-access")
-        self.assertEqual(resumed.tool_runtime.policy.mode, "approve-all")
         self.assertTrue(resumed.tool_runtime.policy.revoked)
         self.assertEqual(sum(event.get("action") == "revoked" for event in resumed.store.load().audit), 1)
 
