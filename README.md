@@ -162,4 +162,6 @@ Python 调用方从所属模块导入，例如 `from agent.agent import Agent`�
 
 ## 许可
 
-当前仓库未声明开源许可证。除非仓库补充许可证文件，否则请不要将代码视为授予了再分发或商用许可。
+本项目采用 [GNU General Public License v3.0](LICENSE)（GPL-3.0）。你可以自由使用、修改和分发，但衍生作品必须以相同的 GPL-3.0 许可开源。
+
+Copyright (C) 2026 CxHsin
