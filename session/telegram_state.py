@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from functools import wraps
 from threading import RLock
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from session.session_store import (
@@ -91,7 +89,16 @@ class TelegramState:
             return {"version": self.VERSION, "workspace_key": workspace_key(self.config.root_dir),
                     "bindings": {}, "updates": {}, "offset": 0}
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            records = self.path.read_bytes().splitlines(keepends=True)
+            if not records:
+                raise ValueError("empty channel state")
+            # The last append may have been torn by a crash; only complete,
+            # newline-terminated snapshots can be used as committed state.
+            if not records[-1].endswith(b"\n"):
+                records.pop()
+            if not records:
+                raise ValueError("no committed channel state")
+            data = json.loads(records[-1].decode("utf-8"))
             if (type(data) is not dict or data.get("version") != self.VERSION
                     or data.get("workspace_key") != workspace_key(self.config.root_dir)
                     or type(data.get("offset")) is not int or data["offset"] < 0
@@ -113,33 +120,24 @@ class TelegramState:
             raise TelegramStateError("Telegram channel state cannot be loaded; refusing to replay") from exc
 
     def _commit(self, data: dict) -> None:
+        """Append a durable snapshot; Windows sandbox ACL handles prohibit replace.
+
+        A complete newline-terminated record is the commit boundary. The prior
+        snapshot remains available if an append is torn by process termination.
+        """
         self.directory.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.directory,
-                                             prefix=".telegram-state-", suffix=".tmp",
-                                             delete=False) as handle:
-                temporary = Path(handle.name)
-                json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-            temporary = None
-            # Best effort directory sync on platforms supporting directory handles.
-            if os.name != "nt":
-                try:
-                    fd = os.open(self.directory, os.O_RDONLY)
-                    try:
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    # Not all filesystems permit fsync on a directory.
-                    pass
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        payload = (json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        with open(self.path, "ab+") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(b"\n")  # separate a torn tail from the next snapshot
+            handle.seek(0, os.SEEK_END)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
 
     @synchronized
     def _change(self, mutate):

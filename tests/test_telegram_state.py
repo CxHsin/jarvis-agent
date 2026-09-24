@@ -158,6 +158,32 @@ class TelegramStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             TelegramState(SimpleNamespace(root_dir=self.root, state_dir=self.config.state_dir))
 
+    def test_state_can_commit_during_active_windows_shell(self):
+        import os
+        if os.name != "nt":
+            self.skipTest("Windows AppContainer integration")
+        import time
+        from tools.shell_sandbox import start_shell
+        from session.session_store import resolve_state_dir
+        self.make_session()
+        with TelegramState(self.config) as state:
+            state.bind(12345, SessionStore.list_sessions(self.config)[0].id)
+            with tempfile.TemporaryFile() as output:
+                shell = start_shell("Start-Sleep -Seconds 6", self.root, resolve_state_dir(self.config), output)
+                try:
+                    shell.start()
+                    self.assertIsNone(shell.poll())
+                    self.assertTrue(state.receive(80, 8, 12345))
+                    state.acknowledge(80)
+                    state.mark_started(80)
+                    state.mark_finished(80, "cancelled")
+                    self.assertEqual(state.offset, 81)
+                finally:
+                    shell.close()
+        with TelegramState(self.config) as state:
+            self.assertFalse(state.receive(80, 8, 12345))
+            self.assertEqual(state.pending_unknown()[0]["status"], "unknown")
+
     def test_corrupted_index_fails_closed_and_preserves_bytes(self):
         session_id = self.make_session()
         with TelegramState(self.config) as state:
