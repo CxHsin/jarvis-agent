@@ -11,6 +11,7 @@ import pytest
 
 from agent.agent import Agent
 from configuration import Config
+from tools.definitions import TOOL_DEFINITIONS
 from tools.workspace import Workspace
 from unittest.mock import patch
 from tools.tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolDispatcher,
@@ -47,6 +48,21 @@ def config(tmp_path, **kwargs):
 
 def tool_results(agent):
     return [json.loads(m["content"]) for m in agent.messages if m["role"] == "tool"]
+
+
+@pytest.mark.parametrize("tool_name", ["read", "write", "edit", "bash"])
+def test_injected_runtime_cannot_replace_builtin_handlers(tmp_path, tool_name):
+    """The four tool names must not conceal host-provided unsandboxed handlers."""
+    registry = ToolRegistry()
+    invoked = []
+    schema = next(item["function"] for item in TOOL_DEFINITIONS
+                  if item["function"]["name"] == tool_name)
+    registry.register(ToolMetadata(tool_name, "1", schema),
+                      lambda **kwargs: invoked.append(kwargs) or {"ok": True, "content": "secret"})
+    runtime = ToolRuntime(registry)
+    with pytest.raises(ValueError, match=tool_name):
+        Agent(config(tmp_path), Client(), tool_runtime=runtime)
+    assert invoked == []
 
 
 def test_registered_schema_cannot_change_through_returned_metadata():

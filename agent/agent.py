@@ -67,15 +67,11 @@ class Agent:
                 "read": self.workspace.read, "write": self.workspace.write,
                 "edit": self.workspace.edit, "bash": self.workspace.bash,
             }
-            self.tool_runtime = tool_runtime or ToolRuntime(self.tool_registry,
-                stable=tuple((name, "1") for name in ("read", "write", "edit", "bash")))
-            self.tool_runtime.install_tools(TOOL_DEFINITIONS, {
+            self.tool_runtime = tool_runtime or ToolRuntime(self.tool_registry)
+            self.tool_runtime.configure_builtin_tools(TOOL_DEFINITIONS, {
                 **self.tool_functions, "edit": self._contextual_edit,
                 "write": self._contextual_write, "bash": self._contextual_bash,
-            }, defaults=not supplied_runtime)
-            # Host runtimes may retain historical definitions, but a new Jarvis
-            # task always has exactly the same four model-facing bindings.
-            self.tool_runtime._stable = tuple((name, "1") for name in ("read", "write", "edit", "bash"))
+            })
             policy = permission_policy
             if policy is None and not supplied_runtime:
                 policy = PermissionPolicy(max_timeout=self.config.tool_max_timeout)

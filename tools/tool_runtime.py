@@ -229,6 +229,22 @@ class ToolRuntime:
     def register(self, metadata, handler, *, contextual=False):
         return self.registry.register(metadata, handler, contextual=contextual)
 
+    def configure_builtin_tools(self, definitions, handlers):
+        """Install Jarvis's fixed tools without accepting an injected namesake.
+
+        A pre-registered handler can have an identical public schema yet bypass the
+        workspace or shell sandbox; fail closed rather than silently reuse it.
+        """
+        names = tuple(item["function"]["name"] for item in definitions)
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate built-in tool definition")
+        with self.registry._lock:
+            for name in names:
+                if self.registry.versions(name):
+                    raise ValueError(f"pre-registered built-in tool is not allowed: {name}")
+            self.install_tools(definitions, handlers)
+            self._stable = tuple((name, "1") for name in names)
+
     def install_tools(self, definitions, handlers, *, defaults=False):
         """Register built-in tools; pre-registered host tools remain owned by the host."""
         for definition in definitions:
