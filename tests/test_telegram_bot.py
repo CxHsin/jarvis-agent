@@ -27,6 +27,10 @@ class State:
         self.offset = max(self.offset, update_id + 1)
         return True
 
+    def acknowledge_ignored(self, update_id):
+        self.offset = max(self.offset, update_id + 1)
+        return self.offset
+
     def acknowledge(self, update_id):
         self.offset = max(self.offset, update_id + 1)
         return self.offset
@@ -109,6 +113,68 @@ def wait_for(predicate):
             return
         time.sleep(.01)
     assert predicate()
+
+
+def test_bot_token_not_persisted_or_echoed_from_chat(tmp_path):
+    config = SimpleNamespace(root_dir=tmp_path / "workspace", state_dir=tmp_path / "state", recent_task_count=5)
+    config.root_dir.mkdir()
+    app, transport = App(), Transport()
+    with TelegramState(config, allowed_user_id=42) as state:
+        bot = TelegramBot(config, 42, transport, application=app, state=state, secret="TOKEN_SECRET")
+        bot.process_update(update(20, "repeat TOKEN_SECRET"))
+        wait_for(lambda: len(app.calls) == 1)
+        bot.close()
+        assert app.calls == ["repeat [redacted]"]
+        assert not any("TOKEN_SECRET" in text for _, text in transport.sent)
+        assert "TOKEN_SECRET" not in state.path.read_text(encoding="utf-8")
+
+
+def test_poll_stops_before_acknowledging_failed_claim(tmp_path, monkeypatch):
+    config = SimpleNamespace(root_dir=tmp_path / "workspace", state_dir=tmp_path / "state", recent_task_count=5)
+    config.root_dir.mkdir()
+    class Once(Transport):
+        def poll(self, offset):
+            assert offset == 0
+            return [update(5, user=100), update(6, "would-execute")]
+    app, transport = App(), Once()
+    with TelegramState(config, allowed_user_id=42) as state:
+        bot = TelegramBot(config, 42, transport, application=app, state=state)
+        original_receive = state.receive
+        def fail_claim(update_id, message_id, chat_id):
+            if update_id == 6:
+                raise OSError("injected durable write failure")
+            return original_receive(update_id, message_id, chat_id)
+        monkeypatch.setattr(state, "receive", fail_claim)
+        with pytest.raises(OSError, match="injected durable write failure"):
+            bot.run()
+        assert app.calls == []
+    with TelegramState(config, allowed_user_id=42) as state:
+        assert state.offset == 6  # rejected update persisted; failed claim not acknowledged
+        assert state.pending_unknown() == []
+
+
+def test_closed_bot_does_not_claim_new_work(tmp_path):
+    app, state, transport = App(), State(), Transport()
+    state.bindings[42] = "existing"
+    bot = TelegramBot(object(), 42, transport, application=app, state=state)
+    bot.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        bot.process_update(update(1))
+    assert state.seen == set() and app.calls == []
+
+
+def test_filtered_updates_advance_durable_offset_without_receiving(tmp_path):
+    config = SimpleNamespace(root_dir=tmp_path / "workspace", state_dir=tmp_path / "state", recent_task_count=5)
+    config.root_dir.mkdir()
+    with TelegramState(config, allowed_user_id=42) as state:
+        app, transport = App(), Transport()
+        bot = TelegramBot(config, 42, transport, application=app, state=state)
+        assert bot.process_update(update(5, user=100)) is False
+        assert state.acknowledge_ignored(5) == 6
+        bot.close()
+    with TelegramState(config, allowed_user_id=42) as state:
+        assert state.offset == 6
+        assert state.pending_unknown() == []
 
 
 def test_private_authorization_and_deduplication(tmp_path):

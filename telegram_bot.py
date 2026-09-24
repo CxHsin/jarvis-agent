@@ -57,8 +57,10 @@ class TelegramTransport:
 
 class TelegramBot:
     """Serial worker with high-priority cancellation on the polling thread."""
-    def __init__(self, config: Config, user_id: int, transport, *, application=None, state=None):
+    def __init__(self, config: Config, user_id: int, transport, *, application=None, state=None,
+                 secret: str | None = None):
         self.config, self.user_id, self.transport = config, user_id, transport
+        self._secret = secret
         self.application = application or Application(config)
         self._owns_application = application is None
         self.state = state if state is not None else TelegramState(config, allowed_user_id=user_id)
@@ -71,31 +73,41 @@ class TelegramBot:
 
     def _safe_send(self, chat_id: int, text: str) -> bool:
         try:
-            self.transport.send(chat_id, text)
+            safe_text = text.replace(self._secret, "[redacted]") if self._secret else text
+            self.transport.send(chat_id, safe_text)
             return True
         except Exception:
             # Do not print exception: third-party transports may embed tokens in URLs.
             print("[Telegram] 无法发送消息，送达状态未知。", file=sys.stderr)
             return False
 
-    def process_update(self, update: dict) -> None:
-        """Untrusted metadata is filtered before any session/model side effect."""
+    def process_update(self, update: dict) -> bool:
+        """Persist or discard a delivery atomically with respect to shutdown."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Bot is closed")
+            return self._process_update(update)
+
+    def _process_update(self, update: dict) -> bool:
+        """Filter untrusted metadata; True means the update was durably claimed."""
         message = update.get("message")
         if not isinstance(message, dict):
-            return
+            return False
         chat = message.get("chat") or {}
         sender = message.get("from") or {}
         if (chat.get("type") != "private" or type(sender.get("id")) is not int
                 or sender["id"] != self.user_id or type(chat.get("id")) is not int):
-            return
+            return False
         chat_id = chat["id"]
         if chat_id != self.user_id:
-            return
+            return False
         text = message.get("text")
         if not isinstance(text, str) or not text.strip():
-            return
+            return False
+        if self._secret:
+            text = text.replace(self._secret, "[redacted]")
         if type(update.get("update_id")) is not int or type(message.get("message_id")) is not int:
-            return
+            return False
         update_id, message_id = update["update_id"], message["message_id"]
         # Allocate the channel's first session in the existing workspace directory.
         # Never select the most recent unrelated CLI session by accident.
@@ -108,7 +120,7 @@ class TelegramBot:
                     store.close()
             if not self.state.receive(update_id, message_id, chat_id):
                 self.state.acknowledge(update_id)
-                return
+                return True
             self.state.acknowledge(update_id)
         if text.strip().casefold() == "/cancel":
             with self._lock:
@@ -122,12 +134,13 @@ class TelegramBot:
                 self.state.mark_notified(update_id)
             else:
                 self.state.mark_finished(update_id, "unknown")
-            return
+            return True
         with self._lock:
             queued = self._busy or bool(self._queue)
             self._queue.append((update_id, chat_id, text))
             self._launch_next_locked()
         self._safe_send(chat_id, "已排队，稍后处理。" if queued else "已收到，正在处理。")
+        return True
 
     def _launch_next_locked(self):
         if self._closed or self._busy or not self._queue:
@@ -189,9 +202,12 @@ class TelegramBot:
                     continue
                 for update in updates:
                     if not isinstance(update, dict) or type(update.get("update_id")) is not int:
-                        continue
-                    self.process_update(update)
-                    offset = max(offset, update["update_id"] + 1)
+                        raise TelegramTransportError("Telegram getUpdates returned invalid update")
+                    update_id = update["update_id"]
+                    if self.process_update(update):
+                        offset = self.state.offset
+                    else:
+                        offset = self.state.acknowledge_ignored(update_id)
         finally:
             self.close()
 
@@ -227,7 +243,7 @@ def main(argv=None):
         if not token or not raw_id or not raw_id.isdecimal() or int(raw_id) < 1:
             raise ConfigurationError("需配置 TELEGRAM_BOT_TOKEN 和数字 TELEGRAM_ALLOWED_USER_ID")
         config = Config.from_env(args.env_file)
-        bot = TelegramBot(config, int(raw_id), TelegramTransport(token))
+        bot = TelegramBot(config, int(raw_id), TelegramTransport(token), secret=token)
     except (ConfigurationError, ValueError) as exc:
         print(f"Bot 配置错误：{exc}", file=sys.stderr)
         return 2

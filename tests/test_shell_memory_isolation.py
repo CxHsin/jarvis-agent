@@ -97,6 +97,39 @@ Path('probe-result.json').write_text(json.dumps({'connected': connected}))
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_shell_cannot_connect_to_host_non_loopback_listener(tmp_path):
+    """Probe the host's LAN address without contacting an external service."""
+    addresses = sorted({item[4][0] for item in socket.getaddrinfo(socket.gethostname(), None,
+                                                                     socket.AF_INET, socket.SOCK_STREAM)
+                        if not item[4][0].startswith(('127.', '169.254.'))})
+    if not addresses:
+        pytest.skip('No host LAN address is available; non-loopback network boundary unverified')
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    with socket.socket() as listener:
+        try:
+            listener.bind((addresses[0], 0))
+        except OSError:
+            pytest.skip('Cannot bind a listener on the host LAN address')
+        listener.listen(1)
+        listener.settimeout(0.2)
+        host, port = listener.getsockname()
+        script = '''import json, socket
+from pathlib import Path
+connected = False
+try:
+    with socket.create_connection((%r, %d), timeout=2):
+        connected = True
+except OSError:
+    pass
+Path('probe-result.json').write_text(json.dumps({'connected': connected}))
+''' % (host, port)
+        assert _run_probe(workspace, tmp_path / 'state', script) == {'connected': False}
+        with pytest.raises(socket.timeout):
+            listener.accept()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
 def test_shell_rejects_workspace_reparse_point_before_execution(tmp_path):
     workspace = tmp_path / 'workspace'
     workspace.mkdir()

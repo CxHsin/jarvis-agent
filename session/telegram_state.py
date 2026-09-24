@@ -218,6 +218,21 @@ class TelegramState:
         return True
 
     @synchronized
+    def acknowledge_ignored(self, update_id: int) -> int:
+        """Durably advance past a filtered update, without recording untrusted chats.
+
+        Pollers may only call this after the update has been rejected or ignored.
+        Persisting it before the next poll avoids keeping an in-memory offset
+        that claims more progress than the durable channel index.
+        """
+        self._require_open()
+        if type(update_id) is not int or update_id < 0:
+            raise ValueError("invalid Telegram update ID")
+        if update_id + 1 > self.offset:
+            self._change(lambda data: data.__setitem__("offset", update_id + 1))
+        return self.offset
+
+    @synchronized
     def acknowledge(self, update_id: int) -> int:
         """Return durable next polling offset; call only after receive()."""
         self._require_open()
