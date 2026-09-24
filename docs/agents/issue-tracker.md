@@ -4,8 +4,9 @@
 
 ## 仓库定位
 通过 git remote -v 确定目标仓库。
-当前尚未配置远程仓库；首次操作前确认 owner/repo，
-并使用 --repo owner/repo 显式指定目标。
+当前远程为 CxHsin/jarvis-agent（https://github.com/CxHsin/jarvis-agent.git）；
+gh 默认读取该 origin，无需 --repo。远程缺失或指向其他仓库时，
+再用 --repo owner/repo 显式指定目标。
 
 ## 操作约定
 - 发布任务或规格：gh issue create。
