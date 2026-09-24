@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from session.task_history import TaskHistory
+from context.context_projection import TaskHistory
 
 
 SESSION_FORMAT_VERSION = 2
@@ -256,7 +256,7 @@ class SessionStore:
         self._file = None
         self._lock = _SessionLock(self.directory / f"{session_id}.lock")
         self._write_lock = RLock()
-        self.memory_directory = self.state_dir / "memory"
+        self._legacy_trajectory_dir = self.state_dir / "memory" / "trajectories"
         self._recent_task_count = getattr(config, "recent_task_count", 5)
         self.history = None
         self._format_version = SESSION_FORMAT_VERSION
@@ -265,19 +265,10 @@ class SessionStore:
         self._needs_separator = False
         self._history_dirty = False
 
-    @property
-    def recent_path(self) -> Path:
-        return self.history.recent_path
-
     @classmethod
-    def create(cls, config: Any, *, memory=None) -> "SessionStore":
-        if memory is None:
-            from application import standalone_store
-            return standalone_store(config)
+    def create(cls, config: Any) -> "SessionStore":
         moment = datetime.now()
         store = cls(config, new_session_id(moment), moment.isoformat(timespec="milliseconds"))
-        if memory is not None:
-            store.memory = memory
         store._open()
         store._append(
             {
@@ -291,10 +282,7 @@ class SessionStore:
         return store
 
     @classmethod
-    def resume(cls, config: Any, session_id: str | None = None, *, memory=None) -> "SessionStore":
-        if memory is None:
-            from application import standalone_store
-            return standalone_store(config, session_id=session_id, resume=True)
+    def resume(cls, config: Any, session_id: str | None = None) -> "SessionStore":
         directory = session_directory(config)
         candidates: list[tuple[str, float, str, Path]] = []
         if directory.is_dir():
@@ -319,8 +307,6 @@ class SessionStore:
         else:
             raise SessionNotFoundError("当前工作区没有可恢复的会话记录。")
         store = cls(config, chosen[2], chosen[0])
-        if memory is not None:
-            store.memory = memory
         store._open(existing=True)
         return store
 
@@ -376,20 +362,8 @@ class SessionStore:
             self._file = None
         self._lock.release()
 
-    def _refresh_history(self, *, tolerate_publication_failure=False) -> None:
-        self.history = TaskHistory(
-            self.memory_directory, self.session_id, self._recent_task_count, self.memory,
-            event_path=self.path if self._format_version == SESSION_FORMAT_VERSION else None,
-            publish=False,
-        )
-        try:
-            self.history.project()
-        except Exception as exc:
-            self._history_dirty = True
-            if not tolerate_publication_failure:
-                raise
-            print(f"[会话投影] 原始事件已保存，派生视图等待重建: {exc}", file=sys.stderr)
-            return
+    def _refresh_history(self) -> None:
+        self.history = TaskHistory(self.path, self._recent_task_count)
         self._history_dirty = False
 
     def __enter__(self) -> "SessionStore":
@@ -422,19 +396,15 @@ class SessionStore:
         self._file.flush()
         os.fsync(self._file.fileno())
         self._sequence = int(record.get("sequence", self._sequence))
-        if self._format_version == SESSION_FORMAT_VERSION:
-            try:
-                if self._history_dirty:
-                    self._refresh_history()
-                else:
-                    self.history.record(record)
-            except Exception as exc:
-                # The canonical commit succeeded. A derived-view error must not
-                # make callers leave live state behind the recoverable state.
-                self._history_dirty = True
-                print(f"[会话投影] 原始事件已保存，派生视图等待重建: {exc}", file=sys.stderr)
-        else:
-            self.history.record(record)
+        try:
+            if self._history_dirty:
+                self._refresh_history()
+            else:
+                self.history.record(record)
+        except Exception as exc:
+            # The event was committed; a derived fold must not undo its effects.
+            self._history_dirty = True
+            print(f"[会话投影] 原始事件已保存，派生视图等待重建: {exc}", file=sys.stderr)
         return self._file.tell()
 
     def end_task(self, status: str = "completed", *, context_valid: bool | None = None) -> None:
@@ -446,10 +416,8 @@ class SessionStore:
             self._append(record)
 
     def recent_messages(self) -> list[dict[str, Any]]:
-        if self._history_dirty:
-            # Only publication may fail open; a failed canonical read must not
-            # silently substitute stale conversation state.
-            self._refresh_history(tolerate_publication_failure=True)
+        # Select from committed events, not a separately published Recent file.
+        self._refresh_history()
         return self.history.messages()
 
     def context_messages(self) -> list[dict[str, Any]]:

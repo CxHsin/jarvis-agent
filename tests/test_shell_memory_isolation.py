@@ -61,7 +61,7 @@ Path('probe-result.json').write_text(json.dumps(results))
             (tmp_path / 'progress.txt').read_text() if (tmp_path / 'progress.txt').exists() else 'not started')
         assert json.loads((tmp_path / 'probe-result.json').read_text()) == {
             'sql': 'denied', 'read': 'denied', 'rename': 'denied', 'create': 'denied'}
-        assert agent.store.memory.facts() == []
+        assert not (settings.state_dir / 'memory' / 'memory.db').exists()
     finally:
         agent.close()
 

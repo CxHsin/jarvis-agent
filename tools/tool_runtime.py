@@ -253,20 +253,18 @@ class ToolRuntime:
         return self.registry.register(metadata, handler, contextual=contextual)
 
     def install_tools(self, definitions, handlers, *, defaults=False):
-        """Register the fixed catalog and legacy aliases, or add missing memory tools."""
+        """Register built-in tools; pre-registered host tools remain owned by the host."""
         for definition in definitions:
             schema = definition["function"]
             name = schema["name"]
-            if not defaults and (name not in {"memory_search", "memory_manage"}
-                                 or self.registry.versions(name)):
+            if not defaults and self.registry.versions(name):
                 continue
             self.register(ToolMetadata(name, "1", schema,
                 risk="high" if name == "bash" else "medium" if name == "edit" else "low",
-                side_effects=("memory",) if name == "memory_manage" else
-                             ("filesystem",) if name in {"edit", "bash"} else (),
+                side_effects=("filesystem",) if name in {"edit", "bash"} else (),
                 timeout=60 if name == "bash" else 30,
                 concurrency="parallel" if name in {"read", "edit"} else "serial"),
-                handlers[name], contextual=name in {"edit", "bash", "memory_manage"})
+                handlers[name], contextual=name in {"edit", "bash"})
         if defaults:
             for alias in ("list_directory", "search_file_content", "read_file"):
                 if not self.registry.versions(alias):

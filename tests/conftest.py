@@ -1,4 +1,4 @@
-"""Keep integration tests offline, including background memory workers."""
+"""Keep integration tests offline."""
 
 import socket
 

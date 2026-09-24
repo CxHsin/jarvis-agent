@@ -32,30 +32,21 @@ class Agent:
         permission_policy: PermissionPolicy | None = None,
         confirm_tool: Callable | None = None,
         native_loader: Callable | None = None,
-        extraction_client: ChatCompletionsClient | Any | None = None,
-        embedding_client: Any | None = None,
-        rewrite_client: Any | None = None,
-        memory_authorization_client: Any | None = None,
         application: Application | None = None,
     ):
         supplied_runtime = tool_runtime is not None
         self._owns_application = application is None
         self.application = application or Application(config, client=client,
-            compression_client=compression_client, extraction_client=extraction_client,
-            embedding_client=embedding_client, rewrite_client=rewrite_client,
-            memory_authorization_client=memory_authorization_client)
+            compression_client=compression_client)
         self.store = store
         try:
             if self.store is None and resume is not None:
                 # Acquire the session lock before model discovery or background work.
-                self.store = SessionStore.resume(config, resume or None, memory=self.application.memory)
-            self.application.prepare(self.store.memory if self.store is not None else None)
+                self.store = SessionStore.resume(config, resume or None)
+            self.application.prepare()
             self.config = self.application.config
             if self.store is None:
-                self.store = SessionStore.create(self.config, memory=self.application.memory)
-            elif self.store.memory is not self.application.memory:
-                self.store.memory = self.application.memory
-                self.store.history.memory = self.application.memory
+                self.store = SessionStore.create(self.config)
         except BaseException:
             if self.store is not None:
                 self.store.close()
@@ -64,15 +55,13 @@ class Agent:
             raise
         try:
             self.workspace = Workspace(self.config)
-            self.memory_authorization_client = self.application.memory_authorization_client
             self.tool_registry = tool_runtime.registry if tool_runtime is not None else ToolRegistry()
             self.usage_ledger = UsageLedger()
             self.compression_client = MeasuredClient(self.application.compression_client, self.usage_ledger,
                                                     "压缩模型", config.compression_model or config.model)
             self.client = MeasuredClient(self.application.client, self.usage_ledger, "主模型", config.model)
             self._audit_events = []
-            self.messages: list[dict[str, Any]] = [{"role": "system", "content":
-                self.store.memory.prefix_snapshot() + "\n\n" + self._system_prompt()}]
+            self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
             self.context = ContextManager(self.config, recorder=self.store)
             self.tool_functions: dict[str, ToolFunction] = {
                 "read": self.workspace.read, "edit": self.workspace.edit, "bash": self.workspace.bash,
@@ -84,9 +73,6 @@ class Agent:
                              ("read", "edit", "bash", "tool_search", "list_directory")))
             self.tool_runtime.install_tools(TOOL_DEFINITIONS, {
                 **self.tool_functions, "edit": self._contextual_edit, "bash": self._contextual_bash,
-                "memory_search": lambda query, include_history=False:
-                    self.store.memory.search(query, include_history=include_history),
-                "memory_manage": self._contextual_memory_manage,
             }, defaults=not supplied_runtime)
             policy = permission_policy
             if policy is None and not supplied_runtime:
@@ -111,29 +97,6 @@ class Agent:
                 self.application.close()
             raise
 
-    def _contextual_memory_manage(self, context, action, fact=None, fact_id=None):
-        from memory.memory_authorization import authorize
-        context.check()
-        user = next((m for m in reversed(self.messages) if m.get('role') == 'user'), None)
-        if not user:
-            raise ValueError('memory management requires a current user event')
-        quote = user.get('content', '')
-        task = self.store.history.tasks[-1] if self.store.history.tasks else {}
-        event = next((e for e in reversed(task.get('events', []))
-                      if e.get('type') == 'message' and e.get('message', {}).get('role') == 'user'), None)
-        if event is None:
-            raise ValueError('memory management requires a recorded current user event')
-        quote = event['message']['content']
-        target = next((item for item in self.store.memory.facts(include_inactive=True)
-                       if item['fact_id'] == fact_id), None) if fact_id else None
-        authorize(self.memory_authorization_client, quote, action, fact, target)
-        source = {'quote': quote, 'recorded_at': event['recorded_at'], 'source_task_id': event['task_id'],
-                  'source_event_id': event['event_id'], 'trajectory_path': str(self.store.history.path)}
-        if action == 'remember': return context.commit(lambda: self.store.memory.remember(fact or {}, source=source))
-        if action == 'correct': return context.commit(lambda: self.store.memory.correct(fact_id, fact or {}, source=source))
-        if action == 'forget': return context.commit(lambda: self.store.memory.forget(fact_id, source=source))
-        raise ValueError('unknown memory action')
-
     def _save_runtime(self, audit=None):
         if self.store:
             self.store.record_runtime(dict(self.tool_runtime.snapshot(), provider=self.provider_session.snapshot()),
@@ -149,9 +112,6 @@ class Agent:
 
     def _search_tools(self, query="", limit=8):
         result = self.tool_runtime.discover(self._runtime_task_id, query, limit)
-        if "memory" not in str(query).casefold():
-            result["tools"] = [item for item in result.get("tools", [])
-                               if item.get("tool_id") not in {"memory_search", "memory_manage"}]
         self._save_runtime()
         return result
 
@@ -351,8 +311,7 @@ class Agent:
         return result
 
     def run_request(self, user_text: str) -> str | None:
-        prefix = self.store.memory.task_prefix()
-        self.messages[0] = {"role": "system", "content": prefix + "\n\n" + self._system_prompt()}
+        self.messages[0] = {"role": "system", "content": self._system_prompt()}
         task_system_message = dict(self.messages[0])
         request_offset = self.store.mark() if self.store is not None else None
         message_snapshot = deepcopy(self.messages)
@@ -361,11 +320,9 @@ class Agent:
         audit_start = self.tool_runtime.audit_cursor()
         audit_event_start = len(self._audit_events)
         self.context.begin_task(user_text)
-        recent = self.store.context_messages()
-        if recent:
-            if recent != self.messages[1:]:
-                self.store.record_recent_context(recent)
-                self.messages[1:] = recent
+        recent = self.context.select_messages(self.store, self.messages)
+        if recent != self.messages[1:]:
+            self.messages[1:] = recent
         self._runtime_task_id = f"{self.store.session_id}:{self.context.task_number}"
         self.tool_runtime.begin_task(self._runtime_task_id)
         self._save_runtime()

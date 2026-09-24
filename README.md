@@ -1,6 +1,6 @@
 # Jarvis
 
-一个面向个人工作流的本地命令行 Agent。Jarvis 通过兼容 OpenAI Chat Completions 的模型接口完成多轮对话，并在用户授权下读取、编辑和执行工作区工具。会话、来源、记忆和权限状态保存在本地。
+一个面向个人工作流的本地命令行 Agent。Jarvis 通过兼容 OpenAI Chat Completions 的模型接口完成多轮对话，并在用户授权下读取、编辑和执行工作区工具。会话事件和权限状态保存在本地；当前不提供跨会话个人记忆。
 
 > 当前项目是可运行的本地 CLI 基线，默认使用离线可测试的本地存储；它不是 Web 服务，也不要求部署数据库或后台服务。
 
@@ -9,9 +9,8 @@
 - 多轮模型交互与工具调用，支持并行独立工具和依赖调用。
 - 工作区文件工具：`read`、`edit`、`bash`、`list_directory`，以及动态 `tool_search`。
 - 会话列表与恢复：`--list`、`--resume`，恢复不会重新执行历史工具调用。
-- 上下文预算、`/compact` 压缩和溢出恢复，保留原始事件与可核对的工具证据。
-- 本地个人记忆：事实、来源、有效期、修正、忘记和画像发布均写入 SQLite。
-- 未配置 embedding 时仍支持关键词召回；配置后可在后台补建向量，不阻塞整库补建。
+- 上下文预算、`/compact` 压缩和溢出恢复；原始事件保留，可重新投影模型上下文。
+- 会话内近期任务选择由上下文投影负责，不依赖个人记忆。
 - 三档工具权限：`approve-all`、`approve-dangerous`、`broad-access`。
 - Windows shell 使用 AppContainer 和 Job object 约束进程树；Python 参数通过固定 launcher 与 JSON manifest 传递。
 
@@ -48,7 +47,7 @@ ROOT_DIR=C:\path\to\your\workspace
 .\.venv\Scripts\python.exe .\jarvis_agent.py
 ```
 
-不要把 `.env`、API key 或包含个人资料的 `STATE_DIR` 提交到 Git。`.env` 已被 Git 忽略；生产使用时建议把状态目录放在工作区之外。
+不要把 `.env`、API key 或包含交互记录的 `STATE_DIR` 提交到 Git。`.env` 已被 Git 忽略；生产使用时建议把状态目录放在工作区之外。
 
 ## CLI
 
@@ -73,24 +72,11 @@ python jarvis_agent.py [--env-file PATH] [--list] [--resume [SESSION_ID]]
 | `API_KEY` | 模型接口密钥 | 无 |
 | `MODEL` | 主模型名称 | 无 |
 | `ROOT_DIR` | 工作区根目录 | 无 |
-| `STATE_DIR` | 会话和记忆状态目录 | Windows 为 `%LOCALAPPDATA%\jarvis` |
+| `STATE_DIR` | 会话状态目录 | Windows 为 `%LOCALAPPDATA%\jarvis` |
 | `TOOL_PERMISSION_MODE` | `approve-all`、`approve-dangerous` 或 `broad-access` | `approve-dangerous` |
 | `MAX_ROUNDS` | 单次请求最多模型轮数 | `5` |
 | `REQUEST_TIMEOUT` | 模型请求超时秒数 | `60` |
 | `COMPRESSION_MODEL` | 可选的上下文压缩模型 | 主模型 |
-
-### Embedding（可选）
-
-四个变量必须同时填写才会启用向量适配器：
-
-```dotenv
-EMBEDDING_BASE_URL=https://example.com/v1
-EMBEDDING_API_KEY=your-embedding-key
-EMBEDDING_MODEL=your-embedding-model
-EMBEDDING_DIMENSIONS=1536
-```
-
-留空时使用关键词召回，事实仍会保存并立即可检索。不要为了启用基础记忆功能填写虚假的 embedding 配置。
 
 ## 工具与安全边界
 
@@ -111,7 +97,7 @@ Python 命令由沙箱临时目录中的固定 launcher 启动，参数通过 UT
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-测试默认使用临时目录、受控模型客户端和本地 SQLite，不调用真实付费模型服务。Windows shell isolation 测试会验证 ACL、Python 参数、进程树、取消和状态目录保护。
+测试默认使用临时目录、受控模型客户端，不调用真实付费模型服务。Windows shell isolation 测试会验证 ACL、Python 参数、进程树、取消和状态目录保护。
 
 项目领域术语见 [CONTEXT.md](CONTEXT.md)，架构决策见 [docs/adr](docs/adr)。
 
@@ -124,21 +110,13 @@ configuration.py         配置解析与用户默认设置
 agent/
   agent.py               Agent 任务执行与模型—工具循环
 context/
-  context_manager.py     上下文投影与组装
+  context_manager.py     上下文状态与请求组装
+  context_projection.py  从事件选择近期模型上下文
   context_budget.py      输入预算与 token 估算
   compaction.py          压缩、切点与溢出恢复
 session/
   session_store.py       会话事件、持久化与恢复
   session_migration.py   旧会话迁移
-  task_history.py        任务轨迹及 History/Recent 投影
-memory/
-  memory_service.py      记忆公开操作与组件装配
-  memory_store.py        SQLite 连接与事务
-  stable_memory.py       稳定事实、来源与有效期
-  memory_retrieval.py    关键词与向量召回
-  memory_profile.py      用户画像与人工编辑
-  memory_pending.py      候选提取、晋级与后台调度
-  memory_authorization.py 记忆写入授权判断
 models/
   model_client.py        模型通信与请求处理
   model_capabilities.py  模型容量查询
@@ -156,9 +134,9 @@ benchmarks/             离线性能基线
 docs/adr/               架构决策记录
 ```
 
-按职责定位代码：`session` 保存发生过的事件及其投影，`memory` 管理跨任务的稳定事实，`context` 决定本次发送给模型的内容。`agent` 协调任务，`tools` 执行具体操作，`models` 处理模型通信及容量和用量。应用负责装配与关闭资源；本次目录划分不改变已有生命周期与持久化契约，也不引入统一的 `core` 杂项目录。
+按职责定位代码：`session` 保存完整运行事件，`context` 从事件选择近期上下文并决定本次发送给模型的内容；`agent` 协调任务，`tools` 执行具体操作，`models` 处理通信、容量和用量。应用负责装配与关闭资源；程序不会自动清理旧状态数据。
 
-Python 调用方从所属模块导入，例如 `from agent.agent import Agent`、`from memory.memory_service import MemoryService`。原有根目录模块导入路径已迁移；CLI 仍使用 `python jarvis_agent.py`。模型能力 JSON 随 `models` 模块存放，shell launcher 随 `tools` 模块存放。
+Python 调用方从所属模块导入，例如 `from agent.agent import Agent`、`from context.context_projection import TaskHistory`。CLI 仍使用 `python jarvis_agent.py`。
 
 ## 许可
 

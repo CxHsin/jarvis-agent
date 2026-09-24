@@ -186,6 +186,51 @@ class SessionLifecycleTests(SessionTestBase):
 
 
 class SessionRecoveryTests(SessionTestBase):
+    def test_new_session_uses_event_projection_without_personal_memory(self):
+        from application import Application
+        from tools.definitions import TOOL_DEFINITIONS
+        names = {item['function']['name'] for item in TOOL_DEFINITIONS}
+        self.assertFalse({'memory_search', 'memory_manage'} & names)
+        with Application(self.config(recent_task_count=1), client=FakeClient([
+            {'role': 'assistant', 'content': 'one'},
+            {'role': 'assistant', 'content': 'two'},
+            {'role': 'assistant', 'content': 'three'},
+        ])) as app:
+            agent = app.create_session()
+            with redirect_stdout(StringIO()):
+                agent.run_request('first')
+                agent.run_request('second')
+                agent.run_request('third')
+            self.assertEqual([m['content'] for m in agent.messages if m['role'] == 'user'],
+                             ['second', 'third'])
+            self.assertNotIn('memory_search', agent.messages[0]['content'])
+            self.assertFalse((self.state / 'memory').exists())
+            self.assertEqual(len([r for r in self.records(agent.store.path)
+                                  if r['type'] == 'message' and r['message']['role'] == 'user']), 3)
+            session_id = agent.store.session_id
+            agent.close()
+        resumed = self.agent(FakeClient([]), resume=session_id, recent_task_count=1)
+        self.assertEqual([m['content'] for m in resumed.messages if m['role'] == 'user'],
+                         ['second', 'third'])
+
+    def test_old_memory_tool_events_remain_history_but_are_not_available(self):
+        store = SessionStore.create(self.config())
+        session_id = store.session_id
+        store.record_task(1, 'old request')
+        store.record_message({'role': 'user', 'content': 'remember tea'})
+        store.record_message({'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'legacy-memory', 'function': {'name': 'memory_manage',
+                                                 'arguments': '{"action":"remember"}'}}]})
+        store.record_message({'role': 'tool', 'tool_call_id': 'legacy-memory', 'name': 'memory_manage',
+                              'content': '{"ok":true}'})
+        store.end_task()
+        store.close()
+        agent = self.agent(FakeClient([]), resume=session_id)
+        self.assertTrue(any(m.get('name') == 'memory_manage' for m in agent.messages))
+        self.assertFalse(any(t['function']['name'] == 'memory_manage'
+                             for t in agent.tool_runtime.schemas('new-task')))
+        self.assertFalse((self.state / 'memory').exists())
+
     def test_resume_restores_history_and_evidence_index(self):
         (self.root / "note.md").write_text("agent loop\n第二行\n", encoding="utf-8")
         client = FakeClient(

@@ -9,7 +9,6 @@ from typing import Sequence
 
 from agent.agent import Agent
 from configuration import Config, ConfigurationError, save_global_tool_permission_mode
-from memory.memory_profile import ProfileEditError
 from session.session_store import SessionStore, SessionNotFoundError, SessionLockedError, resolve_state_dir
 from tools.tool_runtime import PermissionPolicy
 
@@ -121,10 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
                 print(f"全局工具权限已设为 {mode}。")
                 continue
-            try:
-                agent.run_request(user_text)
-            except ProfileEditError as exc:
-                print(f"[记忆编辑未导入] {exc}；请修正 memory.md 后重试。原文件已保留。")
+            agent.run_request(user_text)
     finally:
         agent.close()
 

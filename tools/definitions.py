@@ -9,8 +9,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 TOOL_DEFINITIONS += [
  {"type":"function","function":{"name":"list_directory","description":"列出工作区目录的直接子项，返回文件和子目录路径及截断标记。查看子目录时再次调用；列目录优先使用本工具，无需 shell。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"工作区内的目录路径，默认当前工作区。"}},"additionalProperties":False}}},
- {"type":"function","function":{"name":"memory_search","description":"Search personal memory facts.","parameters":{"type":"object","properties":{"query":{"type":"string"},"include_history":{"type":"boolean"}},"required":["query"],"additionalProperties":False}}},
- {"type":"function","function":{"name":"memory_manage","description":"Remember, correct, or forget a personal fact.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["remember","correct","forget"]},"fact_id":{"type":"string"},"fact":{"type":"object"}},"required":["action"],"additionalProperties":False}}}
 ]
 
 TOOL_DEFINITIONS[1]["function"]["parameters"]["properties"]["expected_hash"] = {

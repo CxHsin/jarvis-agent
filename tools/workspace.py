@@ -252,7 +252,7 @@ class Workspace:
         protected_roots = (resolve_state_dir(self.config).resolve(), Path(__file__).resolve().parents[1],
                            Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve())
         if any(target == root or target.is_relative_to(root) for root in protected_roots):
-            raise WorkspaceError("Agent 状态和运行时代码不可由文件工具修改；记忆只能通过 memory_manage 修改。")
+            raise WorkspaceError("Agent 状态和运行时代码不可由文件工具修改。")
         current_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
         if expected_hash is not None and expected_hash != current_hash:
             return failure("edit_conflict", "文件已改变，请重新读取后再编辑。", current_hash=current_hash)
