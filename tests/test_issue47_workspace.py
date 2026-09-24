@@ -52,7 +52,7 @@ def test_outside_file_tools_denied(tmp_path, path):
     assert (tmp_path / "outside.txt").read_text(encoding="utf-8") == "secret"
 
 
-def test_symlink_escape_and_dotenv_blocked(tmp_path):
+def test_symlink_escape_blocked(tmp_path):
     cfg = config(tmp_path)
     workspace = Workspace(cfg)
     secret = tmp_path / "secret.txt"
@@ -67,13 +67,17 @@ def test_symlink_escape_and_dotenv_blocked(tmp_path):
     with pytest.raises(WorkspaceError):
         workspace.write("link.txt", "changed")
     assert secret.read_text(encoding="utf-8") == "private"
-    (cfg.root_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=private", encoding="utf-8")
-    with pytest.raises(WorkspaceError):
-        workspace.read(".env")
-    with pytest.raises(WorkspaceError):
-        workspace.write(".env", "bad")
-    with pytest.raises(WorkspaceError):
-        workspace.bash("Get-Content .env")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows AppContainer integration")
+def test_dotenv_in_workspace_does_not_block_sandboxed_bash(tmp_path):
+    cfg = config(tmp_path)
+    workspace = Workspace(cfg)
+    (cfg.root_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=placeholder", encoding="utf-8")
+    assert "placeholder" in workspace.read(".env")["content"]
+    result = workspace.bash("[IO.File]::WriteAllText('ran.txt','ran')", timeout=30)
+    assert result["ok"]
+    assert (cfg.root_dir / "ran.txt").read_text(encoding="utf-8") == "ran"
 
 
 class Client:

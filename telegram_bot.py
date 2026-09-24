@@ -235,11 +235,6 @@ def main(argv=None):
         values = _read_dotenv(args.env_file)
         token = _setting(values, "TELEGRAM_BOT_TOKEN")
         raw_id = _setting(values, "TELEGRAM_ALLOWED_USER_ID")
-        # The sandbox can read the entire workspace, including config files.
-        # A Telegram secret on disk there would make the Bot an exfiltration path.
-        source = args.env_file.expanduser().resolve()
-        if values.get("TELEGRAM_BOT_TOKEN") and source.is_relative_to(Path.cwd().resolve()):
-            raise ConfigurationError("Bot Token 配置文件必须放在启动工作区外；或用环境变量提供 Token")
         if not token or not raw_id or not raw_id.isdecimal() or int(raw_id) < 1:
             raise ConfigurationError("需配置 TELEGRAM_BOT_TOKEN 和数字 TELEGRAM_ALLOWED_USER_ID")
         config = Config.from_env(args.env_file)

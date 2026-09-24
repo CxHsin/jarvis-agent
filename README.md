@@ -28,10 +28,10 @@ git clone https://github.com/CxHsin/jarvis-agent.git
 cd jarvis-agent
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example C:\private\jarvis.env
+Copy-Item .env.example .env
 ```
 
-在工作区外的配置文件中至少填写：
+在 `.env` 中至少填写：
 
 ```dotenv
 BASE_URL=https://api.deepseek.com/v1
@@ -39,23 +39,24 @@ API_KEY=your-api-key
 MODEL=deepseek-v4-flash
 ```
 
-从希望作为工作区的目录运行 CLI，例如：
+在希望作为工作区的目录启动 CLI，例如：
 
 ```powershell
 Set-Location C:\path\to\your\workspace
-python C:\path\to\jarvis-agent\jarvis_agent.py --env-file C:\private\jarvis.env
+python C:\path\to\jarvis-agent\jarvis_agent.py
 ```
 
 不要把配置文件、API key、Bot Token 或包含交互记录的 `STATE_DIR` 提交到 Git。生产使用时建议把状态目录放在工作区之外。
 
 ## Telegram 私聊入口（Windows）
 
-将 `TELEGRAM_BOT_TOKEN` 放在**工作区外**的配置文件或进程环境变量中，并设置数字 `TELEGRAM_ALLOWED_USER_ID`（不是用户名）。不要把真实 Token 保存在启动工作区内：`bash` 沙箱能读取工作区文件，Bot 会拒绝从工作区内 `.env` 读取 Token。以另一个目录为工作区时可使用位于该目录外的配置文件：
+可在项目 `.env` 设置 `TELEGRAM_BOT_TOKEN` 和数字 `TELEGRAM_ALLOWED_USER_ID`（不是用户名），在项目目录启动：
 
 ```powershell
-Set-Location C:\path\to\workspace
-python C:\path\to\jarvis-agent\telegram_bot.py --env-file C:\private\jarvis-bot.env
+python telegram_bot.py
 ```
+
+**安全取舍（参照 Pi 的本地信任模型）**：工作区内的 `.env` 可被模型驱动的 `read` 和沙箱内 `bash` 读取；Telegram Token 和模型 API Key **不能保证不进入模型请求、工具结果或会话记录**。启动 Bot 即意味着信任当前工作区与所用模型服务，不适合不可信内容或无人值守的高风险环境。如需真正隔离凭据，应将配置移出工作区或使用系统级隔离，不能依靠提示词、文本脱敏或 `.gitignore`。Bot 对已知 Token 的消息文本做最佳努力替换，但这不是凭据安全边界。
 
 只接收配置用户的私聊文本，其他聊天和文件消息不触发模型。消息串行处理；`/cancel` 请求取消当前任务，但无法撤销已发生的修改。重复投递不再次执行；重启后执行状态未知的任务不会自动重跑。同一私聊在不同工作区有不同的会话；回到旧目录启动可恢复该目录的会话。当前不支持越界确认放行；工作区外文件访问被拒绝。Bot 进程关闭后需要重新启动才能继续收消息。没有真实 Bot 凭据时只能进行离线模拟测试，不能视为真实 Telegram 验收。
 
@@ -90,7 +91,7 @@ python jarvis_agent.py [--env-file PATH] [--list] [--resume [SESSION_ID]]
 
 ## 工具与安全边界
 
-Bot Token 与模型 API Key 都属于秘密；推荐把配置文件放在工作区外。工作区中存在 `.env` 时，为避免沙箱中的命令读取其内容，`bash` 会拒绝启动（即使不是 Bot Token）。
+`.env` 可直接放在项目工作区，工具也能读取它；这是一种本地信任取舍，不是凭据隔离。工作区外的文件和状态目录仍受现有工具与 Windows 沙箱边界限制。
 
 文件工具仅允许访问启动工作区；在此范围内 `read/write/edit` 不逐次询问。越界路径默认拒绝，目前没有通过 Telegram 确认后提权的通道。`bash` 只能在 Windows AppContainer 沙箱内执行；沙箱初始化失败时不会以普通权限重试。
 

@@ -303,13 +303,23 @@ def test_completion_delivery_gap_is_reported_without_reexecution(tmp_path):
         assert state.pending_delivery() == []
 
 
-def test_bot_rejects_token_file_inside_workspace(tmp_path, monkeypatch, capsys):
-    secret = tmp_path / ".env"
-    secret.write_text("TELEGRAM_BOT_TOKEN=MY_SECRET\nTELEGRAM_ALLOWED_USER_ID=42\n", encoding="utf-8")
+def test_bot_accepts_token_file_inside_workspace(tmp_path, monkeypatch, capsys):
+    env_file = tmp_path / ".env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=placeholder\nTELEGRAM_ALLOWED_USER_ID=42\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    assert main(["--env-file", str(secret)]) == 2
-    assert "MY_SECRET" not in capsys.readouterr().err
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_ID", raising=False)
+    class FakeBot:
+        def __init__(self, config, user_id, transport, *, secret):
+            assert user_id == 42 and secret == "placeholder"
+        def run(self):
+            pass
+        def close(self):
+            pass
+    monkeypatch.setattr("telegram_bot.TelegramBot", FakeBot)
+    monkeypatch.setattr("telegram_bot.Config.from_env", lambda path: object())
+    assert main(["--env-file", str(env_file)]) == 0
+    assert "placeholder" not in capsys.readouterr().err
 
 
 def test_transport_sanitizes_secret(monkeypatch):

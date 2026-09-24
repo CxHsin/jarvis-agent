@@ -43,9 +43,6 @@ class Workspace:
         raw = Path(user_path or ".")
         candidate = (raw if raw.is_absolute() else self.root / raw).resolve()
         if candidate == self.root or candidate.is_relative_to(self.root):
-            # Never expose dotenv credentials or session state to a model-facing file tool.
-            if ".env" in candidate.relative_to(self.root).parts:
-                raise WorkspaceError("凭据文件不可由文件工具访问。")
             from session.session_store import resolve_state_dir
             state = resolve_state_dir(self.config).resolve()
             if candidate == state or candidate.is_relative_to(state):
@@ -110,7 +107,7 @@ class Workspace:
         )
 
     def _is_text_file(self, path: Path) -> bool:
-        return path.suffix.lower() in self.config.text_extensions
+        return path.name.casefold() == ".env" or path.suffix.lower() in self.config.text_extensions
 
     @staticmethod
     def _result_tokens(result: Mapping[str, Any]) -> int:
@@ -325,10 +322,6 @@ class Workspace:
         import tempfile
         import time
         if not command or not command.strip(): raise WorkspaceError("command 不能为空。")
-        # The shell is granted workspace access by the OS; a file-tool filter
-        # cannot hide credentials from it. Refuse to launch with a dotenv present.
-        if any(item.name.casefold() == ".env" for item in self.root.rglob(".env")):
-            raise WorkspaceError("工作区包含 .env 凭据文件，无法安全启动 bash。")
         with tempfile.TemporaryFile() as output_file:
             def start():
                 return start_shell(command, self.root, resolve_state_dir(self.config), output_file,
