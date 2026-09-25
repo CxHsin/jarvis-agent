@@ -111,7 +111,7 @@ class WorkspaceTests(unittest.TestCase):
         content = self.workspace.read_file("notes/one.md", 2, 2)
         self.assertEqual(content["content"], "2: 然后自己试验")
 
-    def test_read_can_access_files_outside_root(self):
+    def test_read_denies_files_outside_root(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             root = base / "workspace"
@@ -121,9 +121,9 @@ class WorkspaceTests(unittest.TestCase):
             workspace = Workspace(replace(self.config, root_dir=root))
             for reader in (workspace.read, workspace.read_file):
                 for path in (str(outside), "../outside.md"):
-                    result = reader(path)
-                    self.assertEqual(result["content"], "1: external content")
-                    self.assertEqual(result["path"], str(outside.resolve()))
+                    with self.assertRaises(ValueError):
+                        reader(path)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "external content")
             with self.assertRaises(ValueError):
                 workspace.edit(str(outside), "changed")
 
@@ -257,8 +257,8 @@ class AgentTests(unittest.TestCase):
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [
-                            {"id": "1", "function": {"name": "list_directory", "arguments": "{}"}},
-                            {"id": "2", "function": {"name": "search_file_content", "arguments": json.dumps({"query": "agent"})}},
+                            {"id": "1", "function": {"name": "read", "arguments": json.dumps({"path": "note.md"})}},
+                            {"id": "2", "function": {"name": "read", "arguments": json.dumps({"path": "note.md", "start_line": 1})}},
                         ],
                     },
                     {"role": "assistant", "content": "找到了 note.md。"},
@@ -274,7 +274,7 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn("最后一轮", client.requests[0][0][0]["content"])
             self.assertEqual(agent.messages[0], client.requests[0][0][0])
             self.assertEqual(final_messages[1:], client.requests[0][0][1:] + agent.messages[2:5])
-            self.assertEqual(client.calls, [(2, 5, "auto"), (5, 0, "none")])
+            self.assertEqual(client.calls, [(2, 4, "auto"), (5, 0, "none")])
             self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant", "tool", "tool", "assistant"])
 
     def test_agent_wires_file_tools_through_runtime(self):
@@ -283,11 +283,12 @@ class AgentTests(unittest.TestCase):
                             root_dir=Path(directory), state_dir=_STATE_ROOT)
             agent = make_agent(self, config, FakeClient([{"role": "assistant", "content": "ok"}]))
             names = [item["function"]["name"] for item in agent.tool_runtime.schemas("0")]
-            self.assertEqual(names, ["read", "edit", "bash", "tool_search", "list_directory"])
-            agent.run_request("列出文件")
+            self.assertEqual(names, ["read", "write", "edit", "bash"])
+            agent.run_request("读取文件")
             self.assertEqual(agent.tool_runtime.registry.active_keys(agent._runtime_task_id),
-                             {(name, "1") for name in agent.tool_functions})
-            result = agent._execute_tool("list_directory", {})
+                             {(name, "1") for name in names})
+            (Path(directory) / "note.md").write_text("local", encoding="utf-8")
+            result = agent._execute_tool("read", {"path": "note.md"})
             self.assertTrue(result["ok"])
             self.assertEqual(agent.tool_runtime.registry.list()[0].metadata.version, "1")
 
@@ -323,7 +324,7 @@ class AgentTests(unittest.TestCase):
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [
-                            {"id": "1", "function": {"name": "read_file", "arguments": '{"path":"large.md"}'}},
+                            {"id": "1", "function": {"name": "read", "arguments": '{"path":"large.md"}'}},
                         ],
                     },
                     {"role": "assistant", "content": "已读取。"},
@@ -335,7 +336,7 @@ class AgentTests(unittest.TestCase):
                 self.assertEqual(agent.run_request("读取大文件"), "已读取。")
 
             terminal = output.getvalue()
-            self.assertIn("preview=", terminal)
+            self.assertIn("[工具结果]", terminal)
             self.assertIn("...", terminal)
             self.assertLess(len(terminal), 2_000)
             tool_message = next(message for message in agent.messages if message["role"] == "tool")
@@ -584,15 +585,15 @@ class AgentTests(unittest.TestCase):
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [
-                            {"id": "1", "function": {"name": "list_directory", "arguments": "{}"}},
-                            {"id": "2", "function": {"name": "search_file_content", "arguments": '{"query":"x"}'}},
+                            {"id": "1", "function": {"name": "read", "arguments": '{"path":"cancel.txt"}'}},
+                            {"id": "2", "function": {"name": "read", "arguments": '{"path":"other.txt"}'}},
                         ],
                     }
                 ]
             )
-            with patch.object(Workspace, "list_directory", CancellingWorkspace.list_directory):
+            with patch.object(Workspace, "read", side_effect=KeyboardInterrupt):
                 agent = make_agent(self, config, client)
-            self.assertIsNone(agent.run_request("取消测试"))
+                self.assertIsNone(agent.run_request("取消测试"))
             tool_messages = [message for message in agent.messages if message["role"] == "tool"]
             self.assertEqual(len(tool_messages), 2)
             self.assertTrue(all('"cancelled": true' in message["content"] for message in tool_messages))

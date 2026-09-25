@@ -10,9 +10,9 @@ from configuration import Config
 from tests.test_jarvis_agent import FakeClient
 
 
-@pytest.mark.parametrize("tool", ["read", "read_file"])
 @pytest.mark.parametrize("truncated", [False, True])
-def test_read_evidence_survives_compaction_and_resume(tmp_path, tool, truncated):
+def test_read_evidence_survives_compaction_and_resume(tmp_path, truncated):
+    tool = "read"
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "note.md").write_text("first\nsecond\nthird\n", encoding="utf-8")

@@ -32,30 +32,21 @@ class Agent:
         permission_policy: PermissionPolicy | None = None,
         confirm_tool: Callable | None = None,
         native_loader: Callable | None = None,
-        extraction_client: ChatCompletionsClient | Any | None = None,
-        embedding_client: Any | None = None,
-        rewrite_client: Any | None = None,
-        memory_authorization_client: Any | None = None,
         application: Application | None = None,
     ):
         supplied_runtime = tool_runtime is not None
         self._owns_application = application is None
         self.application = application or Application(config, client=client,
-            compression_client=compression_client, extraction_client=extraction_client,
-            embedding_client=embedding_client, rewrite_client=rewrite_client,
-            memory_authorization_client=memory_authorization_client)
+            compression_client=compression_client)
         self.store = store
         try:
             if self.store is None and resume is not None:
                 # Acquire the session lock before model discovery or background work.
-                self.store = SessionStore.resume(config, resume or None, memory=self.application.memory)
-            self.application.prepare(self.store.memory if self.store is not None else None)
+                self.store = SessionStore.resume(config, resume or None)
+            self.application.prepare()
             self.config = self.application.config
             if self.store is None:
-                self.store = SessionStore.create(self.config, memory=self.application.memory)
-            elif self.store.memory is not self.application.memory:
-                self.store.memory = self.application.memory
-                self.store.history.memory = self.application.memory
+                self.store = SessionStore.create(self.config)
         except BaseException:
             if self.store is not None:
                 self.store.close()
@@ -64,34 +55,26 @@ class Agent:
             raise
         try:
             self.workspace = Workspace(self.config)
-            self.memory_authorization_client = self.application.memory_authorization_client
             self.tool_registry = tool_runtime.registry if tool_runtime is not None else ToolRegistry()
             self.usage_ledger = UsageLedger()
             self.compression_client = MeasuredClient(self.application.compression_client, self.usage_ledger,
                                                     "压缩模型", config.compression_model or config.model)
             self.client = MeasuredClient(self.application.client, self.usage_ledger, "主模型", config.model)
             self._audit_events = []
-            self.messages: list[dict[str, Any]] = [{"role": "system", "content":
-                self.store.memory.prefix_snapshot() + "\n\n" + self._system_prompt()}]
+            self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
             self.context = ContextManager(self.config, recorder=self.store)
             self.tool_functions: dict[str, ToolFunction] = {
-                "read": self.workspace.read, "edit": self.workspace.edit, "bash": self.workspace.bash,
-                "tool_search": self._search_tools,
-                "list_directory": self.workspace.list_directory, "search_file_content": self.workspace.search_file_content, "read_file": self.workspace.read_file,
+                "read": self.workspace.read, "write": self.workspace.write,
+                "edit": self.workspace.edit, "bash": self.workspace.bash,
             }
-            self.tool_runtime = tool_runtime or ToolRuntime(self.tool_registry,
-                stable=tuple((name, "1") for name in
-                             ("read", "edit", "bash", "tool_search", "list_directory")))
-            self.tool_runtime.install_tools(TOOL_DEFINITIONS, {
-                **self.tool_functions, "edit": self._contextual_edit, "bash": self._contextual_bash,
-                "memory_search": lambda query, include_history=False:
-                    self.store.memory.search(query, include_history=include_history),
-                "memory_manage": self._contextual_memory_manage,
-            }, defaults=not supplied_runtime)
+            self.tool_runtime = tool_runtime or ToolRuntime(self.tool_registry)
+            self.tool_runtime.configure_builtin_tools(TOOL_DEFINITIONS, {
+                **self.tool_functions, "edit": self._contextual_edit,
+                "write": self._contextual_write, "bash": self._contextual_bash,
+            })
             policy = permission_policy
             if policy is None and not supplied_runtime:
-                policy = PermissionPolicy(self.config.tool_permission_mode,
-                                          max_timeout=self.config.tool_max_timeout)
+                policy = PermissionPolicy(max_timeout=self.config.tool_max_timeout)
             self.tool_runtime.configure(policy=policy, confirm=confirm_tool,
                                         recorder=self._record_audit, policy_recorder=self._policy_event)
             self.tool_runtime.attach_workspace(self.workspace)
@@ -111,29 +94,6 @@ class Agent:
                 self.application.close()
             raise
 
-    def _contextual_memory_manage(self, context, action, fact=None, fact_id=None):
-        from memory.memory_authorization import authorize
-        context.check()
-        user = next((m for m in reversed(self.messages) if m.get('role') == 'user'), None)
-        if not user:
-            raise ValueError('memory management requires a current user event')
-        quote = user.get('content', '')
-        task = self.store.history.tasks[-1] if self.store.history.tasks else {}
-        event = next((e for e in reversed(task.get('events', []))
-                      if e.get('type') == 'message' and e.get('message', {}).get('role') == 'user'), None)
-        if event is None:
-            raise ValueError('memory management requires a recorded current user event')
-        quote = event['message']['content']
-        target = next((item for item in self.store.memory.facts(include_inactive=True)
-                       if item['fact_id'] == fact_id), None) if fact_id else None
-        authorize(self.memory_authorization_client, quote, action, fact, target)
-        source = {'quote': quote, 'recorded_at': event['recorded_at'], 'source_task_id': event['task_id'],
-                  'source_event_id': event['event_id'], 'trajectory_path': str(self.store.history.path)}
-        if action == 'remember': return context.commit(lambda: self.store.memory.remember(fact or {}, source=source))
-        if action == 'correct': return context.commit(lambda: self.store.memory.correct(fact_id, fact or {}, source=source))
-        if action == 'forget': return context.commit(lambda: self.store.memory.forget(fact_id, source=source))
-        raise ValueError('unknown memory action')
-
     def _save_runtime(self, audit=None):
         if self.store:
             self.store.record_runtime(dict(self.tool_runtime.snapshot(), provider=self.provider_session.snapshot()),
@@ -149,9 +109,6 @@ class Agent:
 
     def _search_tools(self, query="", limit=8):
         result = self.tool_runtime.discover(self._runtime_task_id, query, limit)
-        if "memory" not in str(query).casefold():
-            result["tools"] = [item for item in result.get("tools", [])
-                               if item.get("tool_id") not in {"memory_search", "memory_manage"}]
         self._save_runtime()
         return result
 
@@ -178,6 +135,9 @@ class Agent:
 
     def _contextual_edit(self, context, **arguments):
         return self.workspace.edit(**arguments, execution_context=context)
+
+    def _contextual_write(self, context, **arguments):
+        return self.workspace.write(**arguments, execution_context=context)
 
     def _contextual_bash(self, context, **arguments):
         return self.workspace.bash(**arguments, execution_context=context)
@@ -256,8 +216,8 @@ class Agent:
         extensions = ", ".join(self.config.text_extensions)
         return (
             self.config.system_prompt + "\n" +
-            f"默认工作区是 {self.config.root_dir}；read/read_file 可读取工作区外的文本文件，相对路径以工作区为基准；文本扩展名包括 {extensions}。\n"
-            "tool_search 返回并激活工具定义，可在本次任务后续轮次调用；旧任务的定义不代表当前可调用。"
+            f"启动工作区是 {self.config.root_dir}；read/write/edit 仅可操作工作区内的文本文件，文本扩展名包括 {extensions}。"
+            "bash 仅在 Windows AppContainer 沙箱内执行；无法安全隔离时拒绝执行。"
             "同批调用可用 _depends_on 指定前置调用 ID；参数值可用 "
             '{"$result":{"call_id":"前置ID","path":["字段"]}} 引用前置结果。'
         )
@@ -350,9 +310,11 @@ class Agent:
             result["tool_calls"] = message["tool_calls"]
         return result
 
-    def run_request(self, user_text: str) -> str | None:
-        prefix = self.store.memory.task_prefix()
-        self.messages[0] = {"role": "system", "content": prefix + "\n\n" + self._system_prompt()}
+    def run_request(self, user_text: str, cancellation=None) -> str | None:
+        """Run a task; cancellation is a cooperative threading.Event, never thread interruption."""
+        from threading import Event
+        cancellation = cancellation if cancellation is not None else Event()
+        self.messages[0] = {"role": "system", "content": self._system_prompt()}
         task_system_message = dict(self.messages[0])
         request_offset = self.store.mark() if self.store is not None else None
         message_snapshot = deepcopy(self.messages)
@@ -361,11 +323,9 @@ class Agent:
         audit_start = self.tool_runtime.audit_cursor()
         audit_event_start = len(self._audit_events)
         self.context.begin_task(user_text)
-        recent = self.store.context_messages()
-        if recent:
-            if recent != self.messages[1:]:
-                self.store.record_recent_context(recent)
-                self.messages[1:] = recent
+        recent = self.context.select_messages(self.store, self.messages)
+        if recent != self.messages[1:]:
+            self.messages[1:] = recent
         self._runtime_task_id = f"{self.store.session_id}:{self.context.task_number}"
         self.tool_runtime.begin_task(self._runtime_task_id)
         self._save_runtime()
@@ -377,6 +337,9 @@ class Agent:
         context_valid = True
         try:
             for round_number in range(1, self.config.max_rounds + 1):
+                if cancellation.is_set():
+                    task_status = "cancelled"
+                    return None
                 final_round = round_number == self.config.max_rounds
                 if final_round:
                     self.messages[0] = {
@@ -393,6 +356,9 @@ class Agent:
                 tools = [] if final_round else self.tool_runtime.schemas(self._runtime_task_id)
                 overflow_retried = False
                 while True:
+                    if cancellation.is_set():
+                        task_status = "cancelled"
+                        return None
                     request_messages = self.context.prepare_messages(self.messages, tools, self.compression_client)
                     if self._ensure_dynamic_definitions():
                         # Account for restored schemas without repeatedly compacting them away.
@@ -418,11 +384,17 @@ class Agent:
                     if metrics.get("over_budget"):
                         raise ModelRequestError("压缩后输入仍超过可用输入预算；请缩小本次输入或开启新会话。")
                     try:
+                        if cancellation.is_set():
+                            task_status = "cancelled"
+                            return None
                         message = self._complete_with_tools(
                             request_messages,
                             tools,
                             "none" if final_round else "auto",
                         )
+                        if cancellation.is_set():
+                            task_status = "cancelled"
+                            return None
                         break
                     except ModelRequestError as exc:
                         if overflow_retried or not is_overflow_error(exc):
@@ -432,6 +404,9 @@ class Agent:
                         recovered = self.context.compact(self.messages, tools, self.compression_client, OVERFLOW)
                         if not recovered.compacted:
                             raise
+                if cancellation.is_set():
+                    task_status = "cancelled"
+                    return None
                 self.context.record_usage(self.client.last_usage, request_messages, tools)
                 assistant = self._assistant_message(message)
                 self._append_message(assistant)
@@ -458,7 +433,8 @@ class Agent:
                                           "name": item.tool_id, "content": result_text})
                     self.context.record_tool_result(item.tool_id, item.arguments, result, item.call_id)
                     handled_call_indexes.update(i for i, c in enumerate(calls) if c.get("id") == item.call_id)
-                cancelled = self.tool_runtime.execute_batch(self._runtime_task_id, calls, record_result)
+                cancelled = self.tool_runtime.execute_batch(self._runtime_task_id, calls, record_result,
+                                                            cancellation=cancellation)
                 if cancelled:
                     task_status = "cancelled"
                     active_calls = []

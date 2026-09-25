@@ -61,7 +61,7 @@ class SessionTestBase(unittest.TestCase):
 
 
 class SessionLifecycleTests(SessionTestBase):
-    def test_global_permission_mode_survives_restart_and_overrides_dotenv(self):
+    def test_legacy_global_permission_mode_does_not_grant_access(self):
         env_file = Path(self.temporary.name) / "permissions.env"
         env_file.write_text(
             "BASE_URL=http://example.test/v1\n"
@@ -74,9 +74,10 @@ class SessionLifecycleTests(SessionTestBase):
         save_global_tool_permission_mode(self.state, "broad-access")
         with patch.dict("os.environ", {}, clear=True):
             restarted = Config.from_env(env_file)
-        self.assertEqual(restarted.tool_permission_mode, "broad-access")
+        self.assertIsNone(restarted.tool_permission_mode)
+        self.assertEqual(restarted.root_dir, Path.cwd().resolve())
 
-    def test_environment_permission_mode_overrides_global_default(self):
+    def test_legacy_environment_permission_mode_does_not_grant_access(self):
         env_file = Path(self.temporary.name) / "permissions.env"
         env_file.write_text(
             "BASE_URL=http://example.test/v1\n"
@@ -88,9 +89,10 @@ class SessionLifecycleTests(SessionTestBase):
         save_global_tool_permission_mode(self.state, "broad-access")
         with patch.dict("os.environ", {"TOOL_PERMISSION_MODE": "approve-all"}, clear=False):
             restarted = Config.from_env(env_file)
-        self.assertEqual(restarted.tool_permission_mode, "approve-all")
+        self.assertIsNone(restarted.tool_permission_mode)
+        self.assertEqual(restarted.root_dir, Path.cwd().resolve())
 
-    def test_cli_permission_command_persists_confirmed_upgrade(self):
+    def test_cli_does_not_enable_legacy_permission_command(self):
         env_file = Path(self.temporary.name) / "permissions.env"
         env_file.write_text(
             "BASE_URL=http://example.test/v1\n"
@@ -104,12 +106,12 @@ class SessionLifecycleTests(SessionTestBase):
         output = StringIO()
         with patch.dict("os.environ", {}, clear=True), \
              patch("jarvis_agent.Agent", return_value=agent), \
-             patch("builtins.input", side_effect=["/wide", "y", "exit"]), \
+             patch("builtins.input", side_effect=["/wide", "exit"]), \
              redirect_stdout(output):
             self.assertEqual(main(["--env-file", str(env_file)]), 0)
-            self.assertEqual(Config.from_env(env_file).tool_permission_mode, "broad-access")
-        self.assertEqual(agent.tool_runtime.policy.mode, "broad-access")
-        self.assertIn("已设为 broad-access", output.getvalue())
+            self.assertIsNone(Config.from_env(env_file).tool_permission_mode)
+        agent.run_request.assert_called_once_with("/wide")
+        self.assertFalse(agent.tool_runtime.policy.revoked)
 
     def test_default_start_creates_new_session_and_keeps_previous(self):
         first = self.agent(FakeClient([{"role": "assistant", "content": "第一次"}]))
@@ -164,7 +166,7 @@ class SessionLifecycleTests(SessionTestBase):
         store.close()
 
         output = StringIO()
-        with redirect_stdout(output):
+        with patch("configuration.Path.cwd", return_value=self.root), redirect_stdout(output):
             self.assertEqual(main(["--env-file", str(env_file), "--list"]), 0)
         self.assertIn(session_id, output.getvalue())
         self.assertIn("命令行列举", output.getvalue())
@@ -180,12 +182,57 @@ class SessionLifecycleTests(SessionTestBase):
             encoding="utf-8",
         )
         errors = StringIO()
-        with redirect_stderr(errors):
+        with patch("configuration.Path.cwd", return_value=empty_root), redirect_stderr(errors):
             self.assertEqual(main(["--env-file", str(empty_env), "--resume"]), 2)
         self.assertIn("会话错误", errors.getvalue())
 
 
 class SessionRecoveryTests(SessionTestBase):
+    def test_new_session_uses_event_projection_without_personal_memory(self):
+        from application import Application
+        from tools.definitions import TOOL_DEFINITIONS
+        names = {item['function']['name'] for item in TOOL_DEFINITIONS}
+        self.assertFalse({'memory_search', 'memory_manage'} & names)
+        with Application(self.config(recent_task_count=1), client=FakeClient([
+            {'role': 'assistant', 'content': 'one'},
+            {'role': 'assistant', 'content': 'two'},
+            {'role': 'assistant', 'content': 'three'},
+        ])) as app:
+            agent = app.create_session()
+            with redirect_stdout(StringIO()):
+                agent.run_request('first')
+                agent.run_request('second')
+                agent.run_request('third')
+            self.assertEqual([m['content'] for m in agent.messages if m['role'] == 'user'],
+                             ['second', 'third'])
+            self.assertNotIn('memory_search', agent.messages[0]['content'])
+            self.assertFalse((self.state / 'memory').exists())
+            self.assertEqual(len([r for r in self.records(agent.store.path)
+                                  if r['type'] == 'message' and r['message']['role'] == 'user']), 3)
+            session_id = agent.store.session_id
+            agent.close()
+        resumed = self.agent(FakeClient([]), resume=session_id, recent_task_count=1)
+        self.assertEqual([m['content'] for m in resumed.messages if m['role'] == 'user'],
+                         ['second', 'third'])
+
+    def test_old_memory_tool_events_remain_history_but_are_not_available(self):
+        store = SessionStore.create(self.config())
+        session_id = store.session_id
+        store.record_task(1, 'old request')
+        store.record_message({'role': 'user', 'content': 'remember tea'})
+        store.record_message({'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'legacy-memory', 'function': {'name': 'memory_manage',
+                                                 'arguments': '{"action":"remember"}'}}]})
+        store.record_message({'role': 'tool', 'tool_call_id': 'legacy-memory', 'name': 'memory_manage',
+                              'content': '{"ok":true}'})
+        store.end_task()
+        store.close()
+        agent = self.agent(FakeClient([]), resume=session_id)
+        self.assertTrue(any(m.get('name') == 'memory_manage' for m in agent.messages))
+        self.assertFalse(any(t['function']['name'] == 'memory_manage'
+                             for t in agent.tool_runtime.schemas('new-task')))
+        self.assertFalse((self.state / 'memory').exists())
+
     def test_resume_restores_history_and_evidence_index(self):
         (self.root / "note.md").write_text("agent loop\n第二行\n", encoding="utf-8")
         client = FakeClient(
@@ -196,7 +243,7 @@ class SessionRecoveryTests(SessionTestBase):
                     "tool_calls": [
                         {
                             "id": "call-1",
-                            "function": {"name": "read_file", "arguments": json.dumps({"path": "note.md"})},
+                            "function": {"name": "read", "arguments": json.dumps({"path": "note.md"})},
                         }
                     ],
                 },
@@ -335,14 +382,14 @@ class SessionWriteThroughTests(SessionTestBase):
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
-                        {"id": "c1", "function": {"name": "read_file", "arguments": '{"path":"big.md"}'}}
+                        {"id": "c1", "function": {"name": "read", "arguments": '{"path":"big.md"}'}}
                     ],
                 },
                 {
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
-                        {"id": "c2", "function": {"name": "read_file", "arguments": '{"path":"big.md"}'}}
+                        {"id": "c2", "function": {"name": "read", "arguments": '{"path":"big.md"}'}}
                     ],
                 },
                 {"role": "assistant", "content": "<context_summary>读到了事实。</context_summary>"},

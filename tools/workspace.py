@@ -42,16 +42,40 @@ class Workspace:
     def _resolve(self, user_path: str | None) -> Path:
         raw = Path(user_path or ".")
         candidate = (raw if raw.is_absolute() else self.root / raw).resolve()
+        if candidate == self.root or candidate.is_relative_to(self.root):
+            from session.session_store import resolve_state_dir
+            state = resolve_state_dir(self.config).resolve()
+            if candidate == state or candidate.is_relative_to(state):
+                raise WorkspaceError("Agent 状态不可由文件工具访问。")
         try:
             candidate.relative_to(self.root)
         except ValueError as exc:
             raise WorkspaceError("路径超出允许的工作区范围。") from exc
+        if candidate.is_file() and candidate.stat().st_nlink > 1:
+            raise WorkspaceError("硬链接文件不可由文件工具访问。")
         return candidate
 
     def _resolve_read(self, user_path: str | None) -> Path:
-        """Resolve a read target without restricting it to the workspace root."""
-        raw = Path(user_path or ".").expanduser()
-        return (raw if raw.is_absolute() else self.root / raw).resolve()
+        """Reads have the same boundary as writes (including linked paths)."""
+        return self._resolve(user_path)
+
+    def _writable_target(self, path: str) -> Path:
+        """Reject protected trees and existing links before modifying a file."""
+        target = self._resolve(path)
+        from session.session_store import resolve_state_dir
+        protected_roots = (resolve_state_dir(self.config).resolve(), Path(__file__).resolve().parents[1],
+                           Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve())
+        if any(target == root or target.is_relative_to(root) for root in protected_roots):
+            raise WorkspaceError("Agent 状态和运行时代码不可由文件工具修改。")
+        raw = Path(path)
+        candidate = raw if raw.is_absolute() else self.root / raw
+        if candidate.is_symlink() or (target.exists() and target.is_file() and target.stat().st_nlink > 1):
+            raise WorkspaceError("文件链接不可由文件工具修改。")
+        if target.exists() and not target.is_file():
+            raise WorkspaceError("不是文件。")
+        if not self._is_text_file(target):
+            raise WorkspaceError("只支持文本文件写入。")
+        return target
 
     def list_directory(self, path: str = ".") -> dict[str, Any]:
         directory = self._resolve(path)
@@ -83,7 +107,7 @@ class Workspace:
         )
 
     def _is_text_file(self, path: Path) -> bool:
-        return path.suffix.lower() in self.config.text_extensions
+        return path.name.casefold() == ".env" or path.suffix.lower() in self.config.text_extensions
 
     @staticmethod
     def _result_tokens(result: Mapping[str, Any]) -> int:
@@ -203,6 +227,8 @@ class Workspace:
             raise WorkspaceError(f"文件不存在: {_display_path(file_path, self.root)}")
         if not file_path.is_file():
             raise WorkspaceError(f"不是文件: {_display_path(file_path, self.root)}")
+        if file_path.stat().st_nlink > 1:
+            raise WorkspaceError("文件链接不可由文件工具读取。")
         if not self._is_text_file(file_path):
             raise WorkspaceError(f"第一阶段只支持文本文件: {file_path.suffix or '(无扩展名)'}")
         if start_line < 1 or (end_line is not None and end_line < start_line):
@@ -247,16 +273,10 @@ class Workspace:
 
     def edit(self, path: str, content: str, *, start_line: int | None = None, end_line: int | None = None,
              expected_hash: str | None = None, execution_context=None) -> dict[str, Any]:
-        target = self._resolve(path)
-        from session.session_store import resolve_state_dir
-        protected_roots = (resolve_state_dir(self.config).resolve(), Path(__file__).resolve().parents[1],
-                           Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve())
-        if any(target == root or target.is_relative_to(root) for root in protected_roots):
-            raise WorkspaceError("Agent 状态和运行时代码不可由文件工具修改；记忆只能通过 memory_manage 修改。")
+        target = self._writable_target(path)
         current_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
         if expected_hash is not None and expected_hash != current_hash:
             return failure("edit_conflict", "文件已改变，请重新读取后再编辑。", current_hash=current_hash)
-        if target.exists() and not target.is_file(): raise WorkspaceError("不是文件。")
         if target.exists() and not self._is_text_file(target): raise WorkspaceError("只支持文本文件编辑。")
         if start_line is None and end_line is not None: raise WorkspaceError("end_line 需要 start_line。")
         if start_line is None: updated = str(content)
@@ -268,6 +288,9 @@ class Workspace:
         def commit():
             # Recheck after preparing the edit, then atomically replace the file.
             import tempfile
+            # Recheck containment and links immediately before the atomic replacement.
+            if self._writable_target(path) != target:
+                raise WorkspaceError("目标路径已改变。")
             latest_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
             if latest_hash != current_hash:
                 return failure("edit_conflict", "文件在编辑期间改变。")
@@ -287,6 +310,11 @@ class Workspace:
             return execution_context.commit(commit) if execution_context else commit()
         except OSError as exc:
             raise WorkspaceError(f"写入文件失败: {exc}") from exc
+
+    def write(self, path: str, content: str, *, expected_hash: str | None = None,
+              execution_context=None) -> dict[str, Any]:
+        """Create or replace a complete text file, with optional optimistic concurrency."""
+        return self.edit(path, content, expected_hash=expected_hash, execution_context=execution_context)
 
     def bash(self, command: str, timeout: float = 10.0, execution_context=None) -> dict[str, Any]:
         from tools.shell_sandbox import start_shell

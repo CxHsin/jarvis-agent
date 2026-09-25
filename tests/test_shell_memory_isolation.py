@@ -1,13 +1,180 @@
 import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
 
 from agent.agent import Agent
+from tools.shell_sandbox import SandboxUnavailable, start_shell
 from tests.test_tool_runtime_acceptance import Client, answer, call, config, tool_results
+
+
+def _run_probe(workspace, protected, script, *, timeout=30):
+    """Run a real restricted process, never an unsandboxed subprocess fallback."""
+    probe = workspace / 'isolation-probe.py'
+    probe.write_text(script, encoding='utf-8')
+    with tempfile.TemporaryFile() as output:
+        shell = start_shell(f"python -I '{probe}'", workspace, protected, output)
+        try:
+            shell.start()
+            until = time.monotonic() + timeout
+            while shell.poll() is None:
+                assert time.monotonic() < until, 'Sandbox probe did not terminate'
+                time.sleep(0.02)
+            code = shell.poll()
+        finally:
+            shell.close()
+        output.seek(0)
+        assert code == 0, output.read().decode('utf-8', errors='replace')
+    return json.loads((workspace / 'probe-result.json').read_text(encoding='utf-8'))
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_shell_denies_outside_workspace_and_protected_state(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    secret = outside / 'secret.txt'
+    secret.write_text('outside-secret', encoding='utf-8')
+    protected = workspace / 'state'
+    protected.mkdir()
+    state_secret = protected / 'secret.txt'
+    state_secret.write_text('state-secret', encoding='utf-8')
+    script = '''import json
+from pathlib import Path
+outside = Path(%r)
+state = Path(%r)
+results = {}
+for name, path in [('outside', outside), ('state', state)]:
+    try:
+        results[name + '_read'] = path.read_text() == name + '-secret'
+    except OSError:
+        results[name + '_read'] = False
+    try:
+        path.write_text('modified')
+        results[name + '_write'] = True
+    except OSError:
+        results[name + '_write'] = False
+Path('allowed.txt').write_text('allowed')
+Path('probe-result.json').write_text(json.dumps(results))
+''' % (str(secret), str(state_secret))
+    result = _run_probe(workspace, protected, script)
+    assert result == {'outside_read': False, 'outside_write': False,
+                      'state_read': False, 'state_write': False}
+    assert secret.read_text() == 'outside-secret'
+    assert state_secret.read_text() == 'state-secret'
+    assert (workspace / 'allowed.txt').read_text() == 'allowed'
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_shell_cannot_connect_to_local_listener(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        listener.settimeout(0.2)
+        port = listener.getsockname()[1]
+        script = '''import json, socket
+from pathlib import Path
+connected = False
+try:
+    with socket.create_connection(('127.0.0.1', %d), timeout=2):
+        connected = True
+except OSError:
+    pass
+Path('probe-result.json').write_text(json.dumps({'connected': connected}))
+''' % port
+        result = _run_probe(workspace, tmp_path / 'state', script)
+        assert result == {'connected': False}
+        with pytest.raises(socket.timeout):
+            listener.accept()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_shell_cannot_connect_to_host_non_loopback_listener(tmp_path):
+    """Probe the host's LAN address without contacting an external service."""
+    addresses = sorted({item[4][0] for item in socket.getaddrinfo(socket.gethostname(), None,
+                                                                     socket.AF_INET, socket.SOCK_STREAM)
+                        if not item[4][0].startswith(('127.', '169.254.'))})
+    if not addresses:
+        pytest.skip('No host LAN address is available; non-loopback network boundary unverified')
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    with socket.socket() as listener:
+        try:
+            listener.bind((addresses[0], 0))
+        except OSError:
+            pytest.skip('Cannot bind a listener on the host LAN address')
+        listener.listen(1)
+        listener.settimeout(0.2)
+        host, port = listener.getsockname()
+        script = '''import json, socket
+from pathlib import Path
+connected = False
+try:
+    with socket.create_connection((%r, %d), timeout=2):
+        connected = True
+except OSError:
+    pass
+Path('probe-result.json').write_text(json.dumps({'connected': connected}))
+''' % (host, port)
+        assert _run_probe(workspace, tmp_path / 'state', script) == {'connected': False}
+        with pytest.raises(socket.timeout):
+            listener.accept()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_shell_rejects_workspace_reparse_point_before_execution(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'sentinel.txt').write_text('original')
+    try:
+        (workspace / 'alias').symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        result = subprocess.run(['cmd.exe', '/c', 'mklink', '/J', str(workspace / 'alias'), str(outside)],
+                                capture_output=True, text=True)
+        if result.returncode:
+            pytest.skip(f'Cannot create directory junction on this host: {result.stderr}')
+    with tempfile.TemporaryFile() as output:
+        with pytest.raises(SandboxUnavailable, match='reparse point'):
+            start_shell("[IO.File]::WriteAllText('ran.txt','bad')", workspace, tmp_path / 'state', output)
+    assert not (workspace / 'ran.txt').exists()
+    assert (outside / 'sentinel.txt').read_text() == 'original'
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_shell_rejects_workspace_hardlink_before_execution(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    outside = tmp_path / 'outside.txt'
+    outside.write_text('original')
+    os.link(outside, workspace / 'alias.txt')
+    with tempfile.TemporaryFile() as output:
+        with pytest.raises(SandboxUnavailable, match='hardlinked file'):
+            start_shell("[IO.File]::WriteAllText('alias.txt','bad')", workspace, tmp_path / 'state', output)
+    assert outside.read_text() == 'original'
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_shell_fails_closed_if_isolation_setup_fails(tmp_path, monkeypatch):
+    import tools.shell_sandbox as sandbox
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    def fail_verify(*args):
+        raise SandboxUnavailable('injected verification failure')
+    monkeypatch.setattr(sandbox, '_verify_tree', fail_verify)
+    with tempfile.TemporaryFile() as output:
+        with pytest.raises(SandboxUnavailable, match='injected verification failure'):
+            start_shell("[IO.File]::WriteAllText('ran.txt','bad')", workspace, tmp_path / 'state', output)
+    assert not (workspace / 'ran.txt').exists()
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
@@ -61,7 +228,7 @@ Path('probe-result.json').write_text(json.dumps(results))
             (tmp_path / 'progress.txt').read_text() if (tmp_path / 'progress.txt').exists() else 'not started')
         assert json.loads((tmp_path / 'probe-result.json').read_text()) == {
             'sql': 'denied', 'read': 'denied', 'rename': 'denied', 'create': 'denied'}
-        assert agent.store.memory.facts() == []
+        assert not (settings.state_dir / 'memory' / 'memory.db').exists()
     finally:
         agent.close()
 

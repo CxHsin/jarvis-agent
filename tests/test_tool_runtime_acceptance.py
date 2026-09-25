@@ -11,6 +11,7 @@ import pytest
 
 from agent.agent import Agent
 from configuration import Config
+from tools.definitions import TOOL_DEFINITIONS
 from tools.workspace import Workspace
 from unittest.mock import patch
 from tools.tool_runtime import (ToolMetadata, ToolRegistry, ToolRuntime, ToolDispatcher,
@@ -49,6 +50,21 @@ def tool_results(agent):
     return [json.loads(m["content"]) for m in agent.messages if m["role"] == "tool"]
 
 
+@pytest.mark.parametrize("tool_name", ["read", "write", "edit", "bash"])
+def test_injected_runtime_cannot_replace_builtin_handlers(tmp_path, tool_name):
+    """The four tool names must not conceal host-provided unsandboxed handlers."""
+    registry = ToolRegistry()
+    invoked = []
+    schema = next(item["function"] for item in TOOL_DEFINITIONS
+                  if item["function"]["name"] == tool_name)
+    registry.register(ToolMetadata(tool_name, "1", schema),
+                      lambda **kwargs: invoked.append(kwargs) or {"ok": True, "content": "secret"})
+    runtime = ToolRuntime(registry)
+    with pytest.raises(ValueError, match=tool_name):
+        Agent(config(tmp_path), Client(), tool_runtime=runtime)
+    assert invoked == []
+
+
 def test_registered_schema_cannot_change_through_returned_metadata():
     registry = ToolRegistry()
     metadata = ToolMetadata("echo", "1", {"name": "echo", "parameters": {
@@ -60,24 +76,20 @@ def test_registered_schema_cannot_change_through_returned_metadata():
     assert metadata.schema_fingerprint == fingerprint
 
 
-def test_agent_search_activates_dynamic_tool_and_next_task_rejects_it(tmp_path):
-    client = Client(answer(call("tool_search", {"query": "echo"})),
-                    answer(call("echo", {"text": "found"}, "c2")),
-                    {"content": "done"}, answer(call("echo", {"text": "stale"}, "c3")),
-                    {"content": "done"})
-    agent = Agent(config(tmp_path), client)
+def test_runtime_discovery_activates_dynamic_tool_only_for_current_task():
+    runtime = ToolRuntime(ToolRegistry())
     seen = []
-    agent.tool_registry.register(ToolMetadata("echo", "1", {"name": "echo", "parameters": {
+    runtime.register(ToolMetadata("echo", "1", {"name": "echo", "parameters": {
         "type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
         lambda text: seen.append(text) or {"ok": True, "text": text})
-    try:
-        agent.run_request("find echo")
-        agent.run_request("new task")
-        assert seen == ["found"]
-        assert tool_results(agent)[-1]["error"]["code"] == "inactive_tool"
-        assert client.requests[0][1] == client.requests[1][1]
-    finally:
-        agent.close()
+    runtime.begin_task("first")
+    assert [item["tool_id"] for item in runtime.discover("first", "echo")["tools"]] == ["echo"]
+    assert runtime.execute_model_call("first", "echo", {"text": "found"}) == {"ok": True, "text": "found"}
+    runtime.end_task("first")
+    runtime.begin_task("second")
+    assert seen == ["found"]
+    assert runtime.execute_model_call("second", "echo", {"text": "stale"})["error"]["code"] == "inactive_tool"
+    assert ("echo", "1") in runtime.history
 
 
 def test_agent_validates_argument_types_before_edit(tmp_path):
@@ -113,107 +125,87 @@ def test_registry_rejects_rebinding_handler_and_invalid_metadata():
         ToolMetadata("x", "1", {"name": "x", "parameters": {"type": "object", "$ref": "https://example.test/schema"}})
 
 
-@pytest.mark.parametrize("mode,confirmed,expected", [
-    ("approve-all", False, False), ("approve-all", True, True),
-    ("approve-dangerous", False, False), ("approve-dangerous", True, True),
-    ("broad-access", False, True),
-])
-def test_agent_permissions_gate_shell_before_side_effect(tmp_path, mode, confirmed, expected):
+@pytest.mark.parametrize("legacy_mode", ["approve-all", "approve-dangerous", "broad-access"])
+def test_legacy_permission_modes_cannot_gate_workspace_shell(tmp_path, legacy_mode):
     client = Client(answer(call("bash", {"command": "echo safe"})), {"content": "done"})
-    agent = Agent(config(tmp_path, tool_permission_mode=mode), client,
-                  confirm_tool=lambda metadata, args: confirmed)
+    agent = Agent(config(tmp_path, tool_permission_mode=legacy_mode), client,
+                  confirm_tool=lambda metadata, args: pytest.fail("legacy confirmation called"))
     try:
         with patch.object(Workspace, "bash", return_value={"ok": True}) as shell:
             agent.run_request("run")
-            assert bool(shell.call_count) == expected
-        assert tool_results(agent)[0]["ok"] == expected
-        audit = agent.store.load().audit
-        assert any(item.get("phase") == "finished" for item in audit)
-        assert all(item.get("policy_version") == 1 for item in audit)
+            shell.assert_called_once()
+        assert tool_results(agent)[0]["ok"]
+        assert any(item.get("phase") == "finished" for item in agent.store.load().audit)
     finally:
         agent.close()
 
 
-def test_policy_upgrade_requires_confirmation_and_revocation_survives_resume(tmp_path):
-    policy = PermissionPolicy("approve-all")
-    client = Client(answer(call("edit", {"path": "new.txt", "content": "text"})), {"content": "done"})
-    agent = Agent(config(tmp_path), client, permission_policy=policy)
+def test_revocation_survives_resume_without_legacy_mode_grants(tmp_path):
+    agent = Agent(config(tmp_path), Client(answer(call("write", {"path": "new.txt", "content": "text"})),
+                                          {"content": "done"}))
     session = agent.store.session_id
     try:
-        assert not policy.change_mode("broad-access")["ok"]
-        assert policy.mode == "approve-all"
-        assert policy.change_mode("broad-access", confirmed=True)["ok"]
-        policy.revoke()
+        agent.tool_runtime.policy.revoke()
         agent.run_request("write")
         assert tool_results(agent)[0]["error"]["code"] == "policy_revoked"
         assert not (tmp_path / "new.txt").exists()
-        assert {e.get("action") for e in agent.store.load().audit} >= {"upgrade_denied", "mode_changed", "revoked"}
+        assert any(e.get("action") == "revoked" for e in agent.store.load().audit)
     finally:
         agent.close()
     resumed = Agent(config(tmp_path, tool_permission_mode="broad-access"), Client({"content": "done"}), resume=session)
     try:
         assert resumed.tool_runtime.policy.revoked
-        assert resumed.tool_runtime.policy.version == policy.version
+        assert resumed.tool_runtime.policy.version == 2
     finally:
         resumed.close()
 
 
-def test_revocation_during_confirmation_blocks_execution(tmp_path):
-    policy = PermissionPolicy("approve-all")
-    def confirm(metadata, args):
-        policy.revoke()
-        return True
-    agent = Agent(config(tmp_path), Client(answer(call("edit", {"path": "x.txt", "content": "x"})),
-                                          {"content": "done"}), permission_policy=policy, confirm_tool=confirm)
+def test_revocation_blocks_write_before_execution(tmp_path):
+    policy = PermissionPolicy()
+    agent = Agent(config(tmp_path), Client(answer(call("write", {"path": "x.txt", "content": "x"})),
+                                          {"content": "done"}), permission_policy=policy)
     try:
+        policy.revoke()
         agent.run_request("write")
         assert not (tmp_path / "x.txt").exists()
-        assert tool_results(agent)[0]["error"]["code"] == "policy_changed"
+        assert tool_results(agent)[0]["error"]["code"] == "policy_revoked"
     finally:
         agent.close()
 
 
-def test_search_filters_denied_tools_and_keeps_history_across_resume(tmp_path):
+def test_search_filters_denied_tools_and_keeps_historical_definition():
     policy = PermissionPolicy(denied_tools=("hidden",))
-    agent = Agent(config(tmp_path), Client(answer(call("tool_search")), {"content": "done"}), permission_policy=policy)
-    register(agent, "visible", lambda: {"ok": True})
-    register(agent, "hidden", lambda: {"ok": True})
-    session = agent.store.session_id
-    try:
-        agent.run_request("discover")
-        definitions = tool_results(agent)[0]["tools"]
-        assert [d["tool_id"] for d in definitions] == ["visible"]
-        historical = deepcopy(agent.messages)
-        assert agent.tool_runtime.history[("visible", "1")]["schema"] == definitions[0]["schema"]
-    finally:
-        agent.close()
-    resumed = Agent(config(tmp_path), Client(answer(call("visible")), {"content": "done"}), resume=session)
-    register(resumed, "visible", lambda: pytest.fail("historical tool was reactivated"))
-    try:
-        assert resumed.messages == historical
-        assert ("visible", "1") in resumed.tool_runtime.history
-        resumed.run_request("new task")
-        assert tool_results(resumed)[-1]["error"]["code"] == "inactive_tool"
-    finally:
-        resumed.close()
+    runtime = ToolRuntime(ToolRegistry(), policy=policy)
+    for name in ("visible", "hidden"):
+        runtime.register(ToolMetadata(name, "1", {"name": name, "parameters": {"type": "object"}}), lambda: {"ok": True})
+    runtime.begin_task("first")
+    definitions = runtime.discover("first")["tools"]
+    assert [d["tool_id"] for d in definitions] == ["visible"]
+    history = deepcopy(runtime.history)
+    runtime.end_task("first")
+    restored = ToolRuntime(ToolRegistry(), policy=policy)
+    restored.register(ToolMetadata("visible", "1", definitions[0]["schema"]), lambda: pytest.fail("reactivated"))
+    restored.restore({"definitions": [dict(d) for d in history.values()]})
+    restored.begin_task("next")
+    assert restored.execute_model_call("next", "visible", {})["error"]["code"] == "inactive_tool"
+    assert ("visible", "1") in restored.history
 
 
-def test_agent_executes_independent_tools_concurrently(tmp_path):
+def test_runtime_executes_independent_tools_concurrently():
     barrier = Barrier(2)
     def work():
         barrier.wait(timeout=2)
         return {"ok": True}
-    client = Client(answer(call("tool_search", {"query": "parallel"})),
-                    answer(call("parallel_a", call_id="a"), call("parallel_b", call_id="b")), {"content": "done"})
-    agent = Agent(config(tmp_path), client)
-    register(agent, "parallel_a", work, concurrency="parallel")
-    register(agent, "parallel_b", work, concurrency="parallel")
-    try:
-        agent.run_request("parallel")
-        assert all(item["ok"] for item in tool_results(agent))
-        assert [m["tool_call_id"] for m in agent.messages if m["role"] == "tool"] == ["c1", "a", "b"]
-    finally:
-        agent.close()
+    runtime = ToolRuntime(ToolRegistry(), stable=(("parallel_a", "1"), ("parallel_b", "1")))
+    for name in ("parallel_a", "parallel_b"):
+        runtime.register(ToolMetadata(name, "1", {"name": name, "parameters": {"type": "object"}},
+                                      concurrency="parallel"), work)
+    runtime.begin_task("parallel")
+    results = []
+    runtime.execute_batch("parallel", [call("parallel_a", call_id="a"), call("parallel_b", call_id="b")],
+                          lambda raw, result: results.append((raw.call_id, result)))
+    assert [cid for cid, _ in results] == ["a", "b"]
+    assert all(item["ok"] for _, item in results)
 
 
 def test_same_file_edits_detect_stale_second_write(tmp_path):
@@ -332,18 +324,17 @@ def test_agent_native_fallback_is_persistent_and_discards_partial_changes(tmp_pa
         resumed.close()
 
 
-def test_agent_native_adapter_receives_active_definitions(tmp_path):
+def test_agent_native_adapter_receives_only_four_public_definitions(tmp_path):
     received = []
     def native(client, messages, tools, dynamic, choice):
-        received.append(dynamic)
+        received.append((tools, dynamic))
         return client.complete(messages, tools, choice)
-    agent = Agent(config(tmp_path, provider_tool_mode="native"),
-                  Client(answer(call("tool_search", {"query": "native_tool"})), {"content": "done"}),
-                  native_loader=native)
+    agent = Agent(config(tmp_path, provider_tool_mode="native"), Client({"content": "done"}), native_loader=native)
     register(agent, "native_tool", lambda: "value")
     try:
         agent.run_request("discover")
-        assert any(item["tool_id"] == "native_tool" for item in received[1])
+        assert [item["function"]["name"] for item in received[0][0]] == ["read", "write", "edit", "bash"]
+        assert all(not dynamic for _, dynamic in received)
         assert agent.provider_session.mode == "native"
     finally:
         agent.close()
@@ -370,25 +361,21 @@ def test_model_failure_after_effect_preserves_audit_and_does_not_replay(tmp_path
         resumed.close()
 
 
-def test_compaction_restores_active_schemas_without_changing_stable_prefix(tmp_path):
+def test_compaction_preserves_four_tool_prefix(tmp_path):
     def compact_and_call():
         assert agent.compact_now(keep_tokens=1).compacted
-        return answer(call("echo", {"text": "after compaction"}, "c3"))
-    client = Client(answer(call("tool_search", {"query": "echo"})),
-                    answer(call("echo", {"text": "before compaction"}, "c2")),
-                    compact_and_call, {"content": "done"})
-    compressor = Client({"content": "<context_summary>Used echo; original tool definitions are archived.</context_summary>"})
+        return answer(call("read", {"path": "note.md"}, "c3"))
+    (tmp_path / "note.md").write_text("after compaction", encoding="utf-8")
+    client = Client(answer(call("read", {"path": "note.md"}, "c2")), compact_and_call, {"content": "done"})
+    compressor = Client({"content": "<context_summary>Read note; tool result archived.</context_summary>"})
     agent = Agent(config(tmp_path), client, compression_client=compressor)
-    register(agent, "echo", lambda text: {"ok": True, "text": text}, parameters={
-        "type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]})
     fingerprint = agent.tool_runtime.stable_fingerprint()
     try:
-        agent.run_request("echo twice")
-        assert tool_results(agent)[-1]["text"] == "after compaction"
+        agent.run_request("read twice")
+        assert tool_results(agent)[-1]["ok"]
         assert agent.tool_runtime.stable_fingerprint() == fingerprint
         assert all(request[1] == client.requests[0][1] for request in client.requests)
-        assert any(m["role"] == "system" and m["content"].startswith("Active tool definitions:")
-                   for m in client.requests[-1][0])
+        assert [tool["function"]["name"] for tool in client.requests[0][1]] == ["read", "write", "edit", "bash"]
         for request, _, _ in client.requests:
             calls = {c["id"] for m in request for c in m.get("tool_calls", [])}
             replies = {m["tool_call_id"] for m in request if m["role"] == "tool"}
@@ -398,23 +385,19 @@ def test_compaction_restores_active_schemas_without_changing_stable_prefix(tmp_p
         agent.close()
 
 
-def test_resume_rejects_changed_schema_under_historical_version(tmp_path):
-    agent = Agent(config(tmp_path), Client(answer(call("tool_search", {"query": "dynamic"})), {"content": "done"}))
-    register(agent, "dynamic", lambda: {"ok": True})
-    session = agent.store.session_id
-    try:
-        agent.run_request("discover")
-    finally:
-        agent.close()
-    resumed = Agent(config(tmp_path), Client(answer(call("tool_search", {"query": "dynamic"})),
-                                            answer(call("dynamic", call_id="c2")), {"content": "done"}), resume=session)
-    register(resumed, "dynamic", lambda **kw: pytest.fail("changed schema executed"),
-             parameters={"type": "object", "properties": {"new": {"type": "string"}}})
-    try:
-        resumed.run_request("discover again")
-        assert tool_results(resumed)[-1]["error"]["code"] == "schema_mismatch"
-    finally:
-        resumed.close()
+def test_runtime_rejects_changed_schema_under_historical_version():
+    runtime = ToolRuntime(ToolRegistry())
+    runtime.register(ToolMetadata("dynamic", "1", {"name": "dynamic", "parameters": {"type": "object"}}), lambda: True)
+    runtime.begin_task("old")
+    runtime.discover("old", "dynamic")
+    snapshot = runtime.snapshot()
+    restored = ToolRuntime(ToolRegistry())
+    restored.restore(snapshot)
+    restored.register(ToolMetadata("dynamic", "1", {"name": "dynamic", "parameters": {
+        "type": "object", "properties": {"new": {"type": "string"}}}}), lambda **kw: pytest.fail("executed"))
+    restored.begin_task("new")
+    restored.discover("new", "dynamic")
+    assert restored.execute_model_call("new", "dynamic", {})["error"]["code"] == "schema_mismatch"
 
 
 def test_fallback_survives_model_failure_and_request_rollback(tmp_path):
@@ -433,46 +416,46 @@ def test_fallback_survives_model_failure_and_request_rollback(tmp_path):
 
 def test_cancelled_batch_keeps_tool_pairing_and_audits(tmp_path):
     cancelled = Event()
-    client = Client(answer(call("tool_search", {"query": "cancel"})),
-                    answer(call("cancel_first", call_id="a"), call("cancel_next", call_id="b")))
-    agent = Agent(config(tmp_path), client)
-    def stop():
+    def stop(*args, **kwargs):
         cancelled.set()
         raise KeyboardInterrupt
-    register(agent, "cancel_first", stop)
-    register(agent, "cancel_next", lambda: pytest.fail("cancelled tool executed"))
-    session_id = agent.store.session_id
-    try:
-        assert agent.run_request("cancel") is None
-        assert cancelled.is_set()
-        assert all(result["cancelled"] for result in tool_results(agent)[1:])
-        calls = {c["id"] for m in agent.messages for c in m.get("tool_calls", [])}
-        replies = {m["tool_call_id"] for m in agent.messages if m["role"] == "tool"}
-        assert calls == replies
-        assert any(e.get("error", {}).get("code") == "cancelled" for e in agent.store.load().audit
-                   if isinstance(e.get("error"), dict))
-    finally:
-        agent.close()
+    client = Client(answer(call("read", {"path": "first.txt"}, call_id="a"),
+                           call("read", {"path": "next.txt"}, call_id="b")))
+    with patch.object(Workspace, "read", side_effect=stop):
+        agent = Agent(config(tmp_path), client)
+        session_id = agent.store.session_id
+        try:
+            assert agent.run_request("cancel") is None
+            assert cancelled.is_set()
+            assert all(result["cancelled"] for result in tool_results(agent))
+            calls = {c["id"] for m in agent.messages for c in m.get("tool_calls", [])}
+            replies = {m["tool_call_id"] for m in agent.messages if m["role"] == "tool"}
+            assert calls == replies
+            assert any(e.get("error", {}).get("code") == "cancelled" for e in agent.store.load().audit
+                       if isinstance(e.get("error"), dict))
+        finally:
+            agent.close()
     resumed = Agent(config(tmp_path), Client(), resume=session_id)
     try:
         restored_calls = {c["id"] for m in resumed.messages for c in m.get("tool_calls", [])}
         restored_replies = {m["tool_call_id"] for m in resumed.messages if m["role"] == "tool"}
         assert restored_calls == restored_replies == calls
-        assert all(result["cancelled"] for result in tool_results(resumed)[1:])
+        assert all(result["cancelled"] for result in tool_results(resumed))
     finally:
         resumed.close()
 
 
-def test_session_policy_cannot_be_widened_by_restart_config(tmp_path):
-    agent = Agent(config(tmp_path, tool_permission_mode="approve-all"), Client({"content": "done"}))
+def test_session_revocation_cannot_be_widened_by_restart_config(tmp_path):
+    agent = Agent(config(tmp_path), Client({"content": "done"}))
     session = agent.store.session_id
     try:
+        agent.tool_runtime.policy.revoke()
         agent.run_request("hello")
     finally:
         agent.close()
     resumed = Agent(config(tmp_path, tool_permission_mode="broad-access"), Client(), resume=session)
     try:
-        assert resumed.tool_runtime.policy.mode == "approve-all"
+        assert resumed.tool_runtime.policy.revoked
     finally:
         resumed.close()
 
@@ -507,57 +490,51 @@ def test_read_hash_matches_exact_content_and_prevents_stale_edit(tmp_path):
     assert target.read_text() == "external update"
 
 
-def test_cancel_during_confirmation_does_not_start_workers(tmp_path):
-    def confirm(*args):
-        raise KeyboardInterrupt
-    agent = Agent(config(tmp_path, tool_permission_mode="approve-all"),
-                  Client(answer(call("edit", {"path": "x.txt", "content": "x"}))), confirm_tool=confirm)
+def test_revoked_write_does_not_start_workers(tmp_path):
+    agent = Agent(config(tmp_path), Client(answer(call("write", {"path": "x.txt", "content": "x"})),
+                                          {"content": "done"}))
     try:
-        assert agent.run_request("write") is None
-        assert tool_results(agent)[0]["cancelled"]
+        agent.tool_runtime.policy.revoke()
+        assert agent.run_request("write") == "done"
+        assert tool_results(agent)[0]["error"]["code"] == "policy_revoked"
         assert not (tmp_path / "x.txt").exists()
         assert not any(e.get("phase") == "started" for e in agent.store.load().audit)
     finally:
         agent.close()
 
 
-def test_request_rollback_preserves_permission_audit(tmp_path):
-    policy = PermissionPolicy("approve-all")
-    def confirm(*args):
-        policy.revoke()
-        return False
+def test_failed_request_after_denied_write_preserves_revocation_audit(tmp_path):
+    policy = PermissionPolicy()
     agent = Agent(config(tmp_path),
-                  Client(answer(call("edit", {"path": "x.txt", "content": "x"})), ModelRequestError("failed")),
-                  permission_policy=policy, confirm_tool=confirm)
+                  Client(answer(call("write", {"path": "x.txt", "content": "x"})), ModelRequestError("failed")),
+                  permission_policy=policy)
     try:
+        policy.revoke()
         assert agent.run_request("write") is None
         contents = agent.store.load()
         assert contents.messages == []
+        assert any(e.get("error", {}).get("code") == "policy_revoked" for e in contents.audit
+                   if isinstance(e.get("error"), dict))
         assert contents.runtime["policy"]["revoked"]
         assert any(e.get("action") == "revoked" for e in contents.audit)
         assert not (tmp_path / "x.txt").exists()
     finally:
         agent.close()
 
-def test_agent_preserves_injected_runtime_confirmation(tmp_path):
+
+def test_runtime_preserves_injected_confirmation():
     registry = ToolRegistry()
     seen = []
     registry.register(ToolMetadata("host_write", "1", {"name": "host_write", "parameters": {
         "type": "object"}}, side_effects=("host",)), lambda: seen.append("write") or "saved")
-    runtime = ToolRuntime(registry, stable=(("host_write", "1"),),
-                          policy=PermissionPolicy("approve-all"), confirm=lambda metadata, args: True)
-    agent = Agent(config(tmp_path), Client(answer(call("host_write")), {"content": "done"}),
-                  tool_runtime=runtime)
-    try:
-        assert agent.run_request("write") == "done"
-        assert seen == ["write"]
-        assert tool_results(agent) == [{"ok": True, "value": "saved"}]
-        assert any(e.get("phase") == "confirmation" and e["confirmed"]
-                   for e in agent.store.load().audit)
-    finally:
-        agent.close()
+    runtime = ToolRuntime(registry, stable=(("host_write", "1"),), confirm=lambda metadata, args: True)
+    runtime.begin_task("host")
+    assert runtime.execute_model_call("host", "host_write", {}) == {"ok": True, "value": "saved"}
+    assert seen == ["write"]
+    assert any(e.get("phase") == "finished" for e in runtime.dispatcher.audit)
 
-def test_agent_preserves_host_resource_resolution(tmp_path):
+
+def test_runtime_preserves_host_resource_resolution():
     registry = ToolRegistry()
     seen = []
     registry.register(ToolMetadata("host", "1", {"name": "host", "parameters": {
@@ -565,16 +542,14 @@ def test_agent_preserves_host_resource_resolution(tmp_path):
     def resources(metadata, arguments):
         raise ValueError("host resource unavailable")
     runtime = ToolRuntime(registry, stable=(("host", "1"),), resource_resolver=resources)
-    agent = Agent(config(tmp_path), Client(answer(call("host")), {"content": "done"}), tool_runtime=runtime)
-    try:
-        agent.run_request("use host")
-        assert seen == []
-        assert tool_results(agent)[0]["error"]["code"] == "invalid_arguments"
-        assert "host resource unavailable" in tool_results(agent)[0]["error"]["message"]
-    finally:
-        agent.close()
+    runtime.begin_task("host")
+    result = runtime.execute_model_call("host", "host", {})
+    assert seen == []
+    assert result["error"]["code"] == "invalid_arguments"
+    assert "host resource unavailable" in result["error"]["message"]
 
-def test_agent_timeout_keeps_host_resource_and_unknown_audit_on_restore(tmp_path):
+
+def test_runtime_timeout_keeps_host_resource_and_unknown_audit():
     release, finished = Event(), Event()
     seen = []
     def slow():
@@ -589,31 +564,22 @@ def test_agent_timeout_keeps_host_resource_and_unknown_audit_on_restore(tmp_path
         runtime.register(ToolMetadata(name, "1", {"name": name, "parameters": {"type": "object"}},
                          timeout=0.03, resources=("host-file",), side_effects=("write",),
                          concurrency="parallel"), handler)
-    agent = Agent(config(tmp_path), Client(answer(call("slow", call_id="slow")),
-                  answer(call("next", call_id="next")), {"content": "done"}), tool_runtime=runtime)
-    session = agent.store.session_id
+    runtime.begin_task("run")
     try:
-        agent.run_request("run")
-        results = tool_results(agent)
-        assert results[0]["error"]["code"] == "timeout"
-        assert results[0]["uncertain"] is True
-        assert results[1]["error"]["code"] == "resource_conflict"
+        first = runtime.execute_model_call("run", "slow", {}, call_id="slow")
+        second = runtime.execute_model_call("run", "next", {}, call_id="next")
+        assert first["error"]["code"] == "timeout"
+        assert first["uncertain"] is True
+        assert second["error"]["code"] == "resource_conflict"
         assert seen == []
+        assert any(e.get("call_id") == "slow" and e.get("uncertain") for e in runtime.dispatcher.audit)
     finally:
         release.set()
         assert finished.wait(2)
-        agent.close()
-    resumed = Agent(config(tmp_path), Client({"content": "restored"}), resume=session)
-    try:
-        assert tool_results(resumed) == results
-        assert any(e.get("call_id") == "slow" and e.get("uncertain")
-                   for e in resumed.store.load().audit)
-        assert seen == ["slow"]
-    finally:
-        resumed.close()
+    assert seen == ["slow"]
 
 
-def test_agent_records_parallel_results_and_references_deterministically(tmp_path):
+def test_runtime_records_parallel_results_and_references_deterministically():
     second_finished = Event()
     def first():
         assert second_finished.wait(2)
@@ -630,21 +596,10 @@ def test_agent_records_parallel_results_and_references_deterministically(tmp_pat
     ):
         runtime.register(ToolMetadata(name, "1", {"name": name, "parameters": parameters},
                                       concurrency="parallel"), handler)
-    client = Client(answer(call("first", call_id="a"), call("second", call_id="b"),
-                    call("join", {"text": {"$result": {"call_id": "a", "path": ["value"]}}}, "c")),
-                    {"content": "done"})
-    agent = Agent(config(tmp_path), client, tool_runtime=runtime)
-    session = agent.store.session_id
-    try:
-        agent.run_request("parallel dependencies")
-        messages = [m for m in client.requests[-1][0] if m["role"] == "tool"]
-        assert [m["tool_call_id"] for m in messages] == ["a", "b", "c"]
-        assert [json.loads(m["content"]) for m in messages] == [
-            {"ok": True, "value": "first"}, {"text": "second"}, {"text": "first"}]
-    finally:
-        agent.close()
-    resumed = Agent(config(tmp_path), Client({"content": "done"}), resume=session)
-    try:
-        assert [m for m in resumed.messages if m["role"] == "tool"] == messages
-    finally:
-        resumed.close()
+    runtime.begin_task("parallel")
+    results = []
+    runtime.execute_batch("parallel", [call("first", call_id="a"), call("second", call_id="b"),
+        call("join", {"text": {"$result": {"call_id": "a", "path": ["value"]}}}, "c")],
+        lambda item, result: results.append((item.call_id, result)))
+    assert results == [("a", {"ok": True, "value": "first"}), ("b", {"text": "second"}),
+                       ("c", {"text": "first"})]

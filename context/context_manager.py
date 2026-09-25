@@ -63,6 +63,13 @@ class ContextManager:
         self.compaction_failures = 0
         self.compactor = CompactionService(config, recorder)
 
+    def select_messages(self, store: Any, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project the committed event stream into the next task's visible history."""
+        selected = store.context_messages()
+        if selected != messages[1:]:
+            store.record_recent_context(selected)
+        return selected
+
     def begin_task(self, goal: str) -> None:
         self.task_number += 1
         self.current_task = {

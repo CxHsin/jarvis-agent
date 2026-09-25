@@ -6,7 +6,7 @@ import pytest
 from tools import workspace
 
 
-@pytest.mark.parametrize("relative", ["agent/agent.py", "memory/memory_service.py", "configuration.py"])
+@pytest.mark.parametrize("relative", ["agent/agent.py", "context/context_projection.py", "configuration.py"])
 def test_edit_protects_runtime_files_outside_tools(tmp_path, monkeypatch, relative):
     project = tmp_path / "runtime"
     target = project / relative

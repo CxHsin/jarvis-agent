@@ -1,11 +1,9 @@
-"""Validated, restartable imports; legacy evidence and Memory DB stay intact."""
+"""Validated, restartable legacy session imports; original events stay intact."""
 
 import json
 import os
-import sqlite3
 import sys
 import uuid
-from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,41 +39,6 @@ def _publish(path, data):
 
 def _encode(value):
     return (json.dumps(value, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8')
-
-
-def _backup_database(source_path, target_path):
-    with closing(sqlite3.connect(source_path)) as source, closing(sqlite3.connect(target_path)) as target:
-        source.backup(target)
-    with target_path.open('r+b') as handle:
-        os.fsync(handle.fileno())
-
-
-def protect_legacy_memory(config):
-    """Capture existing personal state before MemoryService can recover/publish it."""
-    from session.session_store import _first_record, _SessionLock, resolve_state_dir
-    state = resolve_state_dir(config)
-    if not any((_first_record(path) or {}).get('version', 1) == 1
-               for path in (state / 'sessions').glob('*/*.jsonl')):
-        return
-    database = state / 'memory' / 'memory.db'
-    if not database.exists():
-        return
-    destination = state / 'migrations' / 'legacy-memory'
-    lock = _SessionLock(destination.parent / 'legacy-memory.lock')
-    lock.acquire()
-    try:
-        if destination.exists():
-            return
-        staging = destination.with_suffix('.tmp')
-        staging.mkdir(parents=True, exist_ok=True)
-        _backup_database(database, staging / 'memory.db')
-        for name in ('memory.md', 'self.md'):
-            path = database.parent / name
-            if path.exists():
-                _write(staging / name, path.read_bytes())
-        os.replace(staging, destination)
-    finally:
-        lock.release()
 
 
 def _sources(path):
@@ -151,36 +114,6 @@ def _convert(store, original, trajectory):
     return events, dict(version=1, sources=mapping, warnings=warnings, conflicts=conflicts)
 
 
-def _validate_memory_sources(database, report):
-    if not database.exists():
-        return
-    available = {(item['source']['path'], item['source']['task_id'], item['source']['event_id'])
-                 for item in report['sources']}
-    imported_paths = {item[0] for item in available}
-    with closing(sqlite3.connect(database)) as db:
-        db.row_factory = sqlite3.Row
-        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for table in ('fact_sources', 'pending_sources', 'pending_batches'):
-            if table not in tables:
-                continue
-            for row in db.execute(f'SELECT * FROM {table}'):
-                path = row['trajectory_path']
-                if not path:  # User operations/profile edits are evidence in their own right.
-                    continue
-                identifiers = json.loads(row['source_event_ids']) if table == 'pending_batches' else [row['source_event_id']]
-                for identity in identifiers:
-                    if path in imported_paths:
-                        resolved = (path, row['source_task_id'], identity) in available
-                    else:
-                        # Other sessions remain at their original locations; do
-                        # not rewrite their references during this session import.
-                        resolved = Path(path).is_file()
-                    if not resolved:
-                        report['conflicts'].append(dict(reason='unresolved_memory_source', table=table,
-                            path=path, task_id=row['source_task_id'], event_id=identity,
-                            resolution='original_reference_and_fact_preserved'))
-
-
 def _validate(store, original, candidate, events):
     from session.session_store import SessionStore
     recovered = []
@@ -207,7 +140,7 @@ def migrate(store):
         return canonical
     directory = migration_directory(original)
     directory.mkdir(parents=True, exist_ok=True)
-    trajectory = store.memory_directory / 'trajectories' / original.name
+    trajectory = store._legacy_trajectory_dir / original.name
     backup = directory / 'backup'
     if not backup.exists():
         staging = directory / 'backup.tmp'
@@ -215,9 +148,6 @@ def migrate(store):
         _write(staging / 'session.jsonl', original.read_bytes())
         if trajectory.exists():
             _write(staging / 'trajectory.jsonl', trajectory.read_bytes())
-        database = store.memory_directory / 'memory.db'
-        if database.exists():
-            _backup_database(database, staging / 'memory.db')
         os.replace(staging, backup)
     if original.read_bytes() != (backup / 'session.jsonl').read_bytes():
         raise ValueError('旧会话在迁移期间发生变化；保留备份，拒绝切换。')
@@ -228,7 +158,6 @@ def migrate(store):
     candidate = directory / 'events.jsonl'
     _publish(candidate, b''.join(_encode(event) for event in events))
     _validate(store, original, candidate, events)
-    _validate_memory_sources(backup / 'memory.db', report)
     _publish(directory / 'committed.json', _encode(report))
     for notice in report['warnings'] + [str(conflict) for conflict in report['conflicts']]:
         print(f'[会话迁移] {notice}', file=sys.stderr)
