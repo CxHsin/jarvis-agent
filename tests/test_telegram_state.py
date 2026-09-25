@@ -26,6 +26,147 @@ class TelegramStateTests(unittest.TestCase):
         with SessionStore.create(config or self.config) as store:
             return store.session_id
 
+    def test_claim_binds_session_deduplicates_and_advances_offset_together(self):
+        with TelegramState(self.config) as state:
+            first = state.claim(11, 42, 12345)
+            self.assertTrue(first.is_new)
+            self.assertEqual(state.offset, 12)
+            self.assertEqual(state.session_id(12345), first.session_id)
+            duplicate = state.claim(12, 42, 12345)
+            self.assertFalse(duplicate.is_new)
+            self.assertEqual(duplicate.session_id, first.session_id)
+            self.assertEqual(state.offset, 13)
+        with TelegramState(self.config) as state:
+            self.assertFalse(state.claim(11, 42, 12345).is_new)
+            self.assertEqual(state.offset, 13)
+        self.assertEqual(len(SessionStore.list_sessions(self.config)), 1)
+
+    def test_failed_first_claim_leaves_only_an_unbound_empty_session(self):
+        with TelegramState(self.config) as state:
+            with patch.object(state, "_commit", side_effect=OSError("injected crash")):
+                with self.assertRaises(OSError):
+                    state.claim(11, 42, 12345)
+            self.assertEqual(state.offset, 0)
+            self.assertIsNone(state.session_id(12345))
+            first_session = SessionStore.list_sessions(self.config)[0].id
+            claimed = state.claim(11, 42, 12345)
+            self.assertNotEqual(claimed.session_id, first_session)
+            self.assertEqual(state.offset, 12)
+
+    def test_delivery_records_start_and_result_before_actions_and_notification(self):
+        sent = []
+        with TelegramState(self.config) as state:
+            inbound = state.claim(11, 42, 12345)
+            def execute(session_id):
+                self.assertEqual(session_id, inbound.session_id)
+                self.assertEqual(state.claim(11, 42, 12345).status, "started")
+                return "completed", "answer"
+            def send(chat_id, reply):
+                self.assertEqual(state.claim(11, 42, 12345).status, "completed")
+                sent.append((chat_id, reply))
+                return True
+            state.deliver(inbound.update_id, execute, send, "unknown")
+            self.assertEqual(sent, [(12345, "answer")])
+            self.assertEqual(state.pending_delivery(), [])
+        with TelegramState(self.config) as state:
+            self.assertEqual(state.pending_delivery(), [])
+            self.assertEqual(state.pending_unknown(), [])
+
+    def test_failed_delivery_reports_unknown_once_after_restart(self):
+        with TelegramState(self.config) as state:
+            inbound = state.claim(11, 42, 12345)
+            state.deliver(inbound.update_id, lambda _: (_ for _ in ()).throw(RuntimeError("failed")),
+                          lambda *_: False, "execution unknown")
+        sent = []
+        with TelegramState(self.config) as state:
+            state.notify_pending(lambda chat, reply: sent.append((chat, reply)) or True,
+                                 "check unknown", "check completed")
+            self.assertEqual(sent, [(12345, "check unknown")])
+        with TelegramState(self.config) as state:
+            state.notify_pending(lambda chat, reply: sent.append((chat, reply)) or True,
+                                 "check unknown", "check completed")
+            self.assertEqual(sent, [(12345, "check unknown")])
+
+    def test_completed_answer_is_not_resent_when_delivery_was_uncertain(self):
+        with TelegramState(self.config) as state:
+            inbound = state.claim(11, 42, 12345)
+            state.deliver(inbound.update_id, lambda _: ("completed", "original answer"),
+                          lambda *_: False, "unknown")
+        sent = []
+        with TelegramState(self.config) as state:
+            state.notify_pending(lambda chat, reply: sent.append(reply) or True,
+                                 "check unknown", "check completed")
+        self.assertEqual(sent, ["check completed"])
+
+    def test_failed_start_commit_prevents_execution_and_recovers_unknown(self):
+        executed = []
+        with TelegramState(self.config) as state:
+            inbound = state.claim(11, 42, 12345)
+            with patch.object(state, "_commit", side_effect=OSError("injected crash")):
+                with self.assertRaises(OSError):
+                    state.deliver(inbound.update_id,
+                                  lambda _: executed.append(True) or ("completed", "answer"),
+                                  lambda *_: True, "unknown")
+            self.assertEqual(executed, [])
+        with TelegramState(self.config) as state:
+            self.assertFalse(state.claim(11, 42, 12345).is_new)
+            self.assertEqual(len(state.pending_unknown()), 1)
+
+    def test_unknown_immediate_notification_is_not_repeated(self):
+        sent = []
+        with TelegramState(self.config) as state:
+            inbound = state.claim(11, 42, 12345)
+            state.deliver(inbound.update_id, lambda _: ("unknown", "check now"),
+                          lambda _chat, reply: sent.append(reply) or True, "unknown")
+        with TelegramState(self.config) as state:
+            state.notify_pending(lambda _chat, reply: sent.append(reply) or True,
+                                 "check again", "check completed")
+            self.assertEqual(sent, ["check now"])
+
+    def test_failed_result_commit_does_not_send_or_reexecute_after_restart(self):
+        executions, sent = [], []
+        with TelegramState(self.config) as state:
+            inbound = state.claim(11, 42, 12345)
+            original_commit = state._commit
+            def fail_after_execution(data):
+                if data["updates"]["11"]["status"] == "completed":
+                    raise OSError("result commit failed")
+                original_commit(data)
+            with patch.object(state, "_commit", side_effect=fail_after_execution):
+                with self.assertRaises(OSError):
+                    state.deliver(inbound.update_id,
+                                  lambda _: executions.append(True) or ("completed", "answer"),
+                                  lambda _chat, reply: sent.append(reply) or True, "unknown")
+            self.assertEqual(executions, [True])
+            self.assertEqual(sent, [])
+        with TelegramState(self.config) as state:
+            self.assertFalse(state.claim(11, 42, 12345).is_new)
+            state.notify_pending(lambda _chat, reply: sent.append(reply) or True,
+                                 "check unknown", "check completed")
+            self.assertEqual(sent, ["check unknown"])
+
+    def test_sent_answer_with_failed_notification_commit_is_not_reexecuted(self):
+        executions, sent = [], []
+        with TelegramState(self.config) as state:
+            inbound = state.claim(11, 42, 12345)
+            original_commit = state._commit
+            def fail_notification(data):
+                if data["updates"]["11"].get("notified"):
+                    raise OSError("notification commit failed")
+                original_commit(data)
+            with patch.object(state, "_commit", side_effect=fail_notification):
+                with self.assertRaises(OSError):
+                    state.deliver(inbound.update_id,
+                                  lambda _: executions.append(True) or ("completed", "answer"),
+                                  lambda _chat, reply: sent.append(reply) or True, "unknown")
+            self.assertEqual(sent, ["answer"])
+        with TelegramState(self.config) as state:
+            self.assertFalse(state.claim(11, 42, 12345).is_new)
+            state.notify_pending(lambda _chat, reply: sent.append(reply) or True,
+                                 "check unknown", "check completed")
+            self.assertEqual(executions, [True])
+            self.assertEqual(sent, ["answer", "check completed"])
+
     def test_workspace_binding_survives_restart_and_does_not_change_session_listing(self):
         first = self.make_session()
         with TelegramState(self.config) as state:

@@ -1,8 +1,8 @@
-"""Durable Telegram channel state, separate from the session event log.
+"""Durable Telegram delivery coordinator, separate from the session event log.
 
-The caller owns polling and delivery.  It must persist an inbound identity before
-advancing Telegram's offset, and must not execute a duplicate or an unknown task.
-This store never replays work or sends messages on its own.
+The caller owns filtering, polling, queueing and transport. This module commits
+delivery identity with the offset, then orders execution and notification around
+durable state transitions. It never replays work or stores message text.
 """
 
 from __future__ import annotations
@@ -113,6 +113,7 @@ class TelegramState:
                         or any(type(entry.get(field)) is not int for field in ("chat_id", "message_id"))
                         or not isinstance(entry.get("session_id"), str)
                         or entry.get("status") not in ("received", "started", "completed", "unknown")
+                        or entry.get("kind", "task") not in ("task", "control")
                         or type(entry.get("notified", False)) is not bool):
                     raise ValueError("invalid inbound identity")
             return data
@@ -183,6 +184,46 @@ class TelegramState:
     def offset(self) -> int:
         self._require_open()
         return self._data["offset"]
+
+    @synchronized
+    def claim(self, update_id: int, message_id: int, chat_id: int,
+              *, kind: str = "task") -> Inbound:
+        """Durably claim one delivery and its polling offset in one commit."""
+        key = self._check_chat(chat_id)
+        if (type(update_id) is not int or update_id < 0
+                or type(message_id) is not int or message_id <= 0):
+            raise ValueError("invalid Telegram update/message ID")
+        if kind not in {"task", "control"}:
+            raise ValueError("invalid channel delivery kind")
+        self._require_open()
+        updates = self._data["updates"]
+        existing = updates.get(str(update_id))
+        if existing is not None:
+            if (existing["chat_id"], existing["message_id"]) != (chat_id, message_id):
+                raise TelegramStateError("Conflicting update identity")
+            if update_id + 1 > self.offset:
+                self._change(lambda data: data.__setitem__("offset", update_id + 1))
+            return Inbound(update_id, chat_id, message_id, existing["session_id"], existing["status"])
+        duplicate = next((entry for entry in updates.values()
+                          if (entry["chat_id"], entry["message_id"]) == (chat_id, message_id)), None)
+        if duplicate is not None:
+            def record_alias(data):
+                data["updates"][str(update_id)] = dict(duplicate)
+                data["offset"] = max(data["offset"], update_id + 1)
+            self._change(record_alias)
+            return Inbound(update_id, chat_id, message_id, duplicate["session_id"], duplicate["status"])
+        session_id = self._data["bindings"].get(key)
+        if session_id is None:
+            with SessionStore.create(self.config) as store:
+                session_id = store.session_id
+        entry = {"chat_id": chat_id, "message_id": message_id,
+                 "session_id": session_id, "status": "received", "kind": kind}
+        def record_claim(data):
+            data["bindings"][key] = session_id
+            data["updates"][str(update_id)] = entry
+            data["offset"] = max(data["offset"], update_id + 1)
+        self._change(record_claim)
+        return Inbound(update_id, chat_id, message_id, session_id, "received", is_new=True)
 
     @synchronized
     def receive(self, update_id: int, message_id: int, chat_id: int) -> bool:
@@ -280,6 +321,21 @@ class TelegramState:
         else:
             raise ValueError("Unsupported task status")
 
+    def deliver(self, update_id: int, execute, send, failure_reply: str) -> None:
+        """Persist each delivery transition before invoking the next action."""
+        inbound = self.start(update_id)
+        try:
+            status, reply = execute(inbound.session_id)
+        except Exception:
+            status, reply = "unknown", failure_reply
+        self.mark_finished(update_id, status)
+        try:
+            sent = send(inbound.chat_id, reply)
+        except Exception:
+            sent = False
+        if sent:
+            self.mark_notified(update_id)
+
     def pending_delivery(self) -> list[dict]:
         """Completed tasks whose reply may have been lost after durable completion."""
         with self._mutex:
@@ -290,7 +346,8 @@ class TelegramState:
                 identity = (item["chat_id"], item["message_id"])
                 if item["status"] == "completed" and not item.get("notified", False) and identity not in seen:
                     seen.add(identity)
-                    result.append({"update_id": int(update_id), "chat_id": item["chat_id"]})
+                    result.append({"update_id": int(update_id), "chat_id": item["chat_id"],
+                                   "kind": item.get("kind", "task")})
             return result
 
     def mark_notified(self, update_id: int) -> None:
@@ -298,7 +355,7 @@ class TelegramState:
         with self._mutex:
             self._require_open()
             entry = self._data["updates"].get(str(update_id))
-            if entry is None or entry["status"] != "completed":
+            if entry is None or entry["status"] not in {"completed", "unknown"}:
                 raise TelegramStateError("Cannot mark an unfinished update notified")
             chat, message = entry["chat_id"], entry["message_id"]
             def mutate(data):
@@ -310,7 +367,22 @@ class TelegramState:
     def pending_unknown(self) -> list[dict]:
         return [{"update_id": item.update_id, "message_id": item.message_id,
                  "chat_id": item.chat_id, "session_id": item.session_id,
-                 "status": item.status} for item in self.unknown()]
+                 "status": item.status, "kind": self._data["updates"][str(item.update_id)].get("kind", "task")}
+                for item in self.unknown()]
+
+    def notify_pending(self, send, unknown_reply: str, completed_reply: str,
+                       control_reply: str = "控制指令回执送达状态未知；请核对当前任务。") -> None:
+        """Report recovery outcomes once, without replaying work or original replies."""
+        for entries, reply in ((self.pending_unknown(), unknown_reply),
+                               (self.pending_delivery(), completed_reply)):
+            for entry in entries:
+                actual_reply = control_reply if entry.get("kind") == "control" else reply
+                try:
+                    sent = send(entry["chat_id"], actual_reply)
+                except Exception:
+                    sent = False
+                if sent:
+                    self.mark_notified(entry["update_id"])
 
     @synchronized
     def unknown(self) -> list[Inbound]:
@@ -320,7 +392,7 @@ class TelegramState:
         result = []
         for update_id, item in self._data["updates"].items():
             identity = (item["chat_id"], item["message_id"])
-            if item["status"] == "unknown" and identity not in seen:
+            if item["status"] == "unknown" and not item.get("notified", False) and identity not in seen:
                 seen.add(identity)
                 result.append(Inbound(int(update_id), *identity, item["session_id"], "unknown"))
         return result

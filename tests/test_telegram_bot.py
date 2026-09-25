@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from session.telegram_state import TelegramState
+from session.telegram_state import Inbound, TelegramState
 from telegram_bot import TelegramBot, TelegramTransport, TelegramTransportError, main
 
 
@@ -18,14 +18,16 @@ class State:
         self.status = {}
         self.offset = 0
 
-    def receive(self, update_id, message_id, chat_id):
+    def claim(self, update_id, message_id, chat_id, *, kind="task"):
         key = (chat_id, message_id)
         if key in self.seen:
-            return False
+            self.offset = max(self.offset, update_id + 1)
+            return Inbound(update_id, chat_id, message_id, self.bindings[chat_id],
+                           self.status.get(update_id, "completed"))
         self.seen.add(key)
         self.status[update_id] = "received"
         self.offset = max(self.offset, update_id + 1)
-        return True
+        return Inbound(update_id, chat_id, message_id, self.bindings[chat_id], "received", True)
 
     def acknowledge_ignored(self, update_id):
         self.offset = max(self.offset, update_id + 1)
@@ -44,6 +46,16 @@ class State:
     def mark_finished(self, update_id, status):
         self.status[update_id] = status
 
+    def deliver(self, update_id, execute, send, failure_reply):
+        self.mark_started(update_id)
+        try:
+            status, reply = execute(self.bindings[42])
+        except Exception:
+            status, reply = "unknown", failure_reply
+        self.mark_finished(update_id, status)
+        if send(42, reply):
+            self.mark_notified(update_id)
+
     def session_id(self, chat_id):
         return self.bindings.get(chat_id)
 
@@ -55,6 +67,9 @@ class State:
 
     def pending_delivery(self):
         return []
+
+    def notify_pending(self, send, unknown_reply, completed_reply):
+        pass
 
     def mark_notified(self, update_id):
         pass
@@ -139,12 +154,12 @@ def test_poll_stops_before_acknowledging_failed_claim(tmp_path, monkeypatch):
     app, transport = App(), Once()
     with TelegramState(config, allowed_user_id=42) as state:
         bot = TelegramBot(config, 42, transport, application=app, state=state)
-        original_receive = state.receive
-        def fail_claim(update_id, message_id, chat_id):
+        original_claim = state.claim
+        def fail_claim(update_id, message_id, chat_id, **kwargs):
             if update_id == 6:
                 raise OSError("injected durable write failure")
-            return original_receive(update_id, message_id, chat_id)
-        monkeypatch.setattr(state, "receive", fail_claim)
+            return original_claim(update_id, message_id, chat_id, **kwargs)
+        monkeypatch.setattr(state, "claim", fail_claim)
         with pytest.raises(OSError, match="injected durable write failure"):
             bot.run()
         assert app.calls == []
@@ -214,6 +229,49 @@ def test_serial_queue_and_cancel_priority():
         assert any("排队" in text for _, text in transport.sent)
     finally:
         app.release.set()
+        bot.close()
+
+
+def test_cancel_is_recorded_before_acknowledgement_and_is_not_replayed(tmp_path):
+    config = SimpleNamespace(root_dir=tmp_path / "workspace", state_dir=tmp_path / "state", recent_task_count=5)
+    config.root_dir.mkdir()
+    app = App()
+    with TelegramState(config, allowed_user_id=42) as state:
+        class InspectingTransport(Transport):
+            def send(self, chat_id, text):
+                if "取消" in text:
+                    assert state.claim(5, 5, 42).status == "completed"
+                super().send(chat_id, text)
+        transport = InspectingTransport()
+        bot = TelegramBot(config, 42, transport, application=app, state=state)
+        bot.process_update(update(5, "/cancel"))
+        bot.process_update(update(5, "/cancel"))
+        assert len(transport.sent) == 1
+        assert app.calls == []
+        bot.close()
+    with TelegramState(config, allowed_user_id=42) as state:
+        assert state.pending_delivery() == []
+        assert state.pending_unknown() == []
+
+
+def test_cancel_receipt_delivery_gap_is_reported_as_a_control_message(tmp_path):
+    config = SimpleNamespace(root_dir=tmp_path / "workspace", state_dir=tmp_path / "state", recent_task_count=5)
+    config.root_dir.mkdir()
+    app = App()
+    with TelegramState(config, allowed_user_id=42) as state:
+        class FailedReceipt(Transport):
+            def send(self, chat_id, text):
+                raise OSError("delivery uncertain")
+        bot = TelegramBot(config, 42, FailedReceipt(), application=app, state=state)
+        bot.process_update(update(5, "/cancel"))
+        bot.close()
+    with TelegramState(config, allowed_user_id=42) as state:
+        transport = Transport()
+        bot = TelegramBot(config, 42, transport, application=app, state=state)
+        state.notify_pending(bot._safe_send,
+                             "执行状态未知", "任务已结束", "取消回执送达状态未知")
+        assert transport.sent == [(42, "取消回执送达状态未知")]
+        assert app.calls == []
         bot.close()
 
 

@@ -16,7 +16,7 @@ from typing import Any
 
 from application import Application
 from configuration import Config, ConfigurationError, _read_dotenv, _setting
-from session.session_store import SessionNotFoundError, SessionStore
+from session.session_store import SessionNotFoundError
 from session.telegram_state import TelegramState
 
 
@@ -109,31 +109,23 @@ class TelegramBot:
         if type(update.get("update_id")) is not int or type(message.get("message_id")) is not int:
             return False
         update_id, message_id = update["update_id"], message["message_id"]
-        # Allocate the channel's first session in the existing workspace directory.
-        # Never select the most recent unrelated CLI session by accident.
         with self._lock:
-            if self.state.session_id(chat_id) is None:
-                store = SessionStore.create(self.config)
-                try:
-                    self.state.bind(chat_id, store.session_id)
-                finally:
-                    store.close()
-            if not self.state.receive(update_id, message_id, chat_id):
-                self.state.acknowledge(update_id)
+            is_cancel = text.strip().casefold() == "/cancel"
+            inbound = self.state.claim(update_id, message_id, chat_id,
+                                       kind="control" if is_cancel else "task")
+            if not inbound.is_new:
                 return True
-            self.state.acknowledge(update_id)
-        if text.strip().casefold() == "/cancel":
-            with self._lock:
-                cancellation = self._cancel
-            if cancellation is not None:
-                cancellation.set()
-            self.state.mark_started(update_id)
-            if self._safe_send(chat_id, "已请求取消当前任务；已发生的操作不会撤销。" if cancellation is not None
-                               else "当前没有运行中的任务。"):
-                self.state.mark_finished(update_id, "completed")
-                self.state.mark_notified(update_id)
-            else:
-                self.state.mark_finished(update_id, "unknown")
+        if is_cancel:
+            def cancel(_session_id):
+                with self._lock:
+                    cancellation = self._cancel
+                if cancellation is not None:
+                    cancellation.set()
+                reply = ("已请求取消当前任务；已发生的操作不会撤销。" if cancellation is not None
+                         else "当前没有运行中的任务。")
+                return "completed", reply
+            self.state.deliver(update_id, cancel, self._safe_send,
+                               "取消指令处理状态未知；请核对当前任务。")
             return True
         with self._lock:
             queued = self._busy or bool(self._queue)
@@ -156,42 +148,40 @@ class TelegramBot:
     def _run_task(self, update_id: int, chat_id: int, text: str, cancellation: threading.Event):
         session = None
         try:
-            self.state.mark_started(update_id)
-            session_id = self.state.session_id(chat_id)
-            try:
-                session = self.application.create_session(resume=session_id)
-            except SessionNotFoundError:
-                # Missing state is unknown, not permission to silently start fresh.
-                raise RuntimeError("关联的会话不存在，未自动创建新会话") from None
-            result = session.run_request(text, cancellation=cancellation)
-            status = "cancelled" if cancellation.is_set() else "completed" if result is not None else "unknown"
-            self.state.mark_finished(update_id, status)
-            reply = ("任务已取消，已发生的操作不会撤销。" if cancellation.is_set()
-                     else result if result else "本次任务未能完成，请检查会话记录；不会自动重试。")
-            if self._safe_send(chat_id, reply) and status == "completed":
-                self.state.mark_notified(update_id)
+            def execute(session_id):
+                nonlocal session
+                try:
+                    session = self.application.create_session(resume=session_id)
+                except SessionNotFoundError:
+                    raise RuntimeError("关联的会话不存在，未自动创建新会话") from None
+                result = session.run_request(text, cancellation=cancellation)
+                status = "unknown" if cancellation.is_set() or result is None else "completed"
+                reply = ("任务已取消，已发生的操作不会撤销。" if cancellation.is_set()
+                         else result if result else "本次任务未能完成，请检查会话记录；不会自动重试。")
+                return status, reply
+            self.state.deliver(update_id, execute, self._safe_send,
+                               "任务中断，执行状态可能未知；请核对工作区后再发送新任务。")
         except Exception:
-            # Avoid leaking provider errors, raw tool output, or transport secrets.
-            try:
-                self.state.mark_finished(update_id, "unknown")
-            except Exception:
-                pass
-            self._safe_send(chat_id, "任务中断，执行状态可能未知；请核对工作区后再发送新任务。")
+            # A failed durable transition cannot be safely replaced with a claim of completion.
+            print("[Telegram] 渠道状态无法保存；请核对会话记录。", file=sys.stderr)
+            with self._lock:
+                self._closed = True
         finally:
             if session is not None:
                 session.close()
             with self._lock:
                 self._busy = False
                 self._cancel = None
-                self._launch_next_locked()
+                if not self._closed:
+                    self._launch_next_locked()
 
     def run(self):
         try:
-            for entry in self.state.pending_unknown():
-                self._safe_send(entry["chat_id"], "上次任务在运行中中断，执行状态未知；未自动重试，请先核对工作区。")
-            for entry in self.state.pending_delivery():
-                if self._safe_send(entry["chat_id"], "上次任务已结束，但回复送达状态未知；请检查会话记录。任务未重跑。"):
-                    self.state.mark_notified(entry["update_id"])
+            self.state.notify_pending(
+                self._safe_send,
+                "上次任务在运行中中断，执行状态未知；未自动重试，请先核对工作区。",
+                "上次任务已结束，但回复送达状态未知；请检查会话记录。任务未重跑。",
+                "上次取消指令的回执送达状态未知；请核对当前任务。")
             offset = self.state.offset
             while not self._closed:
                 try:
