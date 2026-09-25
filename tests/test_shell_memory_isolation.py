@@ -130,6 +130,33 @@ Path('probe-result.json').write_text(json.dumps({'connected': connected}))
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
+def test_link_swapped_after_scan_before_acl_grant_is_rejected(tmp_path, monkeypatch):
+    import tools.shell_sandbox as sandbox
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    outside = tmp_path / 'outside.txt'
+    outside.write_text('original', encoding='utf-8')
+    target = workspace / 'target.txt'
+    target.write_text('safe', encoding='utf-8')
+    original_verify = sandbox._verify_tree
+    swapped = False
+    def swap_after_scan(root, protected, check):
+        nonlocal swapped
+        original_verify(root, protected, check)
+        if root == workspace and not swapped:
+            target.unlink()
+            os.link(outside, target)
+            swapped = True
+    monkeypatch.setattr(sandbox, '_verify_tree', swap_after_scan)
+    with tempfile.TemporaryFile() as output:
+        with pytest.raises(SandboxUnavailable, match='link'):
+            start_shell("[IO.File]::WriteAllText('target.txt','bad')", workspace,
+                        tmp_path / 'state', output)
+    assert swapped
+    assert outside.read_text(encoding='utf-8') == 'original'
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows AppContainer integration')
 def test_shell_rejects_workspace_reparse_point_before_execution(tmp_path):
     workspace = tmp_path / 'workspace'
     workspace.mkdir()
