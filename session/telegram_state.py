@@ -226,37 +226,6 @@ class TelegramState:
         return Inbound(update_id, chat_id, message_id, session_id, "received", is_new=True)
 
     @synchronized
-    def receive(self, update_id: int, message_id: int, chat_id: int) -> bool:
-        """Persist receipt before acknowledging offset; return True only for new work.
-
-        If a message arrives under a second update identity, it is still a
-        duplicate. Identity conflicts are rejected instead of invoking a tool.
-        """
-        key = self._check_chat(chat_id)
-        if (type(update_id) is not int or update_id < 0
-                or type(message_id) is not int or message_id <= 0):
-            raise ValueError("invalid Telegram update/message ID")
-        self._require_open()
-        updates = self._data["updates"]
-        existing = updates.get(str(update_id))
-        if existing is not None:
-            if (existing["chat_id"], existing["message_id"]) != (chat_id, message_id):
-                raise TelegramStateError("Conflicting update identity")
-            return False
-        for old_id, entry in updates.items():
-            if (entry["chat_id"], entry["message_id"]) == (chat_id, message_id):
-                # Persist alias so offset can be advanced for this delivery too.
-                self._change(lambda data: data["updates"].__setitem__(str(update_id), dict(entry)))
-                return False
-        session_id = self._data["bindings"].get(key)
-        if session_id is None:
-            raise TelegramStateError("Bind a workspace session before receiving tasks")
-        entry = {"chat_id": chat_id, "message_id": message_id,
-                 "session_id": session_id, "status": "received"}
-        self._change(lambda data: data["updates"].__setitem__(str(update_id), entry))
-        return True
-
-    @synchronized
     def acknowledge_ignored(self, update_id: int) -> int:
         """Durably advance past a filtered update, without recording untrusted chats.
 
@@ -269,17 +238,6 @@ class TelegramState:
             raise ValueError("invalid Telegram update ID")
         if update_id + 1 > self.offset:
             self._change(lambda data: data.__setitem__("offset", update_id + 1))
-        return self.offset
-
-    @synchronized
-    def acknowledge(self, update_id: int) -> int:
-        """Return durable next polling offset; call only after receive()."""
-        self._require_open()
-        if type(update_id) is not int or str(update_id) not in self._data["updates"]:
-            raise TelegramStateError("Cannot acknowledge an unrecorded update")
-        next_offset = update_id + 1
-        if next_offset > self.offset:
-            self._change(lambda data: data.__setitem__("offset", next_offset))
         return self.offset
 
     @synchronized

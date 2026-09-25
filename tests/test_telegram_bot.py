@@ -33,10 +33,6 @@ class State:
         self.offset = max(self.offset, update_id + 1)
         return self.offset
 
-    def acknowledge(self, update_id):
-        self.offset = max(self.offset, update_id + 1)
-        return self.offset
-
     def close(self):
         pass
 
@@ -288,7 +284,7 @@ def test_real_state_workspace_binding_and_recovery(tmp_path):
         assert session_id
     with TelegramState(config, allowed_user_id=42) as state:
         assert state.session_id(42) == session_id
-        assert not state.receive(8, 8, 42)
+        assert not state.claim(8, 8, 42).is_new
         bot = TelegramBot(config, 42, transport, application=app, state=state)
         bot.process_update(update(9, "second"))
         wait_for(lambda: app.calls == ["first", "second"])
@@ -309,11 +305,11 @@ def test_inflight_duplicate_is_not_replayed_after_restart(tmp_path):
         wait_for(lambda: app.calls == ["first"])
         bot.close()
     with TelegramState(config, allowed_user_id=42) as state:
-        assert not state.receive(12, 12, 42)
-        state.receive(13, 13, 42)
+        assert not state.claim(12, 12, 42).is_new
+        state.claim(13, 13, 42)
         # Received but not started before a crash must never be replayed.
     with TelegramState(config, allowed_user_id=42) as state:
-        assert not state.receive(13, 13, 42)
+        assert not state.claim(13, 13, 42).is_new
         assert any(item["update_id"] == 13 for item in state.pending_unknown())
 
 
@@ -354,7 +350,7 @@ def test_completion_delivery_gap_is_reported_without_reexecution(tmp_path):
         state.mark_notified = original_mark_notified
     with TelegramState(config, allowed_user_id=42) as state:
         assert len(state.pending_delivery()) == 1
-        assert not state.receive(20, 20, 42)
+        assert not state.claim(20, 20, 42).is_new
         assert app.calls == ["first"]
         entry = state.pending_delivery()[0]
         state.mark_notified(entry["update_id"])

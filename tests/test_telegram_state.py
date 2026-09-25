@@ -194,33 +194,31 @@ class TelegramStateTests(unittest.TestCase):
         session_id = self.make_session()
         with TelegramState(self.config) as state:
             state.bind(12345, session_id)
-            self.assertTrue(state.receive(11, 42, 12345))
-            self.assertEqual(state.offset, 0)
-            self.assertEqual(state.acknowledge(11), 12)
+            self.assertTrue(state.claim(11, 42, 12345).is_new)
+            self.assertEqual(state.offset, 12)
             state.mark_started(11)
             state.mark_finished(11, "completed")
-            self.assertFalse(state.receive(11, 42, 12345))
-            self.assertFalse(state.receive(12, 42, 12345))  # second update, same message
-            self.assertEqual(state.acknowledge(12), 13)
+            self.assertFalse(state.claim(11, 42, 12345).is_new)
+            self.assertFalse(state.claim(12, 42, 12345).is_new)  # second update, same message
+            self.assertEqual(state.offset, 13)
             self.assertEqual(state.pending_unknown(), [])
         with TelegramState(self.config) as state:
             self.assertEqual(state.offset, 13)
-            self.assertFalse(state.receive(11, 42, 12345))
-            self.assertFalse(state.receive(12, 42, 12345))
+            self.assertFalse(state.claim(11, 42, 12345).is_new)
+            self.assertFalse(state.claim(12, 42, 12345).is_new)
             self.assertEqual(state.pending_unknown(), [])
 
     def test_received_or_started_are_unknown_on_restart_not_replayed(self):
         session_id = self.make_session()
         with TelegramState(self.config) as state:
             state.bind(12345, session_id)
-            self.assertTrue(state.receive(21, 1, 12345))
-            state.acknowledge(21)
-            self.assertTrue(state.receive(22, 2, 12345))
+            self.assertTrue(state.claim(21, 1, 12345).is_new)
+            self.assertTrue(state.claim(22, 2, 12345).is_new)
             state.mark_started(22)
         with TelegramState(self.config) as state:
-            self.assertEqual(state.offset, 22)
-            self.assertFalse(state.receive(21, 1, 12345))
-            self.assertFalse(state.receive(22, 2, 12345))
+            self.assertEqual(state.offset, 23)
+            self.assertFalse(state.claim(21, 1, 12345).is_new)
+            self.assertFalse(state.claim(22, 2, 12345).is_new)
             self.assertEqual({item["message_id"] for item in state.pending_unknown()}, {1, 2})
             with self.assertRaises(TelegramStateError):
                 state.mark_started(22)
@@ -229,43 +227,39 @@ class TelegramStateTests(unittest.TestCase):
         with TelegramState(self.config) as state:
             self.assertEqual(len(state.pending_unknown()), 2)
 
-    def test_failed_commit_before_offset_does_not_claim_or_ack(self):
+    def test_failed_claim_commit_does_not_advance_offset(self):
         self.make_session()
         with TelegramState(self.config) as state:
             state.bind(12345, SessionStore.list_sessions(self.config)[0].id)
             with patch.object(state, "_commit", side_effect=OSError("injected crash")):
                 with self.assertRaises(OSError):
-                    state.receive(31, 3, 12345)
+                    state.claim(31, 3, 12345)
             self.assertEqual(state.offset, 0)
-            self.assertTrue(state.receive(31, 3, 12345))
-            with patch.object(state, "_commit", side_effect=OSError("injected crash")):
-                with self.assertRaises(OSError):
-                    state.acknowledge(31)
+            self.assertTrue(state.claim(31, 3, 12345).is_new)
+            self.assertEqual(state.offset, 32)
         with TelegramState(self.config) as state:
-            self.assertEqual(state.offset, 0)
-            self.assertFalse(state.receive(31, 3, 12345))
+            self.assertEqual(state.offset, 32)
+            self.assertFalse(state.claim(31, 3, 12345).is_new)
             self.assertEqual(state.pending_unknown()[0]["message_id"], 3)
-            state.acknowledge(31)
 
     def test_failed_start_write_blocks_execution_and_recovers_unknown(self):
         self.make_session()
         with TelegramState(self.config) as state:
             state.bind(12345, SessionStore.list_sessions(self.config)[0].id)
-            state.receive(50, 5, 12345)
+            state.claim(50, 5, 12345)
             with patch.object(state, "_commit", side_effect=OSError("injected crash")):
                 with self.assertRaises(OSError):
                     state.mark_started(50)
         with TelegramState(self.config) as state:
             self.assertEqual(state.pending_unknown()[0]["update_id"], 50)
-            self.assertFalse(state.receive(50, 5, 12345))
+            self.assertFalse(state.claim(50, 5, 12345).is_new)
 
     def test_concurrent_polling_and_worker_updates_keep_all_receipts(self):
         session_id = self.make_session()
         with TelegramState(self.config) as state:
             state.bind(12345, session_id)
             def deliver(index):
-                self.assertTrue(state.receive(index, index + 1, 12345))
-                state.acknowledge(index)
+                self.assertTrue(state.claim(index, index + 1, 12345).is_new)
                 state.mark_started(index)
                 state.mark_finished(index, "completed")
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -275,7 +269,7 @@ class TelegramStateTests(unittest.TestCase):
             self.assertEqual(state.offset, 101)
             self.assertEqual(state.pending_unknown(), [])
             for index in range(1, 101):
-                self.assertFalse(state.receive(index, index + 1, 12345))
+                self.assertFalse(state.claim(index, index + 1, 12345).is_new)
 
     def test_rejection_and_exclusive_lock(self):
         first = self.make_session()
@@ -287,12 +281,10 @@ class TelegramStateTests(unittest.TestCase):
                 with self.assertRaises(TelegramStateError):
                     state.session_id(chat_id)
                 with self.assertRaises(TelegramStateError):
-                    state.receive(99, 1, chat_id)
+                    state.claim(99, 1, chat_id)
+            state.claim(100, 7, 12345)
             with self.assertRaises(TelegramStateError):
-                state.acknowledge(99)
-            state.receive(100, 7, 12345)
-            with self.assertRaises(TelegramStateError):
-                state.receive(100, 8, 12345)
+                state.claim(100, 8, 12345)
             state.mark_started(100)
             state.mark_finished(100, "cancelled")
             self.assertEqual(state.pending_unknown()[0]["status"], "unknown")
@@ -314,15 +306,14 @@ class TelegramStateTests(unittest.TestCase):
                 try:
                     shell.start()
                     self.assertIsNone(shell.poll())
-                    self.assertTrue(state.receive(80, 8, 12345))
-                    state.acknowledge(80)
+                    self.assertTrue(state.claim(80, 8, 12345).is_new)
                     state.mark_started(80)
                     state.mark_finished(80, "cancelled")
                     self.assertEqual(state.offset, 81)
                 finally:
                     shell.close()
         with TelegramState(self.config) as state:
-            self.assertFalse(state.receive(80, 8, 12345))
+            self.assertFalse(state.claim(80, 8, 12345).is_new)
             self.assertEqual(state.pending_unknown()[0]["status"], "unknown")
 
     def test_corrupted_index_fails_closed_and_preserves_bytes(self):
