@@ -150,6 +150,9 @@ class WindowsShell:
             for path in {Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve()}:
                 self._allow_tree(path, 'RX')
             self._allow_tree(workspace, 'M')
+            # A link may have appeared since the initial scan, even when a
+            # single inherited grant on the workspace skips child traversal.
+            _verify_tree(workspace, protected, self.check)
             self._acl(Path(self.temp.name), 'grant', 'M')
 
             create_job = api(self.kernel, 'CreateJobObjectW', [c.c_void_p, w.LPCWSTR], w.HANDLE)
@@ -293,9 +296,30 @@ class WindowsShell:
             create_file = self.kernel.CreateFileW
             create_file.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, c.c_void_p, w.DWORD, w.DWORD, w.HANDLE]
             create_file.restype = w.HANDLE
-            handle = create_file(str(path), 0x60000, 7, None, 3, 0x02000000, None)
+            # Open the link itself, never its target. A workspace entry can be
+            # replaced after _verify_tree/_allow_tree inspected it; an ACL grant
+            # on the resolved target would otherwise escape the workspace.
+            handle = create_file(str(path), 0x60000, 7, None, 3,
+                                 0x02000000 | 0x00200000, None)
             if handle == c.c_void_p(-1).value:
                 self._check(False)
+            class FileInfo(c.Structure):
+                _fields_ = [('attributes', w.DWORD), ('created', w.FILETIME),
+                            ('accessed', w.FILETIME), ('written', w.FILETIME),
+                            ('volume', w.DWORD), ('size_high', w.DWORD),
+                            ('size_low', w.DWORD), ('links', w.DWORD),
+                            ('index_high', w.DWORD), ('index_low', w.DWORD)]
+            info = FileInfo()
+            get_info = self.kernel.GetFileInformationByHandle
+            get_info.argtypes = [w.HANDLE, c.POINTER(FileInfo)]
+            get_info.restype = w.BOOL
+            try:
+                self._check(get_info(handle, c.byref(info)))
+                if info.attributes & 0x400 or info.links > 1:  # REPARSE_POINT / hardlink
+                    raise SandboxUnavailable(f'Shell workspace/runtime contains a link: {path}')
+            except BaseException:
+                self.close_handle(handle)
+                raise
             self.security_handles[path] = handle
         handle = self.security_handles[path]
         try:
